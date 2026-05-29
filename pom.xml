@@ -148,6 +148,20 @@
         <module>load-tests</module>
         <module>e2e-ha</module>
     </modules>
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages</name>
+            <url>https://maven.pkg.github.com/Locstat/arcadedb</url>
+        </repository>
+    </distributionManagement>
+    <repositories>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages</name>
+            <url>https://maven.pkg.github.com/Locstat/arcadedb</url>
+        </repository>
+    </repositories>
 
     <build>
         <resources>
