@@ -51,6 +51,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 
@@ -92,6 +93,9 @@ public class Neo4jImporter {
   private final        ImporterContext                context;
   private final        Map<String, Map<String, Type>> schemaProperties         = new HashMap<>();
   private final static SimpleDateFormat               dateTimeISO8601Format    = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
+  // Allow-list for imported labels: ASCII letters, digits, underscore, hyphen and space only. Excluding '.', '/' and '\'
+  // makes path-traversal sequences structurally impossible in the on-disk bucket file names derived from these labels.
+  private final static Pattern                        SAFE_LABEL               = Pattern.compile("[A-Za-z0-9_ -]+");
 
   // Neo4j ID -> packed ArcadeDB RID mapping, populated during vertex pass.
   // Uses primitive LongLongMap for numeric IDs (common case), falls back to HashMap for non-numeric IDs.
@@ -238,7 +242,7 @@ public class Neo4jImporter {
         break;
 
       case "relationship":
-        final String edgeLabel = json.has("label") && !json.isNull("label") ? json.getString("label") : null;
+        final String edgeLabel = json.has("label") && !json.isNull("label") ? validateLabel(json.getString("label")) : null;
         if (edgeLabel != null)
           database.getSchema().buildEdgeType().withName(edgeLabel).withTotalBuckets(bucketsPerType).withIgnoreIfExists(true)
               .create();
@@ -401,7 +405,7 @@ public class Neo4jImporter {
                 (context.createdEdges.get() / elapsed * 1000));
           }
 
-          final String type = json.getString("label");
+          final String type = validateLabel(json.getString("label"));
           if (type == null) {
             log("- found edge in line %d without labels. Skip it.", lineNumber.get());
             context.warnings.incrementAndGet();
@@ -672,13 +676,21 @@ public class Neo4jImporter {
     if (nodeLabels != null && !nodeLabels.isEmpty()) {
       if (nodeLabels.length() > 1) {
         // MULTI LABEL, CREATE A NEW MIXED TYPE THAT EXTEND ALL THE LABELS BY USING INHERITANCE
-        final List<String> list = nodeLabels.toList().stream().map(String.class::cast).sorted(Comparator.naturalOrder())
-            .collect(Collectors.toList());
+        final List<String> list = nodeLabels.toList().stream().map(String.class::cast).map(Neo4jImporter::validateLabel)
+            .sorted(Comparator.naturalOrder()).collect(Collectors.toList());
         return new Pair<>(String.join(Labels.LABEL_SEPARATOR, list), list);
       } else
-        return new Pair<>((String) nodeLabels.get(0), null);
+        return new Pair<>(validateLabel((String) nodeLabels.get(0)), null);
     }
     return null;
+  }
+
+  // Validates untrusted import labels against a strict allow-list before they become on-disk bucket file names. Only
+  // letters, digits, underscore, hyphen and space are accepted; path separators and '..' cannot appear by construction.
+  private static String validateLabel(final String label) {
+    if (label != null && !SAFE_LABEL.matcher(label).matches())
+      throw new ImportException("Invalid label: must not contain path separators or '..'");
+    return label;
   }
 
   private void log(final String text, final Object... args) {
