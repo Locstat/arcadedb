@@ -18,15 +18,17 @@
  */
 package com.arcadedb.engine.timeseries;
 
+import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.engine.Component;
 import com.arcadedb.engine.timeseries.codec.DeltaOfDeltaCodec;
 import com.arcadedb.engine.timeseries.codec.DictionaryCodec;
 import com.arcadedb.engine.timeseries.codec.TimeSeriesCodec;
-import com.arcadedb.exception.ConcurrentModificationException;
+import com.arcadedb.log.LogManager;
 import com.arcadedb.schema.LocalSchema;
 
 import java.io.IOException;
+import java.util.logging.Level;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -48,6 +50,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class TimeSeriesShard implements AutoCloseable {
 
   private final int                    shardIndex;
+  private final String                 typeName;
   private final DatabaseInternal       database;
   private final List<ColumnDefinition> columns;
   private final long                   compactionBucketIntervalMs;
@@ -69,6 +72,9 @@ public class TimeSeriesShard implements AutoCloseable {
   // cycle at a time per shard, so page versions are always consistent at commit.
   // Writes to *different* shards are still fully concurrent.
   private final Lock                   appendLock      = new ReentrantLock();
+  // Throttle (60s window) for the oversized-sealed-store WARNING so a permanently-too-large shard
+  // does not spam the log every maintenance cycle.
+  private volatile long                lastOversizedWarnMs = 0;
 
   public TimeSeriesShard(final DatabaseInternal database, final String baseName, final int shardIndex,
                          final List<ColumnDefinition> columns) throws IOException {
@@ -78,6 +84,7 @@ public class TimeSeriesShard implements AutoCloseable {
   public TimeSeriesShard(final DatabaseInternal database, final String baseName, final int shardIndex,
                          final List<ColumnDefinition> columns, final long compactionBucketIntervalMs) throws IOException {
     this.shardIndex = shardIndex;
+    this.typeName = baseName;
     this.database = database;
     this.columns = columns;
     this.compactionBucketIntervalMs = compactionBucketIntervalMs;
@@ -101,13 +108,19 @@ public class TimeSeriesShard implements AutoCloseable {
       // transaction's dirty set.  This is required so that the nested TX used by appendSamples()
       // can later commit page 0 without conflicting with an enclosing transaction that was open
       // when this shard was created (a common test pattern).
-      database.begin();
+      // Route through the wrapped (HA) database so that, when this shard is created during a
+      // replicated DDL (CREATE TIMESERIES TYPE wrapped in recordFileChanges), the header-page write
+      // is captured and shipped to followers together with the file-creation SCHEMA_ENTRY. On a
+      // standalone database getWrappedDatabaseInstance() returns the same instance, so behaviour is
+      // unchanged.
+      final DatabaseInternal db = database.getWrappedDatabaseInstance();
+      db.begin();
       try {
         mutableBucket.initHeaderPage();
-        database.commit();
+        db.commit();
       } catch (final Exception e) {
-        if (database.isTransactionActive())
-          database.rollback();
+        if (db.isTransactionActive())
+          db.rollback();
         throw e instanceof IOException ? (IOException) e :
             new IOException("Failed to initialise header for shard " + shardIndex, e);
       }
@@ -177,13 +190,18 @@ public class TimeSeriesShard implements AutoCloseable {
       // ConcurrentModificationException at commit time (current v.X <> database v.Y).
       appendLock.lock();
       try {
-        database.begin();
+        // Route the append transaction through the HA wrapper so the mutable-bucket page writes are
+        // shipped to followers via the Raft WAL (TX_ENTRY). Committing on the inner LocalDatabase here
+        // would persist the pages locally only, leaving followers with an empty bucket (issue #4382).
+        // On a standalone database getWrappedDatabaseInstance() returns the same instance.
+        final DatabaseInternal db = database.getWrappedDatabaseInstance();
+        db.begin();
         try {
           mutableBucket.appendSamples(timestamps, columnValues);
-          database.commit();
+          db.commit();
         } catch (final Exception e) {
-          if (database.isTransactionActive())
-            database.rollback();
+          if (db.isTransactionActive())
+            db.rollback();
           throw e instanceof IOException ? (IOException) e : new IOException("Failed to append timeseries samples", e);
         }
       } finally {
@@ -332,7 +350,19 @@ public class TimeSeriesShard implements AutoCloseable {
     // temp files (e.g. maintenance scheduler and an explicit compactAll() running in parallel).
     compactionMutex.lock();
     try {
-      compactInternal();
+      // Route through the HA replication wrapper. On a Raft FOLLOWER this returns false WITHOUT running
+      // the compaction (compaction is leader-only; followers receive the sealed bytes + mutable-clear
+      // WAL produced here via the replicated SCHEMA_ENTRY). On the LEADER the wrapper opens a recording
+      // session, captures the Phase-4c page-0 clear as buffered WAL and the rewritten sealed-store bytes
+      // (see recordTimeSeriesSealedChange), and ships them atomically. On a standalone database the
+      // default implementation simply runs compactInternal().
+      database.getWrappedDatabaseInstance().runWithCompactionReplication(() -> {
+        compactInternal();
+        return true;
+      });
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Compaction interrupted for shard " + shardIndex, e);
     } finally {
       compactionMutex.unlock();
     }
@@ -341,26 +371,48 @@ public class TimeSeriesShard implements AutoCloseable {
   private void compactInternal() throws IOException {
     final long initialBlockCount = sealedStore.getBlockCount();
 
+    // Route all compaction transactions through the HA wrapper. Under a runWithCompactionReplication
+    // session (set up by the wrapper) the mutating commits (Phase 0 crash flag, Phase 4c page-0 clear)
+    // are buffered as correctly-versioned WAL and shipped to followers together with the rewritten
+    // sealed-store bytes recorded below. On a standalone database this is the same inner instance.
+    final DatabaseInternal db = database.getWrappedDatabaseInstance();
+
     // ── Phase 0 (brief writeLock + brief TX): snapshot page count, set crash flag ─────────
     // The write lock blocks concurrent appendSamples() so the TX modifying page-0 cannot
     // get an MVCC conflict from a concurrent insert.
     final int snapshotDataPageCount;
     compactionLock.writeLock().lock();
     try {
-      database.begin();
+      db.begin();
       try {
         final int pageCount = mutableBucket.getDataPageCount();
         if (pageCount == 0) {
-          database.rollback();
+          db.rollback();
           return;
         }
+
+        // HA safety valve (issue #4382): if the rewritten sealed store would be too large to ship
+        // inline in a single Raft entry, skip compaction entirely this cycle. The data stays in the
+        // mutable bucket, which IS fully replicated, so there is no divergence or data loss - just no
+        // sealing. The projected size over-estimates (raw mutable bytes are a ceiling on the
+        // compressed sealed delta), so we always stay safely under the transport cap.
+        if (db.isReplicated()) {
+          final long cap = database.getConfiguration().getValueAsLong(GlobalConfiguration.HA_TS_MAX_SEALED_INLINE_SIZE);
+          final long projected = sealedStore.getFileSizeBytes() + (long) pageCount * mutableBucket.getPageSize();
+          if (projected > cap) {
+            db.rollback();
+            warnOversizedSealedSkip(projected, cap);
+            return;
+          }
+        }
+
         snapshotDataPageCount = pageCount;
         mutableBucket.setCompactionInProgress(true);
         mutableBucket.setCompactionWatermark(initialBlockCount);
-        database.commit();
+        db.commit();
       } catch (final Exception e) {
-        if (database.isTransactionActive())
-          database.rollback();
+        if (db.isTransactionActive())
+          db.rollback();
         throw e instanceof IOException ? (IOException) e : new IOException("Compaction failed in phase 0", e);
       }
     } finally {
@@ -389,7 +441,7 @@ public class TimeSeriesShard implements AutoCloseable {
     // sealed block across the Phase-2/Phase-4 page boundary.
     Object[] phase2Spill = null;
     if (lastFullPage > 0) {
-      database.begin();
+      db.begin();
       try {
         final Object[] snapshotData = mutableBucket.readFullPagesForCompaction(lastFullPage);
         if (snapshotData != null)
@@ -400,7 +452,7 @@ public class TimeSeriesShard implements AutoCloseable {
           phase2Spill = buildCompressedBlocks(snapshotData, allCompressedList, allMetaList, allMinsList, allMaxsList,
               allSumsList, allTagDVList, true);
       } finally {
-        database.rollback(); // read-only: rollback is always safe
+        db.rollback(); // read-only: rollback is always safe
       }
     }
 
@@ -426,7 +478,7 @@ public class TimeSeriesShard implements AutoCloseable {
     Object[] phase4aData;
     compactionLock.writeLock().lock();
     try {
-      database.begin();
+      db.begin();
       try {
         phase4aPageCount = mutableBucket.getDataPageCount();
         if (phase4aPageCount > lastFullPage)
@@ -434,7 +486,7 @@ public class TimeSeriesShard implements AutoCloseable {
         else
           phase4aData = null;
       } finally {
-        database.rollback(); // read-only snapshot
+        db.rollback(); // read-only snapshot
       }
     } finally {
       compactionLock.writeLock().unlock();
@@ -473,7 +525,7 @@ public class TimeSeriesShard implements AutoCloseable {
     // typically just 0-2 pages worth of data, keeping the lock hold time minimal.
     compactionLock.writeLock().lock();
     try {
-      database.begin();
+      db.begin();
       try {
         final int finalPageCount = mutableBucket.getDataPageCount();
 
@@ -508,14 +560,21 @@ public class TimeSeriesShard implements AutoCloseable {
         // Atomically swap temp file into the sealed store; updates in-memory blockDirectory.
         sealedStore.commitTempCompactionFile(newBlockDirectory);
 
+        // Capture the rewritten sealed-store bytes so the HA layer can ship them to followers in the
+        // SAME replication unit as the mutable-bucket clear below. The sealed store is not a paginated
+        // component, so it does not replicate via the page WAL; recording it here keeps the sealed
+        // blocks and the clear atomic. No-op on a standalone database.
+        db.recordTimeSeriesSealedChange(typeName, shardIndex, sealedStore.getSealedFileName(),
+            sealedStore.readWholeSealedFile());
+
         // Clear the entire mutable bucket and persist the crash-recovery flag reset.
         // No MVCC conflict: writeLock blocks all concurrent appendSamples().
         mutableBucket.clearDataPages();
         mutableBucket.setCompactionInProgress(false);
-        database.commit();
+        db.commit();
       } catch (final Exception e) {
-        if (database.isTransactionActive())
-          database.rollback();
+        if (db.isTransactionActive())
+          db.rollback();
         // Restore sealed store to initial state so the next run re-compacts cleanly.
         // (The crash-recovery flag remains set, so a restart also handles this correctly.)
         try {
@@ -706,16 +765,30 @@ public class TimeSeriesShard implements AutoCloseable {
   /**
    * Best-effort: clear the compaction-in-progress flag after a non-crash error.
    */
+  private void warnOversizedSealedSkip(final long projectedBytes, final long capBytes) {
+    final long now = System.currentTimeMillis();
+    if (now - lastOversizedWarnMs < 60_000)
+      return;
+    lastOversizedWarnMs = now;
+    LogManager.instance().log(this, Level.WARNING,
+        """
+        Skipping HA compaction of TimeSeries '%s' shard %d: projected sealed-store size %d bytes exceeds the inline \
+        replication cap %d bytes (%s). Data remains in the replicated mutable bucket; raise the cap or reduce \
+        retention to re-enable sealing.""",
+        null, typeName, shardIndex, projectedBytes, capBytes, GlobalConfiguration.HA_TS_MAX_SEALED_INLINE_SIZE.getKey());
+  }
+
   private void clearCompactionFlagBestEffort() {
+    final DatabaseInternal db = database.getWrappedDatabaseInstance();
     compactionLock.writeLock().lock();
     try {
-      database.begin();
+      db.begin();
       mutableBucket.setCompactionInProgress(false);
-      database.commit();
+      db.commit();
     } catch (final Exception ignored) {
-      if (database.isTransactionActive())
+      if (db.isTransactionActive())
         try {
-          database.rollback();
+          db.rollback();
         } catch (final Exception re) { /* ignored */ }
     } finally {
       compactionLock.writeLock().unlock();

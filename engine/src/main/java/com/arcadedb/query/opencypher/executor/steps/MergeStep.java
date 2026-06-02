@@ -24,7 +24,6 @@ import com.arcadedb.database.MutableDocument;
 import com.arcadedb.exception.DuplicatedKeyException;
 import com.arcadedb.exception.TimeoutException;
 import com.arcadedb.graph.Edge;
-import com.arcadedb.graph.MutableEdge;
 import com.arcadedb.graph.MutableVertex;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.opencypher.Labels;
@@ -133,7 +132,7 @@ public class MergeStep extends AbstractExecutionStep {
               buffer.addAll(mergedResults);
             } finally {
               if (context.isProfiling())
-                cost += (System.nanoTime() - begin);
+                cost += System.nanoTime() - begin;
             }
           }
 
@@ -153,7 +152,7 @@ public class MergeStep extends AbstractExecutionStep {
               mergedStandalone = true;
             } finally {
               if (context.isProfiling())
-                cost += (System.nanoTime() - begin);
+                cost += System.nanoTime() - begin;
             }
           }
           finished = true;
@@ -383,7 +382,7 @@ public class MergeStep extends AbstractExecutionStep {
     if (pathPattern.getRelationshipCount() != 1)
       return false; // longer paths fall back to anchor walk
 
-    final int unboundIdx = (anchorIdx == 0) ? 1 : 0;
+    final int unboundIdx = anchorIdx == 0 ? 1 : 0;
     final NodePattern unboundPattern = pathPattern.getNode(unboundIdx);
 
     // The candidate side must carry exactly one label so we know which type to
@@ -473,16 +472,16 @@ public class MergeStep extends AbstractExecutionStep {
       final Direction dir, final String relType, final Map<String, Object> relProps) {
     if (dir == Direction.OUT || dir == Direction.BOTH) {
       // Pattern: node0 -OUT-> node1.  Candidate side dictates the lookup direction.
-      final Vertex.DIRECTION candDir = (unboundIdx == 0) ? Vertex.DIRECTION.OUT : Vertex.DIRECTION.IN;
-      final Vertex.DIRECTION otherEnd = (unboundIdx == 0) ? Vertex.DIRECTION.IN : Vertex.DIRECTION.OUT;
+      final Vertex.DIRECTION candDir = unboundIdx == 0 ? Vertex.DIRECTION.OUT : Vertex.DIRECTION.IN;
+      final Vertex.DIRECTION otherEnd = unboundIdx == 0 ? Vertex.DIRECTION.IN : Vertex.DIRECTION.OUT;
       final Edge e = findFirstEdgeTo(candidate, anchor, candDir, otherEnd, relType, relProps);
       if (e != null)
         return e;
     }
     if (dir == Direction.IN || dir == Direction.BOTH) {
       // Pattern: node0 <-IN- node1.  Mirror of the OUT case.
-      final Vertex.DIRECTION candDir = (unboundIdx == 0) ? Vertex.DIRECTION.IN : Vertex.DIRECTION.OUT;
-      final Vertex.DIRECTION otherEnd = (unboundIdx == 0) ? Vertex.DIRECTION.OUT : Vertex.DIRECTION.IN;
+      final Vertex.DIRECTION candDir = unboundIdx == 0 ? Vertex.DIRECTION.IN : Vertex.DIRECTION.OUT;
+      final Vertex.DIRECTION otherEnd = unboundIdx == 0 ? Vertex.DIRECTION.OUT : Vertex.DIRECTION.IN;
       final Edge e = findFirstEdgeTo(candidate, anchor, candDir, otherEnd, relType, relProps);
       if (e != null)
         return e;
@@ -1155,15 +1154,24 @@ public class MergeStep extends AbstractExecutionStep {
     // Ensure edge type exists (Cypher auto-creates types)
     context.getDatabase().getSchema().getOrCreateEdgeType(type);
 
-    final MutableEdge edge = fromVertex.newEdge(type, toVertex);
-
+    // Evaluate edge properties BEFORE creating the edge so they are passed to newEdge() and set
+    // before the internal save()/validation. Otherwise edges with mandatory properties fail
+    // validation inside newEdge() (issue #4413).
+    final Object[] edgeProperties;
     if (relPattern.hasProperties()) {
       final Map<String, Object> evaluatedProperties = evaluateProperties(relPattern.getProperties(), result);
-      setProperties(edge, evaluatedProperties);
-    }
+      final List<Object> keyValues = new ArrayList<>(evaluatedProperties.size() * 2);
+      for (final Map.Entry<String, Object> entry : evaluatedProperties.entrySet()) {
+        keyValues.add(entry.getKey());
+        keyValues.add(TemporalUtil.toCoreJavaType(entry.getValue()));
+      }
+      edgeProperties = keyValues.toArray();
+    } else
+      edgeProperties = null;
 
-    edge.save();
-    return edge;
+    return edgeProperties != null
+        ? fromVertex.newEdge(type, toVertex, edgeProperties)
+        : fromVertex.newEdge(type, toVertex);
   }
 
   /**

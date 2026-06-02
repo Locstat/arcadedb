@@ -20,11 +20,15 @@ package com.arcadedb.server.ha.raft;
 
 import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.database.Binary;
+import com.arcadedb.database.BootstrapFingerprint;
 import com.arcadedb.database.DatabaseInternal;
+import com.arcadedb.database.LocalDatabase;
 import com.arcadedb.engine.ComponentFile;
 import com.arcadedb.engine.WALFile;
 import com.arcadedb.exception.WALVersionGapException;
 import com.arcadedb.log.LogManager;
+import com.arcadedb.schema.LocalSchema;
+import com.arcadedb.schema.LocalTimeSeriesType;
 import com.arcadedb.serializer.json.JSONObject;
 import com.arcadedb.server.ArcadeDBServer;
 import com.arcadedb.server.ServerDatabase;
@@ -52,9 +56,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -117,8 +124,8 @@ public class ArcadeStateMachine extends BaseStateMachine {
    * Populated when the entry is applied (locally on every peer), used by the catch-up decision
    * tree (locally bootstrapped vs leader-shipped vs late-newer-joiner refusal). Issue #4147.
    */
-  private final java.util.concurrent.ConcurrentHashMap<String, BootstrapBaseline> bootstrapBaselines =
-      new java.util.concurrent.ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, BootstrapBaseline> bootstrapBaselines =
+      new ConcurrentHashMap<>();
 
   /** Per-database bootstrap baseline as it appears in the committed Raft log entry. */
   public record BootstrapBaseline(String fingerprint, long lastTxId) {
@@ -383,9 +390,10 @@ public class ArcadeStateMachine extends BaseStateMachine {
       // and Max, or reduce per-batch size.
       final long sinceLast = previousElectionTime > 0 ? now - previousElectionTime : -1;
       LogManager.instance().log(this, Level.WARNING,
-          "Leader churn: %s re-elected (term=%d, %d ms since last leader change). "
-              + "Likely cause: leader heartbeat blocked by bulk-load replication. "
-              + "Tune arcadedb.ha.electionTimeoutMin/Max higher or reduce batch size.",
+          """
+          Leader churn: %s re-elected (term=%d, %d ms since last leader change). \
+          Likely cause: leader heartbeat blocked by bulk-load replication. \
+          Tune arcadedb.ha.electionTimeoutMin/Max higher or reduce batch size.""",
           leaderName, currentTerm, sinceLast);
     } else {
       // Different node became leader. Normal failover (network, server restart, etc.).
@@ -620,9 +628,23 @@ public class ArcadeStateMachine extends BaseStateMachine {
           decoded.filesToAdd());
     }
 
+    // A TimeSeries compaction/maintenance entry carries only sealed-store blobs (+ the mutable-bucket
+    // clear WAL) and never changes the schema or creates/removes paginated files. For such entries we
+    // MUST NOT re-update + reload the schema: load() re-instantiates every TimeSeries engine (closing
+    // shard executors with a 30s awaitTermination) on the Raft apply thread, stalling replication.
+    // installSealedFileBytes already reopened the sealed store and the clear WAL applies to the live
+    // mutable-bucket pages, so neither the schema update nor the reload is needed.
+    final boolean sealedOnlyEntry = isEmptyMap(decoded.filesToAdd()) && isEmptyMap(decoded.filesToRemove())
+        && decoded.sealedFileBlobs() != null && !decoded.sealedFileBlobs().isEmpty();
+
     try {
       if (decoded.filesToAdd() != null)
         createNewFiles(db, decoded.filesToAdd());
+
+      // Install any TimeSeries sealed-store blobs BEFORE applying the WAL (issue #4382). The WAL
+      // below carries the mutable-bucket clear; installing the sealed file first guarantees a query
+      // never observes "cleared mutable + stale sealed" (the data-loss window).
+      applySealedBlobs(db, decoded.sealedFileBlobs());
 
       if (decoded.filesToRemove() != null)
         for (final Map.Entry<Integer, String> fileEntry : decoded.filesToRemove().entrySet()) {
@@ -631,7 +653,7 @@ public class ArcadeStateMachine extends BaseStateMachine {
           db.getSchema().getEmbedded().removeFile(fileEntry.getKey());
         }
 
-      if (decoded.schemaJson() != null && !decoded.schemaJson().isEmpty())
+      if (!sealedOnlyEntry && decoded.schemaJson() != null && !decoded.schemaJson().isEmpty())
         db.getSchema().getEmbedded().update(new JSONObject(decoded.schemaJson()));
 
       // Apply WAL entries BEFORE the schema reload. New files created above are initially empty;
@@ -645,7 +667,7 @@ public class ArcadeStateMachine extends BaseStateMachine {
         final List<Map<Integer, Integer>> bucketDeltas = decoded.bucketDeltas();
         for (int i = 0; i < walEntries.size(); i++) {
           final byte[] walData = walEntries.get(i);
-          final Map<Integer, Integer> bucketDelta = (bucketDeltas != null && i < bucketDeltas.size())
+          final Map<Integer, Integer> bucketDelta = bucketDeltas != null && i < bucketDeltas.size()
               ? bucketDeltas.get(i)
               : Collections.emptyMap();
           final WALFile.WALTransaction walTx = deserializeWalTransaction(walData);
@@ -659,7 +681,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
       // Reload schema after WAL pages are on disk so new index files have valid content
       // and are correctly registered (page counts, type links, in-memory structures).
-      db.getSchema().getEmbedded().load(ComponentFile.MODE.READ_WRITE, true);
+      // Skipped for sealed-only TimeSeries compaction entries (see sealedOnlyEntry above).
+      if (!sealedOnlyEntry)
+        db.getSchema().getEmbedded().load(ComponentFile.MODE.READ_WRITE, true);
 
     } catch (final IOException e) {
       throw new RuntimeException("Failed to apply schema entry for database '" + decoded.databaseName() + "'", e);
@@ -686,7 +710,7 @@ public class ArcadeStateMachine extends BaseStateMachine {
         return;
       final JSONObject types = root.getJSONObject("types");
 
-      final java.util.Set<String> shippedIndexNames = new java.util.HashSet<>();
+      final Set<String> shippedIndexNames = new HashSet<>();
       if (filesToAdd != null) {
         for (final String fullName : filesToAdd.values()) {
           final int firstDot = fullName.indexOf('.');
@@ -733,6 +757,44 @@ public class ArcadeStateMachine extends BaseStateMachine {
         continue;
       db.getFileManager().getOrCreateFile(fileId, databasePath + File.separator + fileName);
     }
+  }
+
+  /**
+   * Installs TimeSeries sealed-store blobs shipped by the leader (issue #4382): for each blob the
+   * full {@code .ts.sealed} file is replaced atomically and the in-memory sealed store reopened.
+   * Idempotent: re-applying the same blob (crash/restart replay) simply rewrites the identical file.
+   */
+  private void applySealedBlobs(final DatabaseInternal db, final List<RaftLogEntryCodec.TsSealedBlob> blobs)
+      throws IOException {
+    if (blobs == null || blobs.isEmpty())
+      return;
+    for (final RaftLogEntryCodec.TsSealedBlob blob : blobs) {
+      final LocalSchema schema = db.getSchema().getEmbedded();
+      if (!schema.existsType(blob.typeName())) {
+        // Should not happen: the type-creation entry has a lower Raft index and is applied first.
+        LogManager.instance().log(this, Level.SEVERE,
+            "Received TimeSeries sealed blob for unknown type '%s' (db=%s); skipping", null, blob.typeName(),
+            decodedDbName(db));
+        continue;
+      }
+      if (!(schema.getType(blob.typeName()) instanceof LocalTimeSeriesType tsType) || tsType.getEngine() == null) {
+        LogManager.instance().log(this, Level.SEVERE,
+            "Received TimeSeries sealed blob for non-timeseries or uninitialized type '%s' (db=%s); skipping", null,
+            blob.typeName(), decodedDbName(db));
+        continue;
+      }
+      tsType.getEngine().getShard(blob.shardIndex()).getSealedStore().installSealedFileBytes(blob.bytes());
+      HALog.log(this, HALog.DETAILED, "Installed TimeSeries sealed blob for %s shard %d (%d bytes) on db '%s'",
+          blob.typeName(), blob.shardIndex(), blob.bytes().length, decodedDbName(db));
+    }
+  }
+
+  private static String decodedDbName(final DatabaseInternal db) {
+    return db != null ? db.getName() : "?";
+  }
+
+  private static boolean isEmptyMap(final Map<?, ?> map) {
+    return map == null || map.isEmpty();
   }
 
   private void applyInstallDatabaseEntry(final RaftLogEntryCodec.DecodedEntry decoded) {
@@ -829,8 +891,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
       // (or natural Raft replay) will create the database and install the leader's snapshot;
       // we just record the baseline.
       LogManager.instance().log(this, Level.INFO,
-          "Bootstrap baseline recorded for '%s' (lastTxId=%d); database not yet present locally, "
-              + "will be created via leader-shipped snapshot",
+          """
+          Bootstrap baseline recorded for '%s' (lastTxId=%d); database not yet present locally, \
+          will be created via leader-shipped snapshot""",
           dbName, chosenLastTxId);
       return;
     }
@@ -842,14 +905,14 @@ public class ArcadeStateMachine extends BaseStateMachine {
     try {
       final ServerDatabase serverDb = server.getDatabase(dbName);
       final DatabaseInternal embedded = serverDb.getWrappedDatabaseInstance().getEmbedded();
-      if (!(embedded instanceof com.arcadedb.database.LocalDatabase localDb)) {
+      if (!(embedded instanceof LocalDatabase localDb)) {
         LogManager.instance().log(this, Level.WARNING,
             "BOOTSTRAP_FINGERPRINT_ENTRY for '%s': embedded database is not a LocalDatabase, skipping",
             dbName);
         return;
       }
       localPath = localDb.getDatabasePath();
-      localFingerprint = com.arcadedb.database.BootstrapFingerprint.compute(new File(localPath));
+      localFingerprint = BootstrapFingerprint.compute(new File(localPath));
       localLastTxId = localDb.getLastTransactionId();
     } catch (final Exception e) {
       LogManager.instance().log(this, Level.WARNING,
@@ -874,11 +937,12 @@ public class ArcadeStateMachine extends BaseStateMachine {
     // transactions on a single pod by re-bootstrapping from older peers.
     if (localLastTxId > chosenLastTxId) {
       LogManager.instance().log(this, Level.SEVERE,
-          "Database '%s': local lastTxId=%d is GREATER than cluster bootstrap lastTxId=%d. "
-              + "This peer's data is fresher than the cluster's chosen baseline (committed "
-              + "BOOTSTRAP_FINGERPRINT_ENTRY). Refusing to overwrite local data. To preserve it, "
-              + "stop the cluster, copy this peer's database directory to every other peer, then "
-              + "restart all peers.",
+          """
+          Database '%s': local lastTxId=%d is GREATER than cluster bootstrap lastTxId=%d. \
+          This peer's data is fresher than the cluster's chosen baseline (committed \
+          BOOTSTRAP_FINGERPRINT_ENTRY). Refusing to overwrite local data. To preserve it, \
+          stop the cluster, copy this peer's database directory to every other peer, then \
+          restart all peers.""",
           dbName, localLastTxId, chosenLastTxId);
       return;
     }
@@ -888,8 +952,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
     // place; at bootstrap time the Ratis log is empty on every peer so a transaction-level
     // delta cannot be served from it.
     LogManager.instance().log(this, Level.INFO,
-        "Database '%s' bootstrap mismatch (local lastTxId=%d / fp=%s..., baseline lastTxId=%d / fp=%s...); "
-            + "reinstalling from leader-shipped full snapshot",
+        """
+        Database '%s' bootstrap mismatch (local lastTxId=%d / fp=%s..., baseline lastTxId=%d / fp=%s...); \
+        reinstalling from leader-shipped full snapshot""",
         dbName, localLastTxId, localFingerprint.substring(0, Math.min(8, localFingerprint.length())),
         chosenLastTxId, chosenFingerprint.substring(0, Math.min(8, chosenFingerprint.length())));
     installFromLeaderForBootstrap(dbName);
@@ -1054,9 +1119,14 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
     tx.txId = buf.getLong();
     tx.timestamp = buf.getLong();
-    tx.forceApply = (tx.txId < 0); // negative txId signals compaction page replication
+    tx.forceApply = tx.txId < 0; // negative txId signals compaction page replication
     final int pageCount = buf.getInt();
     buf.getInt(); // segmentSize - not needed for deserialization
+
+    // Reject a corrupted/misaligned entry instead of blowing up with a cryptic NegativeArraySizeException (issue #4420):
+    // every WAL page occupies at least its 24-byte fixed header, so a page count exceeding the remaining bytes is corruption.
+    if (pageCount < 0 || (long) pageCount * 6 * Integer.BYTES > buf.remaining())
+      throw new ReplicationException("Corrupted WAL transaction entry: invalid page count " + pageCount);
 
     tx.pages = new WALFile.WALPage[pageCount];
 
@@ -1070,6 +1140,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
       page.currentPageSize = buf.getInt();
 
       final int deltaSize = page.changesTo - page.changesFrom + 1;
+      if (deltaSize <= 0 || page.changesFrom < 0 || deltaSize > buf.remaining())
+        throw new ReplicationException("Corrupted WAL transaction entry: invalid delta range [" + page.changesFrom + ","
+            + page.changesTo + "] for page " + page.fileId + ":" + page.pageNumber);
       final byte[] content = new byte[deltaSize];
       buf.get(content);
       page.currentContent = new Binary(content);
