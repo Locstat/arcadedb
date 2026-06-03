@@ -65,6 +65,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 
@@ -94,6 +95,15 @@ import java.util.logging.Level;
  * interrupted by a process crash.
  */
 public class ArcadeStateMachine extends BaseStateMachine {
+
+  /**
+   * Test-only WAL gap counter. When non-null, incremented each time a follower detects a
+   * WAL page-version gap. Used by deterministic tests to verify no gap occurred.
+   * <p>
+   * Tests that set this MUST reset it to {@code null} in an {@code @AfterEach} method, otherwise
+   * it leaks into subsequent tests in the same JVM.
+   */
+  public static volatile AtomicInteger TEST_WAL_GAP_COUNTER = null;
 
   private final    SimpleStateMachineStorage storage          = new SimpleStateMachineStorage();
   private final    AtomicLong                lastAppliedIndex = new AtomicLong(-1);
@@ -131,8 +141,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
   public record BootstrapBaseline(String fingerprint, long lastTxId) {
   }
 
-  private final AtomicBoolean needsSnapshotDownload = new AtomicBoolean(false);
-  private final AtomicBoolean catchingUp            = new AtomicBoolean(false);
+  private final AtomicBoolean needsSnapshotDownload      = new AtomicBoolean(false);
+  private final AtomicBoolean snapshotDownloadInProgress = new AtomicBoolean(false);
+  private final AtomicBoolean catchingUp                 = new AtomicBoolean(false);
   // Set to true after applyTransaction catches an unexpected Throwable (OOM, NPE, etc.). The
   // state machine's in-memory schema/page state can be inconsistent at that point (issue #4219:
   // mid-load OOM leaves bucketMap cleared but not repopulated), so any subsequent apply
@@ -577,6 +588,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
     } catch (final WALVersionGapException e) {
       // Version gap: WAL page version > DB page version + 1 - an intermediate transaction
       // was never applied on this node. State has diverged; trigger snapshot resync.
+      final AtomicInteger gapCounter = TEST_WAL_GAP_COUNTER;
+      if (gapCounter != null)
+        gapCounter.incrementAndGet();
       LogManager.instance().log(this, Level.SEVERE,
           "WAL version gap on follower - state divergence detected, triggering snapshot resync (db=%s, txId=%d): %s",
           decoded.databaseName(), walTx.txId, e.getMessage());
@@ -997,6 +1011,62 @@ public class ArcadeStateMachine extends BaseStateMachine {
   }
 
   /**
+   * Operator-triggered emergency recovery: drop the local copy of {@code dbName} and re-acquire a
+   * fresh full snapshot from the current leader. This is the manual equivalent of the automatic
+   * snapshot install path ({@link #notifyInstallSnapshotFromLeader}) and uses the same crash-safe
+   * {@link SnapshotInstaller} machinery as {@link #installFromLeaderForBootstrap}.
+   * <p>
+   * The intended use case is a follower that has diverged from the leader (e.g. a
+   * {@link WALVersionGapException} reported "snapshot resync required"): the diverged page versions
+   * can never be reconciled by applying further deltas, so the only safe fix is to replace the local
+   * files with the leader's authoritative copy. After install the local database matches the leader's
+   * snapshot point; any Raft log entries replayed afterwards that predate the snapshot are skipped by
+   * the page-version guard in {@code applyChanges}, and forward replication resumes normally.
+   * <p>
+   * Runs synchronously on the caller thread (the HTTP worker thread). Refuses to run on the leader
+   * (it holds the authoritative copy) and when no leader is currently known.
+   *
+   * @param dbName name of the database to resync from the leader
+   * @throws ReplicationException if Raft HA is not enabled, this node is the leader, the leader is
+   *                              unknown, or the snapshot install fails
+   */
+  public void resyncDatabaseFromLeader(final String dbName) {
+    final RaftHAServer raft = raftHAServer;
+    if (raft == null)
+      throw new ReplicationException("Cannot resync database '" + dbName + "': Raft HA is not enabled");
+
+    if (raft.isLeader())
+      throw new ReplicationException("Cannot resync database '" + dbName
+          + "' on the leader: the leader holds the authoritative copy. Run the resync on the diverged follower.");
+
+    if (raft.getLeaderHttpAddress() == null)
+      throw new ReplicationException("Cannot resync database '" + dbName
+          + "': the leader is currently unknown (election in progress?). Retry once a leader is elected.");
+
+    LogManager.instance().log(this, Level.WARNING,
+        "Operator-triggered resync of database '%s' from leader: dropping local copy and re-acquiring full snapshot", dbName);
+
+    try {
+      final String databasePath;
+      if (server.existsDatabase(dbName)) {
+        final DatabaseInternal db = (DatabaseInternal) server.getDatabase(dbName);
+        databasePath = db.getDatabasePath();
+        db.getEmbedded().close();
+        server.removeDatabase(dbName);
+      } else {
+        databasePath = server.getConfiguration().getValueAsString(GlobalConfiguration.SERVER_DATABASE_DIRECTORY)
+            + File.separator + dbName;
+      }
+      // Resolve the leader address on each retry (it can change mid-operation if leadership moves).
+      final String clusterToken = raft.getClusterToken();
+      SnapshotInstaller.install(dbName, databasePath, raft::getLeaderHttpAddress, clusterToken, server);
+      LogManager.instance().log(this, Level.INFO, "Database '%s' resynced from leader on operator request", dbName);
+    } catch (final IOException e) {
+      throw new ReplicationException("Failed to resync database '" + dbName + "' from leader", e);
+    }
+  }
+
+  /**
    * Returns the bootstrap baseline committed for {@code dbName}, or {@code null} if no
    * {@link RaftLogEntryType#BOOTSTRAP_FINGERPRINT_ENTRY} has been applied for it. Visible to
    * tests and the cluster-status exporter (Phase 7).
@@ -1070,13 +1140,21 @@ public class ArcadeStateMachine extends BaseStateMachine {
   private void triggerSnapshotDownload() {
     if (raftHAServer == null || server == null)
       return;
-    final String leaderHttpAddr = raftHAServer.getLeaderHttpAddress();
-    if (leaderHttpAddr == null) {
-      LogManager.instance().log(this, Level.WARNING,
-          "Cannot trigger snapshot download: leader HTTP address unknown");
+    // Single-flight guard: multiple recovery paths (reinitialize watchdog, notifyLeaderChanged,
+    // stale-follower recovery from the HealthMonitor) can request a download. Only one may run at
+    // a time; concurrent requests are dropped. The flag also feeds isSnapshotDownloadPending() so
+    // the stale-follower check does not re-arm while a download is already in flight.
+    if (!snapshotDownloadInProgress.compareAndSet(false, true)) {
+      HALog.log(this, HALog.BASIC, "Snapshot download already in progress, skipping duplicate request");
       return;
     }
     try {
+      final String leaderHttpAddr = raftHAServer.getLeaderHttpAddress();
+      if (leaderHttpAddr == null) {
+        LogManager.instance().log(this, Level.WARNING,
+            "Cannot trigger snapshot download: leader HTTP address unknown");
+        return;
+      }
       final String clusterToken = raftHAServer.getClusterToken();
       for (final String dbName : server.getDatabaseNames()) {
         if (server.existsDatabase(dbName)) {
@@ -1090,7 +1168,50 @@ public class ArcadeStateMachine extends BaseStateMachine {
       LogManager.instance().log(this, Level.INFO, "Snapshot download triggered by watchdog completed");
     } catch (final Exception e) {
       LogManager.instance().log(this, Level.SEVERE, "Snapshot download triggered by watchdog failed", e);
+    } finally {
+      snapshotDownloadInProgress.set(false);
     }
+  }
+
+  /**
+   * Returns {@code true} while this follower is replaying a burst of log entries to close a gap
+   * with the leader (set in {@link #applyTransaction} when the applied-index jumps by more than one
+   * and cleared once the applied index reaches the commit index). Used by the {@link HealthMonitor}
+   * stale-follower check to avoid acting on lag that is actively shrinking.
+   */
+  public boolean isCatchingUp() {
+    return catchingUp.get();
+  }
+
+  /**
+   * Returns {@code true} if a snapshot download is queued (gap detected during {@code reinitialize})
+   * or currently running. The {@link HealthMonitor} stale-follower check uses this to avoid
+   * re-arming recovery while one is already in flight.
+   */
+  public boolean isSnapshotDownloadPending() {
+    return needsSnapshotDownload.get() || snapshotDownloadInProgress.get();
+  }
+
+  /**
+   * Re-arms a snapshot download from the leader for a follower that has been persistently lagging
+   * without making progress (issue #3893). This covers the narrow window where a follower diverged
+   * (apply failure) and its snapshot download also failed on a quiet cluster, so no new log entry
+   * arrives to re-trigger recovery and the follower would otherwise stay diverged until restart.
+   * <p>
+   * Invoked by {@link HealthMonitor} after the lag has persisted for the configured duration.
+   * No-op when this node is the leader, when there is no leader/server context, or when a download
+   * is already pending or in progress.
+   */
+  public void recoverFromPersistentLag() {
+    final RaftHAServer raftHA = this.raftHAServer;
+    if (raftHA == null || server == null || raftHA.isLeader())
+      return;
+    if (isSnapshotDownloadPending())
+      return;
+    LogManager.instance().log(this, Level.WARNING,
+        "Persistent follower lag detected (applied=%d, commit=%d): re-arming snapshot download from leader",
+        lastAppliedIndex.get(), raftHA.getCommitIndex());
+    lifecycleExecutor.submit(this::triggerSnapshotDownload);
   }
 
   @Override
