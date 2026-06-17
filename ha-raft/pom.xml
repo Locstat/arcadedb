@@ -67,6 +67,17 @@
             <groupId>org.apache.ratis</groupId>
             <artifactId>ratis-server</artifactId>
             <version>${ratis.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.ratis</groupId>
+                    <artifactId>ratis-thirdparty-misc</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.ratis</groupId>
+            <artifactId>ratis-thirdparty-misc</artifactId>
+            <version>1.0.11.2</version>
         </dependency>
         <dependency>
             <groupId>org.apache.ratis</groupId>
