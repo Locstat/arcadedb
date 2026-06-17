@@ -123,6 +123,28 @@ public final class VectorUtils {
    *                                  or contains non-numeric elements
    */
   public static float[] toFloatArray(final Object vectorObj) {
+    return toFloatArray(vectorObj, false);
+  }
+
+  /**
+   * Variant of {@link #toFloatArray(Object)} that maps {@code null} collection elements to
+   * {@link Float#NaN} instead of throwing. Used by the validity-check functions
+   * {@code vector.hasNaN} and {@code vector.hasInf} (issue #3099): an invalid SQL math op such as
+   * {@code sqrt(-1.0)} is coerced to {@code NULL} inside a collection literal, so
+   * {@code vector.hasNaN([1.0, sqrt(-1.0), 3.0])} must detect it as a NaN rather than crashing the
+   * conversion with a {@code NullPointerException}. By substituting {@code NaN} for {@code null},
+   * {@code hasNaN} naturally returns {@code true} and {@code hasInf} naturally ignores it (NaN is not
+   * infinite), keeping both functions symmetric without per-function null handling.
+   *
+   * @param vectorObj the object to convert
+   *
+   * @return float array representation, with null elements replaced by {@link Float#NaN}
+   */
+  public static float[] toFloatArrayNaNForNull(final Object vectorObj) {
+    return toFloatArray(vectorObj, true);
+  }
+
+  private static float[] toFloatArray(final Object vectorObj, final boolean nullElementAsNaN) {
     if (vectorObj instanceof float[] f)
       return f;
     if (vectorObj instanceof byte[])
@@ -152,37 +174,110 @@ public final class VectorUtils {
     }
     if (vectorObj instanceof Object[] objArray) {
       final float[] result = new float[objArray.length];
-      for (int i = 0; i < objArray.length; i++) {
-        if (objArray[i] instanceof Number num)
-          result[i] = num.floatValue();
-        else
-          throw new IllegalArgumentException("Vector elements must be numbers, found: " + objArray[i].getClass().getSimpleName());
-      }
+      for (int i = 0; i < objArray.length; i++)
+        result[i] = elementToFloat(objArray[i], nullElementAsNaN);
       return result;
     }
     if (vectorObj instanceof List<?> list) {
       final float[] result = new float[list.size()];
-      for (int i = 0; i < list.size(); i++) {
-        final Object elem = list.get(i);
-        if (elem instanceof Number num)
-          result[i] = num.floatValue();
-        else
-          throw new IllegalArgumentException("Vector elements must be numbers, found: " + elem.getClass().getSimpleName());
-      }
+      for (int i = 0; i < list.size(); i++)
+        result[i] = elementToFloat(list.get(i), nullElementAsNaN);
       return result;
     }
     if (vectorObj instanceof String s) {
       final String trimmed = s.trim();
       final String inner = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.substring(1, trimmed.length() - 1) : trimmed;
-      if (inner.isEmpty())
+      final String cleaned = inner.trim();
+      if (cleaned.isEmpty())
         return new float[0];
-      final String[] parts = inner.split(",");
+      // Split on commas and/or whitespace so every asString()/vector.toString() format round-trips:
+      // comma-separated (COMPACT/PYTHON/JULIA/NUMPY), space-separated (MATLAB) and multi-line (PRETTY).
+      final String[] parts = cleaned.split("[,\\s]+");
       final float[] result = new float[parts.length];
       for (int i = 0; i < parts.length; i++)
-        result[i] = Float.parseFloat(parts[i].trim());
+        result[i] = Float.parseFloat(parts[i]);
       return result;
     }
     throw new IllegalArgumentException("Vector must be an array or list, found: " + vectorObj.getClass().getSimpleName());
+  }
+
+  /**
+   * Converts a single collection element to a float. A {@code null} element either becomes
+   * {@link Float#NaN} (when {@code nullElementAsNaN} is set, for the validity-check functions) or
+   * triggers a clear {@link IllegalArgumentException} - never a {@link NullPointerException} from
+   * calling {@code getClass()} on a null (issue #3099).
+   */
+  private static float elementToFloat(final Object elem, final boolean nullElementAsNaN) {
+    if (elem instanceof Number num)
+      return num.floatValue();
+    if (elem == null) {
+      if (nullElementAsNaN)
+        return Float.NaN;
+      throw new IllegalArgumentException("Vector elements must be numbers, found: null");
+    }
+    throw new IllegalArgumentException("Vector elements must be numbers, found: " + elem.getClass().getSimpleName());
+  }
+
+  /**
+   * Human-readable string formats for a vector, shared by the {@code vector.toString()} SQL function and
+   * the {@code asString()} SQL method.
+   * <ul>
+   *   <li>{@code COMPACT}: single line {@code [1.0, 2.0, 3.0]} (default)</li>
+   *   <li>{@code PRETTY}: one element per line</li>
+   *   <li>{@code PYTHON}: Python list literal {@code [1.0, 2.0, 3.0]}</li>
+   *   <li>{@code MATLAB}: space-separated row vector {@code [1.0 2.0 3.0]}</li>
+   *   <li>{@code JULIA}: Julia vector literal {@code [1.0, 2.0, 3.0]}</li>
+   *   <li>{@code NUMPY}: bare comma-separated {@code 1.0, 2.0, 3.0} (no brackets), suitable for
+   *       {@code numpy.fromstring(..., sep=",")}</li>
+   * </ul>
+   */
+  public enum StringFormat {
+    COMPACT,
+    PRETTY,
+    PYTHON,
+    MATLAB,
+    JULIA,
+    NUMPY
+  }
+
+  /**
+   * Parses a (case-insensitive) format name into a {@link StringFormat}.
+   *
+   * @throws IllegalArgumentException with the list of supported formats when the name is unknown
+   */
+  public static StringFormat parseStringFormat(final String name) {
+    try {
+      return StringFormat.valueOf(name.toUpperCase(java.util.Locale.ROOT));
+    } catch (final IllegalArgumentException e) {
+      throw new IllegalArgumentException("Unknown format: " + name + ". Supported: COMPACT, PRETTY, PYTHON, MATLAB, JULIA, NUMPY");
+    }
+  }
+
+  /**
+   * Renders a vector to a string using the given {@link StringFormat}. An empty vector renders as
+   * {@code []} (or an empty string for {@code NUMPY}).
+   */
+  public static String formatVector(final float[] vector, final StringFormat format) {
+    final String separator = format == StringFormat.MATLAB ? " " : ", ";
+    if (format == StringFormat.PRETTY) {
+      final StringBuilder sb = new StringBuilder("[\n");
+      for (int i = 0; i < vector.length; i++) {
+        sb.append("  ").append(vector[i]);
+        if (i < vector.length - 1)
+          sb.append(",");
+        sb.append("\n");
+      }
+      return sb.append("]").toString();
+    }
+
+    final StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < vector.length; i++) {
+      if (i > 0)
+        sb.append(separator);
+      sb.append(vector[i]);
+    }
+    // NUMPY emits a bare comma-separated list (no brackets) for numpy.fromstring(); all others bracket it.
+    return format == StringFormat.NUMPY ? sb.toString() : "[" + sb + "]";
   }
 
   /**
@@ -339,6 +434,14 @@ public final class VectorUtils {
    * @return cosine similarity value between -1 and 1
    */
   public static float cosineSimilarity(final float[] v1, final float[] v2) {
+    // Issue #4583: a zero-magnitude vector yields an undefined cosine (0/0). The JVector SIMD path
+    // returns NaN (and throws an AssertionError when run with -ea) while the scalar fallback below
+    // returns 0.0f, so the same query could rank differently depending on whether the JVM has the
+    // Vector API enabled, and NaN would poison Float.compare ordering. Guard up front and return a
+    // consistent 0.0f sentinel (distance 1.0 for the 1 - score callers). isZeroVector short-circuits
+    // on the first non-zero element, so this is O(1) for the common non-degenerate case.
+    if (isZeroVector(v1) || isZeroVector(v2))
+      return 0.0f;
     try {
       final VectorizationProvider vp = VectorizationProvider.getInstance();
       final VectorFloat<?> jv1 = vp.getVectorTypeSupport().createFloatVector(v1);
@@ -350,7 +453,9 @@ public final class VectorUtils {
       double normA = 0.0;
       double normB = 0.0;
       for (int i = 0; i < v1.length; i++) {
-        dotProduct += v1[i] * v2[i];
+        // Cast operands to double before multiplying so the dot-product accumulates at the same
+        // precision as normA/normB instead of forming a float product first (issue #4583).
+        dotProduct += (double) v1[i] * v2[i];
         normA += (double) v1[i] * v1[i];
         normB += (double) v2[i] * v2[i];
       }

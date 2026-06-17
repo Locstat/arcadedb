@@ -20,27 +20,31 @@ package com.arcadedb.query.opencypher.query;
 
 import com.arcadedb.ContextConfiguration;
 import com.arcadedb.database.Database;
+import com.arcadedb.database.DatabaseContext;
 import com.arcadedb.database.Document;
 import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.Record;
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.exception.CommandParsingException;
 import com.arcadedb.exception.QueryNotIdempotentException;
+import com.arcadedb.query.OperationType;
+import com.arcadedb.query.QueryEngine;
+import com.arcadedb.query.QuerySession;
 import com.arcadedb.query.opencypher.ast.CypherAdminStatement;
 import com.arcadedb.query.opencypher.ast.CypherDDLStatement;
-import com.arcadedb.query.opencypher.optimizer.plan.PhysicalPlan;
+import com.arcadedb.query.opencypher.ast.CypherSessionStatement;
 import com.arcadedb.query.opencypher.ast.CypherStatement;
 import com.arcadedb.query.opencypher.ast.CypherTransactionStatement;
-import com.arcadedb.query.opencypher.planner.CypherExecutionPlanner;
 import com.arcadedb.query.opencypher.executor.CypherExecutionPlan;
 import com.arcadedb.query.opencypher.executor.CypherFunctionFactory;
 import com.arcadedb.query.opencypher.executor.ExpressionEvaluator;
-import com.arcadedb.query.OperationType;
-import com.arcadedb.query.QueryEngine;
-import com.arcadedb.utility.CollectionUtils;
+import com.arcadedb.query.opencypher.optimizer.plan.PhysicalPlan;
+import com.arcadedb.query.opencypher.planner.CypherExecutionPlanner;
+import com.arcadedb.query.sql.executor.BasicCommandContext;
 import com.arcadedb.query.sql.executor.InternalResultSet;
 import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
+import com.arcadedb.utility.CollectionUtils;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.Property;
 import com.arcadedb.schema.Schema;
@@ -102,13 +106,13 @@ public class OpenCypherQueryEngine implements QueryEngine {
         public Set<OperationType> getOperationTypes() {
           if (statement instanceof CypherAdminStatement)
             return CollectionUtils.singletonSet(OperationType.ADMIN);
-          // Transaction control (START TRANSACTION/COMMIT/ROLLBACK) is a session-control operation that
-          // reads/writes no data itself; the writes it wraps are gated by their own operation types. So it
-          // must not be classified as ADMIN (that would lock it behind the MCP admin flag and stop a
-          // write-capable agent from committing its own writes). This permission axis is independent of
-          // isReadOnly()/HA routing (see CypherTransactionStatement.isReadOnly()), so keep this check ahead
-          // of the isReadOnly()/write-detection fallback below to avoid the write-set misclassification.
-          if (statement instanceof CypherTransactionStatement)
+          // Server-control statements (transaction control and session management) read/write no data
+          // themselves; the writes they wrap are gated by their own operation types. They must not be
+          // classified as ADMIN (that would lock them behind the MCP admin flag and stop a write-capable
+          // agent from committing its own writes). This permission axis is independent of isReadOnly()/HA
+          // routing - see CypherStatement.isServerControlStatement() - so keep this check ahead of the
+          // isReadOnly()/write-detection fallback below to avoid the write-set misclassification.
+          if (statement.isServerControlStatement())
             return CollectionUtils.singletonSet(OperationType.READ);
           if (statement instanceof CypherDDLStatement)
             return CollectionUtils.singletonSet(OperationType.SCHEMA);
@@ -160,6 +164,11 @@ public class OpenCypherQueryEngine implements QueryEngine {
       // Use statement cache to avoid re-parsing
       final CypherStatement statement = database.getCypherStatementCache().get(actualQuery);
 
+      // Make any session parameters (SESSION SET) visible to this query as $name.
+      final QuerySession session = currentQuerySession();
+      final Map<String, Object> effectiveParameters = QuerySession.mergeParameters(
+          session != null ? session.getParameters() : null, parameters);
+
       // EXPLAIN never executes the underlying query, so the idempotency rule does not apply.
       // PROFILE is treated as idempotent at the wrapper level to match SQL parity
       // (see ProfileStatement/ExplainStatement in the SQL parser, both return isIdempotent()==true).
@@ -169,7 +178,7 @@ public class OpenCypherQueryEngine implements QueryEngine {
       if (!explain && !profile && !statement.isReadOnly())
         throw new QueryNotIdempotentException("Query '" + query + "' is not idempotent");
 
-      return execute(actualQuery, statement, configuration, parameters, explain, profile);
+      return execute(actualQuery, statement, configuration, effectiveParameters, explain, profile);
     } catch (final QueryNotIdempotentException | CommandExecutionException | CommandParsingException | SecurityException e) {
       throw e;
     } catch (final Exception e) {
@@ -219,7 +228,18 @@ public class OpenCypherQueryEngine implements QueryEngine {
       if (statement instanceof CypherTransactionStatement)
         return executeTransaction((CypherTransactionStatement) statement);
 
-      return execute(actualQuery, statement, configuration, parameters, explain, profile);
+      // Make any session parameters (SESSION SET) visible to this command as $name. Resolve the session
+      // once and thread it to both the merge and executeSession (avoids a second thread-context lookup).
+      final QuerySession session = currentQuerySession();
+      final Map<String, Object> effectiveParameters = QuerySession.mergeParameters(
+          session != null ? session.getParameters() : null, parameters);
+
+      // Session management statements (SESSION SET/RESET/CLOSE) operate on the server session bound to
+      // the current thread; executed directly, no planner pipeline.
+      if (statement instanceof CypherSessionStatement)
+        return executeSession((CypherSessionStatement) statement, session, effectiveParameters);
+
+      return execute(actualQuery, statement, configuration, effectiveParameters, explain, profile);
     } catch (final CommandExecutionException | CommandParsingException | SecurityException e) {
       throw e;
     } catch (final Exception e) {
@@ -392,7 +412,11 @@ public class OpenCypherQueryEngine implements QueryEngine {
   }
 
   /**
-   * Maps a Cypher type name (from IS TYPED constraints) to an ArcadeDB Type.
+   * Maps a Cypher type name (from IS TYPED constraints) to an ArcadeDB Type. The GQL numeric width types map
+   * onto ArcadeDB's existing widths (INT8->BYTE, INT16->SHORT, INT32->INTEGER, INT64->LONG, FLOAT32->FLOAT,
+   * FLOAT64->DOUBLE) so a declared property persists and reloads at that width. The mapping mirrors the read
+   * side ({@link com.arcadedb.query.opencypher.ast.IsTypedExpression}): INTEGER is the 64-bit generic, INT
+   * aliases INT32. Keeping the two sides aligned is what makes a declared column satisfy its own IS TYPED.
    */
   private static Type mapCypherType(final String cypherType) {
     switch (cypherType) {
@@ -402,12 +426,23 @@ public class OpenCypherQueryEngine implements QueryEngine {
     case "STRING":
     case "VARCHAR":
       return Type.STRING;
-    case "INTEGER":
+    case "INT8":
+    case "INTEGER8":
+      return Type.BYTE;
+    case "INT16":
+    case "INTEGER16":
+      return Type.SHORT;
     case "INT":
+    case "INT32":
+    case "INTEGER32":
+      return Type.INTEGER;
+    case "INTEGER":
     case "SIGNED INTEGER":
     case "INTEGER64":
     case "INT64":
       return Type.LONG;
+    case "FLOAT32":
+      return Type.FLOAT;
     case "FLOAT":
     case "FLOAT64":
       return Type.DOUBLE;
@@ -553,6 +588,64 @@ public class OpenCypherQueryEngine implements QueryEngine {
       break;
     default:
       throw new IllegalStateException("Unhandled transaction kind: " + txn.getKind());
+    }
+
+    resultSet.add(result);
+    return resultSet;
+  }
+
+  /**
+   * Returns the {@link QuerySession} attached to this thread's context by the server (HTTP/Bolt), or
+   * {@code null} in embedded use. Resolved once per command/query and threaded to both the parameter merge
+   * and {@link #executeSession} so the thread-context is not looked up twice. Session parameters become
+   * visible to a Cypher command or query as {@code $name} only on this OpenCypher engine path, since they
+   * are a GQL concept.
+   */
+  private QuerySession currentQuerySession() {
+    final DatabaseContext.DatabaseContextTL ctx = DatabaseContext.INSTANCE.getContextIfExists(database.getDatabasePath());
+    return ctx != null ? ctx.getQuerySession() : null;
+  }
+
+  /**
+   * Executes a session management statement (SESSION SET/RESET/CLOSE) against the {@link QuerySession}
+   * attached to the current thread context by the server. In embedded use (no server session) there is
+   * nothing attached, so the statement reports an actionable error rather than silently doing nothing.
+   */
+  private ResultSet executeSession(final CypherSessionStatement stmt, final QuerySession session,
+      final Map<String, Object> parameters) {
+    if (session == null)
+      throw new CommandExecutionException(
+          "SESSION statements require a server session (set the 'arcadedb-session-id' HTTP header); not available in embedded mode");
+
+    final InternalResultSet resultSet = new InternalResultSet();
+    final ResultInternal result = new ResultInternal(database);
+
+    switch (stmt.getKind()) {
+    case SET:
+      final BasicCommandContext context = new BasicCommandContext();
+      context.setDatabase(database);
+      // 'parameters' already carries the session parameters (merged once in command()), so a value can
+      // reference an earlier session parameter or a request parameter.
+      context.setInputParameters(parameters);
+      final Object value = EXPRESSION_EVALUATOR.evaluate(stmt.getValueExpression(), new ResultInternal(database), context);
+      session.setParameter(stmt.getParameterName(), value);
+      result.setProperty("operation", "set");
+      result.setProperty("name", stmt.getParameterName());
+      result.setProperty("value", value);
+      break;
+    case RESET:
+      session.reset();
+      result.setProperty("operation", "reset");
+      break;
+    case CLOSE:
+      // Depending on the owner, close() may roll back the session's transaction (HTTP). It runs while this
+      // command is still in flight, so any further DB operation issued in the same request/session after
+      // SESSION CLOSE would act on an already-finalized transaction.
+      session.close();
+      result.setProperty("operation", "close");
+      break;
+    default:
+      throw new IllegalStateException("Unhandled session kind: " + stmt.getKind());
     }
 
     resultSet.add(result);

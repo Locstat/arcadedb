@@ -19,6 +19,7 @@
 package com.arcadedb.server.grpc;
 
 import com.arcadedb.database.Database;
+import com.arcadedb.database.ProtocolContext;
 import com.arcadedb.database.DatabaseContext;
 import com.arcadedb.database.DatabaseFactory;
 import com.arcadedb.database.DatabaseInternal;
@@ -45,6 +46,7 @@ import com.arcadedb.schema.EdgeType;
 import com.arcadedb.schema.Property;
 import com.arcadedb.schema.Schema;
 import com.arcadedb.schema.VertexType;
+import com.arcadedb.security.SecurityDatabaseUser;
 import com.arcadedb.serializer.JsonSerializer;
 import com.arcadedb.server.ArcadeDBServer;
 import com.arcadedb.server.grpc.InsertOptions.ConflictMode;
@@ -266,6 +268,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     boolean beganHere = false;
     final QueryProfile profile = new QueryProfile();
     QueryProfile.pushCurrent(profile);
+    ProtocolContext.set("grpc");
     String profileLanguage = null;
 
     try {
@@ -450,6 +453,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           .setExecutionTimeMs(ms)
           .build();
     } finally {
+      ProtocolContext.clear();
       recordGrpcProfile("grpc.command", profile, db != null ? db.getName() : req.getDatabase(),
           profileLanguage != null ? profileLanguage : req.getLanguage(), req.getCommand());
       QueryProfile.popCurrent();
@@ -593,22 +597,47 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
   @Override
   public void lookupByRid(LookupByRidRequest req, StreamObserver<LookupByRidResponse> resp) {
+    // When the read is part of an externally-managed transaction, execute it on the transaction's dedicated thread so the
+    // record version is tracked in that transaction. Under REPEATABLE_READ this is what lets a later write detect a
+    // concurrent modification on commit, mirroring the HTTP behavior (issue #4533).
+    final String incomingTxId = req.hasTransaction() ? req.getTransaction().getTransactionId() : null;
+    final TransactionContext txCtx = incomingTxId != null && !incomingTxId.isBlank()
+        ? activeTransactions.get(incomingTxId) : null;
+
+    if (txCtx != null) {
+      try {
+        final Future<LookupByRidResponse> future = txCtx.executor.submit(() -> lookupByRidInternal(req, txCtx.db));
+        resp.onNext(future.get());
+        resp.onCompleted();
+      } catch (Exception e) {
+        final Throwable cause = e instanceof ExecutionException && e.getCause() != null ? e.getCause() : e;
+        if (cause instanceof RecordNotFoundException)
+          resp.onError(Status.NOT_FOUND.withDescription("LookupByRid: " + cause.getMessage()).asException());
+        else
+          resp.onError(Status.INTERNAL.withDescription("LookupByRid: " + cause.getMessage()).asException());
+      }
+      return;
+    }
+
     try {
-      Database db = getDatabase(req.getDatabase(), req.getCredentials());
-
-      final String ridStr = req.getRid();
-      if (ridStr == null || ridStr.isBlank())
-        throw new IllegalArgumentException("rid is required");
-
-      var el = db.lookupByRID(new RID(ridStr), true);
-
-      resp.onNext(LookupByRidResponse.newBuilder().setFound(true).setRecord(convertToGrpcRecord(el.getRecord(), db)).build());
+      final Database db = getDatabase(req.getDatabase(), req.getCredentials());
+      resp.onNext(lookupByRidInternal(req, db));
       resp.onCompleted();
     } catch (RecordNotFoundException e) {
       resp.onError(Status.NOT_FOUND.withDescription("LookupByRid: " + e.getMessage()).asException());
     } catch (Exception e) {
       resp.onError(Status.INTERNAL.withDescription("LookupByRid: " + e.getMessage()).asException());
     }
+  }
+
+  private LookupByRidResponse lookupByRidInternal(final LookupByRidRequest req, final Database db) {
+    final String ridStr = req.getRid();
+    if (ridStr == null || ridStr.isBlank())
+      throw new IllegalArgumentException("rid is required");
+
+    final var el = db.lookupByRID(new RID(ridStr), true);
+
+    return LookupByRidResponse.newBuilder().setFound(true).setRecord(convertToGrpcRecord(el.getRecord(), db)).build();
   }
 
   @Override
@@ -691,6 +720,15 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         final Map<String, GrpcValue> props = req.hasRecord() ? req.getRecord().getPropertiesMap()
             : req.hasPartial() ? req.getPartial().getPropertiesMap() : Collections.emptyMap();
 
+        // In full-replacement mode (oneof "record") remove the properties that are no longer present, so a
+        // client-side save() that dropped a property is mirrored on the server (matches the HTTP "update content"
+        // semantics). In partial mode (oneof "partial") only the provided keys are merged.
+        if (req.hasRecord()) {
+          for (final String existing : new ArrayList<>(mvertex.getPropertyNames()))
+            if (!props.containsKey(existing))
+              mvertex.remove(existing);
+        }
+
         // Exclude ArcadeDB system fields during update
 
         props.forEach((k, v) -> {
@@ -717,6 +755,15 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
         final Map<String, GrpcValue> props = req.hasRecord() ? req.getRecord().getPropertiesMap()
             : req.hasPartial() ? req.getPartial().getPropertiesMap() : Collections.emptyMap();
+
+        // In full-replacement mode (oneof "record") remove the properties that are no longer present, so a
+        // client-side save() that dropped a property is mirrored on the server (matches the HTTP "update content"
+        // semantics). In partial mode (oneof "partial") only the provided keys are merged.
+        if (req.hasRecord()) {
+          for (final String existing : new ArrayList<>(mdoc.getPropertyNames()))
+            if (!props.containsKey(existing))
+              mdoc.remove(existing);
+        }
 
         // Exclude ArcadeDB system fields during update
 
@@ -888,6 +935,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
   private ExecuteQueryResponse executeQueryInternal(final ExecuteQueryRequest request, final Database database) {
     final QueryProfile profile = new QueryProfile();
     QueryProfile.pushCurrent(profile);
+    ProtocolContext.set("grpc");
     String profileLanguage = null;
     try {
       final long deserStart = System.nanoTime();
@@ -968,6 +1016,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         return response;
       }
     } finally {
+      ProtocolContext.clear();
       recordGrpcProfile("grpc.query", profile, database != null ? database.getName() : request.getDatabase(),
           profileLanguage != null ? profileLanguage : request.getLanguage(), request.getQuery());
       QueryProfile.popCurrent();
@@ -995,6 +1044,20 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       projectionConfig = new ProjectionConfig(true, ProjectionEncoding.PROJECTION_AS_JSON, 0);
     }
     return projectionConfig;
+  }
+
+  /**
+   * Maps the wire-protocol {@link TransactionIsolation} to the engine {@link Database.TRANSACTION_ISOLATION_LEVEL}.
+   * ArcadeDB only supports READ_COMMITTED and REPEATABLE_READ, so weaker/stronger levels collapse to the closest match.
+   * Unset (proto default, old clients) maps to READ_COMMITTED to preserve the previous behavior.
+   */
+  private static Database.TRANSACTION_ISOLATION_LEVEL mapIsolationLevel(final TransactionIsolation isolation) {
+    if (isolation == null)
+      return Database.TRANSACTION_ISOLATION_LEVEL.READ_COMMITTED;
+    return switch (isolation) {
+      case REPEATABLE_READ, SERIALIZABLE -> Database.TRANSACTION_ISOLATION_LEVEL.REPEATABLE_READ;
+      default -> Database.TRANSACTION_ISOLATION_LEVEL.READ_COMMITTED;
+    };
   }
 
   @Override
@@ -1031,12 +1094,17 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           beginTransaction(): calling database.begin() on dedicated thread \
           for txId=%s""", transactionId);
 
+      // Honor the isolation level requested by the client (defaults to READ_COMMITTED). This is required so that
+      // REPEATABLE_READ transactions track the version of the records they read and a write-write conflict raises a
+      // ConcurrentModificationException on commit, exactly as on HTTP (issue #4533).
+      final Database.TRANSACTION_ISOLATION_LEVEL isolationLevel = mapIsolationLevel(request.getIsolation());
+
       // Begin transaction ON THE DEDICATED THREAD - this is critical because ArcadeDB
       // transactions are thread-local
       Future<?> beginFuture = txCtx.executor.submit(() -> {
         // Initialize the DatabaseContext on this dedicated thread before any DB operation
         DatabaseContext.INSTANCE.init((DatabaseInternal) database);
-        database.begin();
+        database.begin(isolationLevel);
       });
       beginFuture.get(); // Wait for begin to complete
 
@@ -1182,18 +1250,19 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     final QueryProfile profile = new QueryProfile();
     QueryProfile.pushCurrent(profile);
     final long engineStart = System.nanoTime();
-    ProjectionConfig projectionConfig = getProjectionConfigFromRequest(request);
-
-    final ServerCallStreamObserver<QueryResult> scso = (ServerCallStreamObserver<QueryResult>) responseObserver;
-
     final AtomicBoolean cancelled = new AtomicBoolean(false);
-    scso.setOnCancelHandler(() -> cancelled.set(true));
 
     Database db = null;
     boolean beganHere = false;
     String profileLanguage = null;
 
+    ProtocolContext.set("grpc");
     try {
+      ProjectionConfig projectionConfig = getProjectionConfigFromRequest(request);
+
+      final ServerCallStreamObserver<QueryResult> scso = (ServerCallStreamObserver<QueryResult>) responseObserver;
+      scso.setOnCancelHandler(() -> cancelled.set(true));
+
       db = getDatabase(request.getDatabase(), request.getCredentials());
       final int batchSize = Math.max(1, request.getBatchSize());
 
@@ -1278,6 +1347,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       recordGrpcProfile("grpc.stream", profile, db != null ? db.getName() : request.getDatabase(),
           profileLanguage != null ? profileLanguage : request.getLanguage(), request.getQuery());
       QueryProfile.popCurrent();
+      ProtocolContext.clear();
     }
   }
 
@@ -1539,20 +1609,25 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
   // --- 1) Unary bulk ---
   @Override
   public void bulkInsert(BulkInsertRequest req, StreamObserver<InsertSummary> resp) {
-
-    final InsertOptions opts = defaults(req.getOptions()); // apply defaults (batch size, tx mode, etc.)
     final long started = System.currentTimeMillis();
 
-    try (InsertContext ctx = new InsertContext(opts)) {
+    ProtocolContext.set("grpc");
+    try {
+      final InsertOptions opts = defaults(req.getOptions()); // apply defaults (batch size, tx mode, etc.)
 
-      Counts totals = insertRows(ctx, req.getRowsList().iterator());
+      try (InsertContext ctx = new InsertContext(opts)) {
 
-      ctx.flushCommit(true);
+        Counts totals = insertRows(ctx, req.getRowsList().iterator());
 
-      resp.onNext(ctx.summary(totals, started));
-      resp.onCompleted();
+        ctx.flushCommit(true);
+
+        resp.onNext(ctx.summary(totals, started));
+        resp.onCompleted();
+      }
     } catch (Exception e) {
       resp.onError(Status.INTERNAL.withDescription("bulkInsert: " + e.getMessage()).asException());
+    } finally {
+      ProtocolContext.clear();
     }
   }
 
@@ -1620,6 +1695,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
                 effective);
           } else {
 
+            // Issue #4644: a later chunk may be dispatched on a different pool thread than the one
+            // that began the transaction; re-bind the transaction to this thread before inserting.
+            ctx.bindToCurrentThread();
+
             // -------- Subsequent chunks: optionally validate option consistency --------
             if (c.hasOptions()) {
               InsertOptions prev = firstOptsRef.get();
@@ -1674,6 +1753,9 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           // Status.INTERNAL, leaving the client without an InsertSummary. Instead, surface those as
           // structured errors in totals.errors and still deliver the summary.
           try {
+            // Issue #4644: onCompleted may run on a different pool thread than the onNext that began
+            // the transaction; re-bind it to this thread so the deferred commit finds it.
+            ctx.bindToCurrentThread();
             ctx.flushCommit(true); // commit if not validate-only
           } catch (Exception commitEx) {
             recordCommitException(totals, commitEx);
@@ -2810,6 +2892,15 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     final String sessionId = UUID.randomUUID().toString();
     long received = 0;
 
+    // Issue #4644: ArcadeDB transactions are bound to the calling thread via the DatabaseContext
+    // ThreadLocal. The gRPC serializing executor may run onNext (which calls db.begin()) and
+    // onCompleted (which calls db.commit()) on different pool threads, so the transaction begun on
+    // one callback thread must be explicitly re-bound onto whichever thread runs the next callback,
+    // otherwise the deferred commit fails with "Transaction not begun". We capture the active
+    // transaction and its security user here and re-apply them in bindToCurrentThread().
+    private com.arcadedb.database.TransactionContext tx;
+    private SecurityDatabaseUser                     txUser;
+
     InsertContext(InsertOptions opts) {
 
       this.opts = opts;
@@ -2826,33 +2917,81 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           db.begin();
         }
       }
+
+      captureTransaction();
+    }
+
+    /**
+     * Issue #4644: re-bind the transaction begun on a previous callback thread onto the thread that
+     * is about to run the current callback. gRPC serializes a call's StreamObserver callbacks but
+     * does not pin them to a single thread, so begin/insert/commit can land on different pool
+     * threads. This is a no-op when the transaction is already bound to the current thread (the
+     * common no-hop case), so it never rolls back its own active transaction.
+     */
+    void bindToCurrentThread() {
+      if (tx == null)
+        return;
+
+      final DatabaseContext.DatabaseContextTL tl = DatabaseContext.INSTANCE.getContextIfExists(db.getDatabasePath());
+      if (tl != null && tl.getLastTransaction() == tx)
+        return; // already bound to this thread
+
+      final DatabaseContext.DatabaseContextTL rebound = DatabaseContext.INSTANCE.init((DatabaseInternal) db, tx);
+      rebound.setCurrentUser(txUser);
+    }
+
+    /**
+     * Issue #4644: snapshot the transaction (and its security user) currently bound to this thread so
+     * it can be re-bound on the next callback thread by {@link #bindToCurrentThread()}.
+     */
+    private void captureTransaction() {
+      final DatabaseContext.DatabaseContextTL tl = DatabaseContext.INSTANCE.getContextIfExists(db.getDatabasePath());
+      if (tl != null) {
+        tx = tl.getLastTransaction();
+        txUser = tl.getCurrentUser();
+      } else {
+        tx = null;
+        txUser = null;
+      }
     }
 
     void flushCommit(boolean end) {
 
       if (opts.getValidateOnly()) {
-        if (end)
+        if (end) {
           db.rollback();
+          tx = null;
+        }
         return;
       }
       switch (opts.getTransactionMode()) {
         case PER_ROW -> {
           db.commit();
-          if (!end)
+          if (!end) {
             db.begin();
+            captureTransaction();
+          } else
+            tx = null;
         }
         case PER_REQUEST -> {
-          if (end)
+          if (end) {
             db.commit();
+            tx = null;
+          }
         }
         case PER_BATCH -> {
           db.commit();
-          if (!end)
+          if (!end) {
             db.begin();
+            captureTransaction();
+          } else
+            tx = null;
         }
         case PER_STREAM -> {
-          if (end)
+          if (end) {
             db.commit();
+            tx = null;
+          }
         }
         default -> {
         }

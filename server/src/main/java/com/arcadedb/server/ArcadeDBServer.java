@@ -40,6 +40,11 @@ import com.arcadedb.server.event.FileServerEventLog;
 import com.arcadedb.server.event.ServerEventLog;
 import com.arcadedb.server.http.HttpServer;
 import com.arcadedb.server.mcp.MCPConfiguration;
+import com.arcadedb.database.QueryMetricsRecorder;
+import com.arcadedb.database.QueryTracer;
+import com.arcadedb.server.monitor.EngineMetricsBinder;
+import com.arcadedb.server.monitor.MicrometerQueryMetricsRecorder;
+import com.arcadedb.server.monitor.MicrometerQueryTracer;
 import com.arcadedb.server.monitor.PoolMetrics;
 import com.arcadedb.server.monitor.ServerQueryProfiler;
 import com.arcadedb.server.plugin.PluginManager;
@@ -57,6 +62,7 @@ import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
 import io.micrometer.core.instrument.binder.system.ProcessorMetrics;
 import io.micrometer.core.instrument.logging.LoggingMeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
 
 import java.io.File;
 import java.io.IOException;
@@ -82,10 +88,21 @@ public class ArcadeDBServer {
   public enum STATUS {OFFLINE, STARTING, ONLINE, SHUTTING_DOWN}
 
   public static final String                                CONFIG_SERVER_CONFIGURATION_FILENAME = "config/server-configuration.json";
+
+  /**
+   * Prefix that marks reserved internal databases (e.g. the Raft control directory {@code .raft}).
+   * Reserved databases may live under the server database directory but are not user databases: they
+   * must not be registered at startup, nor exposed through the server/cluster status APIs.
+   */
+  public static final String                                RESERVED_DATABASE_PREFIX             = ".";
   private final       ContextConfiguration                  configuration;
   private final       String                                serverName;
   private             String                                hostAddress;
   private final       boolean                               replicationLifecycleEventsEnabled;
+  // Shared spine for Micrometer Observations. Starts with no handlers, so Observations are no-ops
+  // (zero overhead) until the optional tracing plugin attaches a tracing handler. Metrics continue
+  // to be recorded by the dedicated Micrometer timers, independently of this registry.
+  private final       ObservationRegistry                   observationRegistry                  = ObservationRegistry.create();
   private             FileServerEventLog                    eventLog;
   private             PluginManager                         pluginManager;
   private             String                                serverRootPath;
@@ -132,6 +149,15 @@ public class ArcadeDBServer {
 
   public ContextConfiguration getConfiguration() {
     return configuration;
+  }
+
+  /**
+   * Shared Micrometer {@link ObservationRegistry} used to instrument server hot paths once and emit
+   * both metrics and (when the optional tracing plugin registers a tracer) spans. With no tracer
+   * attached the registry has no handlers and Observations are no-ops.
+   */
+  public ObservationRegistry getObservationRegistry() {
+    return observationRegistry;
   }
 
   public void setSnapshotInstallInProgress(final boolean inProgress) {
@@ -208,6 +234,10 @@ public class ArcadeDBServer {
       // Engine executor pools (query parallelism + sparse-vector scoring) - exposes
       // arcadedb.executor.pool.{size,active,...} gauges tagged with pool=<name>.
       new PoolMetrics().bindTo(Metrics.globalRegistry);
+      // Engine-wide Profiler stats (cache hit/miss, pages, WAL, MVCC conflicts, open files, tx,
+      // queries) - exposes arcadedb.engine.* gauges read live from the Profiler on each scrape.
+      new EngineMetricsBinder().bindTo(Metrics.globalRegistry);
+      QueryMetricsRecorder.Holder.register(new MicrometerQueryMetricsRecorder());
 
       if (configuration.getValueAsBoolean(GlobalConfiguration.SERVER_METRICS_LOGGING)) {
         LogManager.instance().log(this, Level.INFO, "- Logging metrics enabled...");
@@ -215,6 +245,11 @@ public class ArcadeDBServer {
       }
       LogManager.instance().log(this, Level.INFO, "Metrics Collection Started");
     }
+
+    // Register the engine-boundary query tracer regardless of the metrics flag: it opens a span only
+    // when the optional tracing plugin has attached a tracer to the ObservationRegistry, and is a
+    // zero-cost no-op otherwise. This gives every wire protocol query/command spans from one point.
+    QueryTracer.Holder.register(new MicrometerQueryTracer(observationRegistry));
 
     security = new ServerSecurity(this, configuration, serverRootPath + "/config");
     security.startService();
@@ -538,6 +573,14 @@ public class ArcadeDBServer {
     return Collections.unmodifiableSet(databases.keySet());
   }
 
+  /**
+   * Returns {@code true} if the given name belongs to a reserved internal database (e.g. the Raft
+   * control directory {@code .raft}) that must not be exposed as a user database.
+   */
+  public static boolean isReservedDatabaseName(final String databaseName) {
+    return databaseName != null && databaseName.startsWith(RESERVED_DATABASE_PREFIX);
+  }
+
   public ServerDatabase registerDatabase(final String databaseName, final DatabaseInternal database) {
     final ServerDatabase serverDatabase = new ServerDatabase(this, database);
     final ServerDatabase existing = databases.putIfAbsent(databaseName, serverDatabase);
@@ -721,7 +764,10 @@ public class ArcadeDBServer {
       if (configuration.getValueAsBoolean(GlobalConfiguration.SERVER_DATABASE_LOADATSTARTUP)) {
         final File[] databaseDirectories = databaseDir.listFiles(File::isDirectory);
         for (final File f : databaseDirectories)
-          getDatabase(f.getName());
+          // Skip reserved internal databases (e.g. the Raft control directory '.raft'): they are not
+          // user databases and must not be registered nor leak into the server/cluster status APIs.
+          if (!isReservedDatabaseName(f.getName()))
+            getDatabase(f.getName());
       }
     }
   }
