@@ -43,12 +43,15 @@ import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
+import org.apache.ratis.statemachine.impl.SingleFileSnapshotInfo;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.util.LifeCycle;
 
 import java.io.File;
 import java.io.IOException;
@@ -144,6 +147,14 @@ public class ArcadeStateMachine extends BaseStateMachine {
   public record BootstrapBaseline(String fingerprint, long lastTxId) {
   }
 
+  /**
+   * Database reconciliation collaborator (issue #4727, extracted in #4748). Owns the per-database
+   * auto-acquisition status, the failure/give-up bookkeeping, and the reconcile orchestration the state machine
+   * delegates to from {@link #notifyInstallSnapshotFromLeader}. Exposed via {@link #getReconciler()} so
+   * {@code GetClusterHandler} and {@code ClusterAlerts} can read the per-database statuses.
+   */
+  private final DatabaseReconciler reconciler = new DatabaseReconciler();
+
   private final AtomicBoolean needsSnapshotDownload      = new AtomicBoolean(false);
   private final AtomicBoolean snapshotDownloadInProgress = new AtomicBoolean(false);
   private final AtomicBoolean catchingUp                 = new AtomicBoolean(false);
@@ -156,9 +167,37 @@ public class ArcadeStateMachine extends BaseStateMachine {
   // resync on the next start.
   private final AtomicBoolean haltedAfterCriticalError = new AtomicBoolean(false);
 
+  // Database names whose state has diverged from the committed Raft log (a WALVersionGapException
+  // was detected while applying an entry for them). While a database is in this set, unexpected
+  // Throwables in applyWithRetry for THAT database are wrapped as ReplicationException (recoverable
+  // resync) instead of propagating to the fatal server-halt path (issue #4740): operating on
+  // inconsistent page state after a WAL gap often throws NPE, ClassCastException, or similar errors
+  // that would otherwise halt the server even though the node is merely waiting for a snapshot
+  // resync. Scoped per-database so a gap in one database never masks a genuine bug raised while
+  // applying an entry for an unrelated, healthy database. Cleared when a snapshot resync completes
+  // (it resyncs all databases) and restores consistent state.
+  private final Set<String> divergedDatabases = ConcurrentHashMap.newKeySet();
+
+  // Bounded escalation (issue #4740): a node that can never resync (no stable leader reachable)
+  // must not stay in "swallow unexpected errors" mode forever, silently degrading. Each error
+  // swallowed on a diverged database increments this; once it exceeds the threshold the next
+  // unexpected error is allowed to propagate to the fatal halt path so a truly stuck node surfaces
+  // loudly rather than quietly. Reset to 0 whenever a snapshot resync clears the diverged set.
+  // Deliberately JVM-wide (not per-database): the threshold is a coarse "this node is stuck, halt
+  // loudly" backstop, so a shared budget across all diverged databases is the intended behaviour -
+  // one very noisy diverged database crossing the threshold should still halt the node.
+  private final        AtomicInteger divergedSwallowedErrors      = new AtomicInteger(0);
+  private static final int           MAX_DIVERGED_SWALLOWED_ERRORS = 100;
+
 
   public void setServer(final ArcadeDBServer server) {
     this.server = server;
+    reconciler.setServer(server);
+  }
+
+  /** The database reconciliation collaborator, used by {@code GetClusterHandler} and {@code ClusterAlerts}. */
+  public DatabaseReconciler getReconciler() {
+    return reconciler;
   }
 
   public void setRaftHAServer(final RaftHAServer raftHAServer) {
@@ -172,6 +211,12 @@ public class ArcadeStateMachine extends BaseStateMachine {
   @Override
   public void initialize(final RaftServer raftServer, final RaftGroupId groupId, final RaftStorage raftStorage) throws IOException {
     super.initialize(raftServer, groupId, raftStorage);
+    // Start the LifeCycle so getLifeCycleState() returns RUNNING while the state machine is active.
+    // StateMachineUpdater.reload() asserts getLifeCycleState() == PAUSED (after pause() is called by
+    // SnapshotInstallationHandler) at Ratis StateMachineUpdater.java:230. Without this start-up the
+    // lifecycle stays in NEW and that precondition throws IllegalStateException (issue #4754).
+    getLifeCycle().transition(LifeCycle.State.STARTING);
+    getLifeCycle().transition(LifeCycle.State.RUNNING);
     storage.init(raftStorage);
     reinitialize();
     // Recover any snapshot installations that were interrupted by a crash
@@ -185,9 +230,50 @@ public class ArcadeStateMachine extends BaseStateMachine {
   }
 
   /**
+   * Transitions the state machine to {@link LifeCycle.State#PAUSED} so that
+   * {@code StateMachineUpdater.reload()} can proceed. Called by Ratis's
+   * {@code SnapshotInstallationHandler} after {@link #notifyInstallSnapshotFromLeader} completes,
+   * before signalling the updater to reload.
+   * <p>
+   * Idempotent: if the lifecycle is already PAUSED (e.g. a concurrent path already paused it),
+   * the call is a no-op. If the lifecycle is in any unexpected state, a WARNING is logged and
+   * the transition is skipped rather than crashing the caller.
+   * <p>
+   * <b>Invariant (verified against Ratis 3.2.2 source):</b> All three callers of
+   * {@code StateMachine.pause()} in Ratis 3.2.2 are paired with a subsequent
+   * {@link #reinitialize()} call that transitions the lifecycle back to RUNNING:
+   * <ul>
+   *   <li>{@code SnapshotInstallationHandler}: notification path (ArcadeDB's path) - pairs with
+   *       {@code state.reloadStateMachine()} which triggers {@code reload()} then
+   *       {@code reinitialize()}.</li>
+   *   <li>{@code ServerState.installSnapshot()}: chunk-based path (not used when
+   *       {@code HA_INSTALL_SNAPSHOT=false}) - same reload chain after last chunk.</li>
+   *   <li>{@code RaftServerImpl.pause()}: external server-pause API - pairs with
+   *       {@code RaftServerImpl.resume()} which calls {@code reinitialize()} directly.</li>
+   * </ul>
+   * If a future Ratis version introduces a {@code pause()} call without a matching
+   * {@code reinitialize()}, the state machine would be stuck in PAUSED permanently.
+   */
+  @Override
+  public void pause() {
+    final LifeCycle.State current = getLifeCycleState();
+    if (current == LifeCycle.State.RUNNING) {
+      getLifeCycle().transition(LifeCycle.State.PAUSING);
+      getLifeCycle().transition(LifeCycle.State.PAUSED);
+    } else if (current != LifeCycle.State.PAUSED) {
+      LogManager.instance().log(this, Level.WARNING,
+          "pause() called in unexpected lifecycle state %s; skipping transition", current);
+    }
+  }
+
+  /**
    * Restores {@link #lastAppliedIndex} from the latest Ratis {@link SimpleStateMachineStorage}
    * snapshot metadata. Called during {@link #initialize} and again if the state machine storage
    * is reset (e.g., during Ratis recovery via {@link RaftHAServer#restartRatisIfNeeded}).
+   * <p>
+   * When called from {@code StateMachineUpdater.reload()} after a snapshot install, the lifecycle
+   * is in {@link LifeCycle.State#PAUSED} and this method transitions it back to
+   * {@link LifeCycle.State#RUNNING} so the updater can resume applying log entries.
    */
   public void reinitialize() throws IOException {
     final long persistedApplied = readPersistedAppliedIndex();
@@ -225,6 +311,15 @@ public class ArcadeStateMachine extends BaseStateMachine {
       updateLastAppliedTermIndex(snapshotInfo.getTerm(), snapshotIndex);
     } else
       lastAppliedIndex.set(-1);
+
+    // When called from StateMachineUpdater.reload() after a snapshot install, the lifecycle is
+    // PAUSED (pause() was called by SnapshotInstallationHandler). Transition back to RUNNING so
+    // the updater can resume applying log entries. This is a no-op during the normal startup path
+    // (lifecycle is already RUNNING when initialize() calls reinitialize()).
+    if (getLifeCycleState() == LifeCycle.State.PAUSED) {
+      getLifeCycle().transition(LifeCycle.State.STARTING);
+      getLifeCycle().transition(LifeCycle.State.RUNNING);
+    }
   }
 
   @Override
@@ -287,7 +382,7 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
       final boolean originatedLocally = Boolean.TRUE.equals(trx.getStateMachineContext());
 
-      applyWithRetry(index, () -> {
+      applyWithRetry(index, decoded.databaseName(), () -> {
         switch (decoded.type()) {
         case TX_ENTRY -> applyTxEntry(decoded, index, originatedLocally);
         case SCHEMA_ENTRY -> applySchemaEntry(decoded, index, originatedLocally);
@@ -355,6 +450,16 @@ public class ArcadeStateMachine extends BaseStateMachine {
   }
 
   /**
+   * Convenience overload that runs the dispatch without scoping the diverged-state guard to a
+   * specific database (equivalent to {@code applyWithRetry(index, null, applyAction)}). Used where
+   * the entry has no single target database.
+   */
+  // @VisibleForTesting
+  void applyWithRetry(final long index, final Runnable applyAction) {
+    applyWithRetry(index, null, applyAction);
+  }
+
+  /**
    * Runs the apply dispatch with bounded in-place retry for transient/retryable conditions.
    * <p>
    * A {@link NeedRetryException} (e.g. an MVCC {@link com.arcadedb.exception.ConcurrentModificationException}
@@ -370,12 +475,14 @@ public class ArcadeStateMachine extends BaseStateMachine {
    * is a single sequential thread, so a smaller (or zero) delay is perfectly safe on this path and only
    * reduces the worst-case latency per entry; the value is read live so it can be tuned independently.
    *
-   * @param index       the Raft log index being applied (diagnostics only)
-   * @param applyAction the apply dispatch to run
+   * @param index        the Raft log index being applied (diagnostics only)
+   * @param databaseName the database the entry targets, used to scope the diverged-state guard
+   *                     (may be {@code null} for entry types without a single target database)
+   * @param applyAction  the apply dispatch to run
    * @throws ReplicationException if the retryable condition persists after all attempts
    */
   // @VisibleForTesting
-  void applyWithRetry(final long index, final Runnable applyAction) {
+  void applyWithRetry(final long index, final String databaseName, final Runnable applyAction) {
     final int maxRetries = Math.max(0, server != null
         ? server.getConfiguration().getValueAsInteger(GlobalConfiguration.TX_RETRIES)
         : GlobalConfiguration.TX_RETRIES.getValueAsInteger());
@@ -409,6 +516,41 @@ public class ArcadeStateMachine extends BaseStateMachine {
             break;
           }
         }
+      } catch (final ReplicationException re) {
+        // Already a resync signal (e.g. the WAL-gap escalation from applyTxEntry); propagate it
+        // unchanged so it reaches applyTransaction's catch (ReplicationException) handler without
+        // being re-wrapped or counted against the bounded-escalation budget below.
+        throw re;
+      } catch (final RuntimeException t) {
+        // Catch RuntimeException (not Throwable) on purpose: applyAction is a Runnable, so the only
+        // things it can throw are RuntimeException or Error. JVM Errors (OutOfMemoryError,
+        // StackOverflowError, ...) mean the JVM itself is unstable and must never be swallowed as a
+        // recoverable resync condition - leaving them uncaught lets them propagate unchanged to
+        // applyTransaction's fatal halt path so the node stops loudly rather than masking a corrupt
+        // runtime.
+        // When this database has already diverged (WAL gap detected earlier), an unexpected error
+        // most likely stems from the engine operating on the inconsistent in-memory state left by
+        // the gap - e.g. NPE on a page that wasn't refreshed, ClassCastException on a stale object.
+        // Treat it as a recoverable resync condition (issue #4740) instead of propagating to
+        // applyTransaction's fatal catch (Throwable) path that would halt the server. The ongoing
+        // snapshot download will restore consistent state once a stable leader is available.
+        if (databaseName != null && divergedDatabases.contains(databaseName)) {
+          // Bounded escalation: a node that can never resync (no stable leader) must not swallow
+          // errors forever and degrade silently. Once the swallow count exceeds the threshold, let
+          // the error propagate to the fatal halt path so a truly stuck node surfaces loudly.
+          if (divergedSwallowedErrors.incrementAndGet() > MAX_DIVERGED_SWALLOWED_ERRORS) {
+            LogManager.instance().log(this, Level.SEVERE,
+                "Diverged database '%s' swallowed over %d unexpected errors without resyncing (index %d); escalating to fatal halt: %s",
+                databaseName, MAX_DIVERGED_SWALLOWED_ERRORS, index, t.getMessage());
+            throw t;
+          }
+          LogManager.instance().log(this, Level.SEVERE,
+              "Unexpected error at index %d while database '%s' is diverged (WAL gap detected earlier); treating as resync condition: %s",
+              index, databaseName, t.getMessage());
+          throw new ReplicationException(
+              "Apply error on diverged state at index " + index + "; snapshot resync in progress", t);
+        }
+        throw t;
       }
     }
 
@@ -496,6 +638,10 @@ public class ArcadeStateMachine extends BaseStateMachine {
       raftHAServer.startLagMonitor();
       raftHAServer.printClusterConfiguration();
 
+      // Clear the follower-side reconcile states (LEADER_MISSING / FAILED) and failure counters now that this node
+      // is the leader, so their cluster alerts do not linger (issue #4727). ACQUIRED is harmless history and kept.
+      reconciler.clearFollowerReconcileStatesOnBecomeLeader();
+
       // Issue #4147: drive offline cluster bootstrap if conditions match (commit index still 0,
       // arcadedb.ha.bootstrapFromLocalDatabase=true). Runs on a background thread to keep the
       // notifyLeaderChanged callback non-blocking; a slow peer or a bootstrap-state RPC timeout
@@ -554,6 +700,19 @@ public class ArcadeStateMachine extends BaseStateMachine {
     // for the migration target; the cleanup item is to fork onto a dedicated executor (sized via
     // a future {@code arcadedb.haSnapshotInstallThreads} knob) once we add one.
     return CompletableFuture.supplyAsync(() -> {
+      // Participate in the same single-flight protocol as triggerSnapshotDownload() so that
+      // isSnapshotDownloadPending() returns true during this install and the HealthMonitor's
+      // recoverFromPersistentLag() does not initiate a new concurrent triggerSnapshotDownload().
+      // We use CAS (not unconditional set) to avoid clearing a flag owned by a concurrently
+      // running triggerSnapshotDownload():
+      //  - if we win (flag false->true): we own the flag and MUST clear it in finally.
+      //  - if we lose (flag already true, another download in progress): we skip the flag and let
+      //    the other download complete; we still proceed with reconcileDatabasesFromLeader() because
+      //    the two installs both pull from the same leader and SnapshotInstaller is crash-safe with
+      //    atomic directory swaps. NOTE: the two calls are not serialized by this flag; ordering
+      //    is only guaranteed when we win the CAS. Eliminating the residual race requires a mutex
+      //    or waiting on the in-flight download, which is deferred as a future improvement.
+      final boolean acquiredSnapshotFlag = snapshotDownloadInProgress.compareAndSet(false, true);
       try {
         final RaftPeerId leaderId = RaftPeerId.valueOf(
             roleInfoProto.getFollowerInfo().getLeaderInfo().getId().getId());
@@ -565,24 +724,63 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
         final String clusterToken = raftHAServer.getClusterToken();
 
-        for (final String dbName : server.getDatabaseNames()) {
-          LogManager.instance().log(this, Level.INFO,
-              "Installing snapshot for database '%s' from leader %s...", dbName, leaderHttpAddr);
+        reconciler.reconcileDatabasesFromLeader(leaderHttpAddr, leaderHttpsAddr, clusterToken);
 
-          // install() downloads the snapshot with the database still open and only closes + swaps it
-          // once a complete copy is on disk, rolling back on failure, so a failed download never
-          // leaves this database closed (DatabaseIsClosedException).
-          if (server.existsDatabase(dbName))
-            SnapshotInstaller.install(dbName, SnapshotInstaller.resolveDatabasePath(server, dbName),
-                leaderHttpAddr, leaderHttpsAddr, clusterToken, server);
-        }
+        // Compute the installed snapshot TermIndex. firstTermIndexInLog is the first log entry
+        // AFTER the snapshot, so the snapshot covers all entries up to getIndex()-1.
+        // Returning firstTermIndexInLog itself (as the old code did) caused two bugs:
+        // 1. SnapshotInstallationHandler called state.reloadStateMachine(firstTermIndexInLog) which
+        //    purged log entries up to firstTermIndexInLog.getIndex() instead of getIndex()-1.
+        // 2. StateMachineUpdater.reload() calls getLatestSnapshot().getIndex() and expects it to match
+        //    the TermIndex we return; returning firstTermIndexInLog while storage was never updated
+        //    caused NullPointerException (and before that, IllegalStateException from the PAUSED check).
+        final long snapshotIndex = Math.max(0L, firstTermIndexInLog.getIndex() - 1);
+        // Use firstTermIndexInLog.getTerm() as the snapshot term. The true last-entry term inside
+        // the snapshot is opaque to us (ArcadeDB ships database files, not Ratis snapshot chunks),
+        // so we use the term of the first available log entry as a safe upper bound. This value is
+        // only used to name the marker file (snapshot.term_index) and as metadata for Ratis's
+        // snapshotIndex tracking; it does not affect data correctness.
+        final long snapshotTerm = firstTermIndexInLog.getTerm();
+        final TermIndex installedTermIndex = TermIndex.valueOf(snapshotTerm, snapshotIndex);
 
-        LogManager.instance().log(this, Level.INFO, "Full resync from leader completed");
-        return firstTermIndexInLog;
+        // Register the snapshot in SimpleStateMachineStorage. StateMachineUpdater.reload() calls
+        // getLatestSnapshot() immediately after reinitialize() and requires a non-null result.
+        // We write an empty marker file - ArcadeDB's real snapshot is the database files on disk,
+        // not a Ratis-managed chunk file. The null FileDigest passed to FileInfo is intentional and
+        // safe: this path (file-less, notification-based snapshot install) does not use the Ratis
+        // chunk-based verification flow that would check the digest.
+        final File snapshotFile = storage.getSnapshotFile(snapshotTerm, snapshotIndex);
+        final File parentDir = snapshotFile.getParentFile();
+        if (parentDir != null && !parentDir.exists() && !parentDir.mkdirs())
+          LogManager.instance().log(this, Level.WARNING,
+              "Could not create snapshot storage directory %s; snapshot registration may fail", parentDir);
+        if (!snapshotFile.exists())
+          snapshotFile.createNewFile();
+        storage.updateLatestSnapshot(new SingleFileSnapshotInfo(
+            new FileInfo(snapshotFile.toPath(), null), snapshotTerm, snapshotIndex));
+        // The empty marker file will be re-discovered by SimpleStateMachineStorage.loadLatestSnapshot()
+        // on restart (it scans for files matching "snapshot.term_index"). No .md5 file is written
+        // alongside it, so MD5FileUtil.readStoredMd5ForFile() returns null and the SingleFileSnapshotInfo
+        // is constructed with a null digest - the same as when ArcadeDB boots fresh with no prior snapshot.
+        // ArcadeDB never validates snapshot file content via Ratis's chunk-verification path (it uses
+        // the HTTP-based DatabaseReconciler instead), so the empty file is safe across restarts.
+
+        // Advance the local applied-index to the snapshot point so that the StateMachineUpdater
+        // knows which log entries have been consumed by this install.
+        lastAppliedIndex.set(snapshotIndex);
+        updateLastAppliedTermIndex(snapshotTerm, snapshotIndex);
+        writePersistedAppliedIndex(snapshotIndex);
+
+        LogManager.instance().log(this, Level.INFO, "Full resync from leader completed (snapshotIndex=%d)", snapshotIndex);
+        clearDivergedState();
+        return installedTermIndex;
 
       } catch (final Exception e) {
         LogManager.instance().log(this, Level.SEVERE, "Error during snapshot installation from leader", e);
         throw new RuntimeException("Error during Raft snapshot installation", e);
+      } finally {
+        if (acquiredSnapshotFlag)
+          snapshotDownloadInProgress.set(false);
       }
     });
   }
@@ -663,6 +861,20 @@ public class ArcadeStateMachine extends BaseStateMachine {
       LogManager.instance().log(this, Level.SEVERE,
           "WAL version gap on follower - state divergence detected, triggering snapshot resync (db=%s, txId=%d): %s",
           decoded.databaseName(), walTx.txId, e.getMessage());
+      // Mark this database as diverged so subsequent unexpected errors don't trigger fatal halt
+      // (issue #4740). Trigger an immediate snapshot download instead of waiting for the
+      // HealthMonitor's periodic check. Set.add() returns true only when the database was not
+      // already in the set, so the immediate-download trigger fires at most once per database
+      // until a resync clears it.
+      if (divergedDatabases.add(decoded.databaseName())) {
+        try {
+          lifecycleExecutor.submit(this::triggerSnapshotDownload);
+        } catch (final RejectedExecutionException ree) {
+          LogManager.instance().log(this, Level.WARNING,
+              "Cannot schedule immediate snapshot download after WAL gap (db=%s): executor is shut down",
+              ree, decoded.databaseName());
+        }
+      }
       throw new ReplicationException(
           "WAL version gap detected - snapshot resync required (db=" + decoded.databaseName() + ")", e);
     }
@@ -1266,11 +1478,44 @@ public class ArcadeStateMachine extends BaseStateMachine {
               leaderHttpAddr, leaderHttpsAddr, clusterToken, server);
       }
       LogManager.instance().log(this, Level.INFO, "Snapshot download triggered by watchdog completed");
+      clearDivergedState();
     } catch (final Exception e) {
       LogManager.instance().log(this, Level.SEVERE, "Snapshot download triggered by watchdog failed", e);
     } finally {
       snapshotDownloadInProgress.set(false);
     }
+  }
+
+  /**
+   * Marks {@code dbName} as diverged from the committed Raft log (issue #4740). While a database is
+   * diverged, unexpected Throwables raised while applying its entries are treated as recoverable
+   * resync conditions in {@link #applyWithRetry} rather than fatal halts.
+   */
+  // @VisibleForTesting
+  void markStateDiverged(final String dbName) {
+    divergedDatabases.add(dbName);
+  }
+
+  /**
+   * Clears the diverged-database set and the bounded-escalation counter after a snapshot resync has
+   * restored consistent state across all databases. A resync always reinstalls every database from
+   * the leader, so clearing the whole set (rather than a single database) matches what the resync
+   * actually did.
+   */
+  // @VisibleForTesting
+  void clearDivergedState() {
+    divergedDatabases.clear();
+    divergedSwallowedErrors.set(0);
+  }
+
+  // @VisibleForTesting
+  boolean isDatabaseDiverged(final String dbName) {
+    return divergedDatabases.contains(dbName);
+  }
+
+  // @VisibleForTesting
+  int divergedSwallowedErrorCount() {
+    return divergedSwallowedErrors.get();
   }
 
   /**

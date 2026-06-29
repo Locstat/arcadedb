@@ -39,12 +39,18 @@ import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.TimeDuration;
 
+import javax.net.ssl.HttpsURLConnection;
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -54,9 +60,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -85,6 +93,13 @@ import java.util.logging.Logger;
  */
 public class RaftHAServer implements HealthMonitor.HealthTarget {
 
+  // The forwarded user the leader presents (with the cluster token) for inter-node calls such as the
+  // stalled-replica resync. ArcadeDB's bootstrap 'root' user is the cluster-wide superuser; named here
+  // so the coupling is visible rather than scattered as a string literal.
+  // Package-private so other cluster-internal RPC callers (e.g. LeaderDatabaseQuery) reuse the same constant
+  // instead of re-inlining the "root" literal.
+  static final String FORWARDED_ROOT_USER = "root";
+
   private final    ArcadeDBServer          arcadeServer;
   private final    ContextConfiguration    configuration;
   private volatile ArcadeStateMachine      stateMachine;
@@ -110,6 +125,13 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   private volatile RaftTransactionBroker     transactionBroker;
   private          RaftClusterStatusExporter statusExporter;
   private          ScheduledExecutorService  lagMonitorExecutor;
+  // Runs leader-driven stalled-replica resyncs off the lag-monitor thread (issue #4728). One worker is
+  // enough since at most one resync fires per replica per stall streak; a small bounded queue with a
+  // caller-runs policy degrades to running on the lag-monitor thread under the (unlikely) burst.
+  private final    ThreadPoolExecutor        stalledResyncExecutor = createStalledResyncExecutor();
+  // Inbound Raft gRPC peer allowlist, recreated on each Ratis (re)start. Periodically refreshed by the
+  // health monitor tick so a returned peer's new pod IP is admitted proactively (issue #4696).
+  private volatile PeerAddressAllowlistFilter allowlistFilter;
   private final    Object                    leaderChangeNotifier  = new Object();
   private final    Object                    applyNotifier         = new Object();
   private          RaftClusterManager        clusterManager;
@@ -193,7 +215,9 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     this.stateMachine = new ArcadeStateMachine();
     this.stateMachine.setServer(arcadeServer);
 
-    this.clusterMonitor = new ClusterMonitor(lagWarningThreshold);
+    final long stalledResyncDurationMs = configuration.getValueAsLong(
+        GlobalConfiguration.HA_STALLED_REPLICA_RESYNC_DURATION_MS);
+    this.clusterMonitor = new ClusterMonitor(lagWarningThreshold, stalledResyncDurationMs, this::forceResyncStalledReplica);
     this.quorum = Quorum.parse(configuration.getValueAsString(GlobalConfiguration.HA_QUORUM));
     this.quorumTimeout = configuration.getValueAsLong(GlobalConfiguration.HA_QUORUM_TIMEOUT);
 
@@ -233,6 +257,146 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
    */
   public String getPeerHttpsAddress(final RaftPeerId peerId) {
     return resolveHttpsAddress(peerId);
+  }
+
+  /**
+   * Leader-driven recovery for a persistently STALLED replica (issue #4728). Invoked by
+   * {@link ClusterMonitor} on the leader's lag-monitor thread once a replica's {@code matchIndex} has
+   * not advanced for {@link GlobalConfiguration#HA_STALLED_REPLICA_RESYNC_DURATION_MS} while the
+   * leader kept committing. The leader instructs the stuck follower to drop its local copy and
+   * re-acquire a fresh full snapshot, the same operation an operator runs manually via
+   * {@code POST /api/v1/cluster/resync/{database}} - reused here so the cluster self-heals instead of
+   * logging the stall forever.
+   * <p>
+   * The HTTP work is done on a short-lived daemon thread so the lag-monitor thread is never blocked
+   * on network I/O. Authenticated with the inter-node cluster token (the same trust mechanism used
+   * for snapshot transfer), never with operator credentials.
+   */
+  void forceResyncStalledReplica(final String peerId) {
+    if (peerId == null || !isLeader())
+      return;
+
+    final RaftPeerId targetId = RaftPeerId.valueOf(peerId);
+    if (targetId.equals(localPeerId))
+      return; // never resync the leader itself
+
+    // On an SSL-enabled cluster the follower listens on HTTPS (a different port from plain HTTP), so
+    // prefer its HTTPS endpoint; mirror SnapshotInstaller's behaviour and fall back to plain HTTP
+    // only when no HTTPS endpoint is known.
+    final boolean useSSL = configuration.getValueAsBoolean(GlobalConfiguration.NETWORK_USE_SSL);
+    boolean https = false;
+    String followerAddr = null;
+    if (useSSL) {
+      followerAddr = getPeerHttpsAddress(targetId);
+      if (followerAddr != null)
+        https = true;
+    }
+    if (followerAddr == null)
+      followerAddr = getPeerHttpAddress(targetId);
+    if (followerAddr == null) {
+      LogManager.instance().log(this, Level.WARNING,
+          "Cannot force resync of stalled replica '%s': its address is unknown", peerId);
+      return;
+    }
+
+    final String clusterToken = getClusterToken();
+    if (clusterToken == null || clusterToken.isEmpty()) {
+      // The follower's resync endpoint only accepts inter-node calls authenticated with the cluster
+      // token; without one the request is doomed to be rejected, so do not even attempt it.
+      LogManager.instance().log(this, Level.WARNING,
+          "Cannot force resync of stalled replica '%s': cluster token is not configured", peerId);
+      return;
+    }
+
+    final String address = followerAddr;
+    final boolean useHttps = https;
+
+    stalledResyncExecutor.execute(() -> {
+      // TODO (#4728): this resyncs EVERY non-reserved database on the follower. When a cluster hosts
+      // many databases and only one is stuck, this forces unnecessary full snapshots of the others.
+      // A per-database stall signal would let us scope the resync; acceptable as a first pass.
+      for (final String dbName : arcadeServer.getDatabaseNames()) {
+        // Re-check leadership on each iteration: the outer guard ran before this task was queued, and
+        // leadership may have moved since. A resync request from a non-leader is harmless (the
+        // follower rejects it) but would log spurious warnings, so stop early instead.
+        if (!isLeader())
+          return;
+        if (ArcadeDBServer.isReservedDatabaseName(dbName))
+          continue;
+        try {
+          requestRemoteResync(address, dbName, clusterToken, useHttps);
+          LogManager.instance().log(this, Level.INFO,
+              "Requested resync of database '%s' on stalled replica '%s' (%s)", dbName, peerId, address);
+        } catch (final Exception e) {
+          LogManager.instance().log(this, Level.WARNING,
+              "Failed to request resync of database '%s' on stalled replica '%s' (%s): %s",
+              dbName, peerId, address, e.getMessage());
+        }
+      }
+    });
+  }
+
+  private static ThreadPoolExecutor createStalledResyncExecutor() {
+    final ThreadPoolExecutor executor = new ThreadPoolExecutor(0, 1, 30L, TimeUnit.SECONDS,
+        new ArrayBlockingQueue<>(16), r -> {
+      final Thread t = new Thread(r, "arcadedb-raft-stalled-resync");
+      t.setDaemon(true);
+      return t;
+    }, new ThreadPoolExecutor.CallerRunsPolicy());
+    return executor;
+  }
+
+  /**
+   * Sends {@code POST /api/v1/cluster/resync/{database}} to a follower, authenticated with the
+   * cluster token. When {@code https} is true the connection uses the cluster SSL context (the same
+   * one used for snapshot transfer). Visible for testing. Throws on a non-2xx response.
+   */
+  void requestRemoteResync(final String followerAddr, final String databaseName, final String clusterToken,
+      final boolean https) throws IOException {
+    final String url = (https ? "https://" : "http://") + followerAddr + "/api/v1/cluster/resync/"
+        + URLEncoder.encode(databaseName, StandardCharsets.UTF_8);
+    final HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+    try {
+      if (conn instanceof final HttpsURLConnection httpsConn)
+        httpsConn.setSSLSocketFactory(SnapshotInstaller.buildSSLContext(arcadeServer).getSocketFactory());
+      conn.setRequestMethod("POST");
+      conn.setConnectTimeout(10_000);
+      // The resync endpoint is synchronous: it downloads the full snapshot from the leader and only
+      // then returns, so the read timeout must accommodate a snapshot transfer, not just a trigger.
+      conn.setReadTimeout(120_000);
+      conn.setDoOutput(true);
+      conn.setRequestProperty("Content-Type", "application/json");
+      // Inter-node forwarded auth: the cluster token plus the forwarded root user, validated by
+      // AbstractServerHttpHandler before the handler runs (same mechanism used for follower->leader
+      // request forwarding). No operator credentials are sent over the wire.
+      if (clusterToken != null && !clusterToken.isEmpty()) {
+        conn.setRequestProperty("X-ArcadeDB-Cluster-Token", clusterToken);
+        conn.setRequestProperty("X-ArcadeDB-Forwarded-User", FORWARDED_ROOT_USER);
+      }
+      try (final OutputStream os = conn.getOutputStream()) {
+        os.write("{}".getBytes(StandardCharsets.UTF_8));
+      }
+      final int code = conn.getResponseCode();
+      if (code < 200 || code >= 300) {
+        drainErrorStream(conn);
+        throw new IOException("resync endpoint returned HTTP " + code);
+      }
+    } finally {
+      conn.disconnect();
+    }
+  }
+
+  /**
+   * Drains and discards the error response body so the underlying keep-alive socket can be reused by
+   * the JVM connection pool instead of being abandoned (and leaked).
+   */
+  private static void drainErrorStream(final HttpURLConnection conn) {
+    try (final var err = conn.getErrorStream()) {
+      if (err != null)
+        err.readAllBytes();
+    } catch (final IOException ignored) {
+      // best-effort cleanup
+    }
   }
 
   /**
@@ -317,7 +481,12 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     final long staleFollowerLagThreshold = configuration.getValueAsLong(GlobalConfiguration.HA_STALE_FOLLOWER_LAG_THRESHOLD);
     final long staleFollowerRecoveryDurationMs = configuration.getValueAsLong(
         GlobalConfiguration.HA_STALE_FOLLOWER_RECOVERY_DURATION_MS);
-    this.healthMonitor = new HealthMonitor(this, healthInterval, staleFollowerLagThreshold, staleFollowerRecoveryDurationMs);
+    final boolean divergedFollowerRecovery = configuration.getValueAsBoolean(
+        GlobalConfiguration.HA_DIVERGED_FOLLOWER_RECOVERY);
+    final int divergedFollowerMaxReformats = configuration.getValueAsInteger(
+        GlobalConfiguration.HA_DIVERGED_FOLLOWER_MAX_REFORMATS);
+    this.healthMonitor = new HealthMonitor(this, healthInterval, staleFollowerLagThreshold, staleFollowerRecoveryDurationMs,
+        divergedFollowerRecovery, divergedFollowerMaxReformats);
     this.healthMonitor.start();
   }
 
@@ -381,6 +550,90 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   }
 
   /**
+   * Stuck-divergence detection for the {@link HealthMonitor} (issue #4741): true only when this node
+   * is a running follower that recognizes a leader at a newer term yet cannot apply the leader's
+   * current-term entries because its Raft log diverged. The signal is term-based rather than a lag
+   * count because the divergence can be a single entry on an otherwise idle cluster, where the
+   * lag-based recoveries (HA_STALE_FOLLOWER_LAG_THRESHOLD, HA_STALLED_REPLICA_RESYNC_DURATION_MS)
+   * never fire.
+   * <p>
+   * A healthy follower carries the leader's current-term entry (e.g. the post-election no-op), so its
+   * last-applied term equals the current term. A stuck-diverged follower keeps rejecting the leader's
+   * AppendEntries (term conflict), so it has applied everything it could locally commit
+   * ({@code commitIndex == appliedIndex}) yet its last-applied entry is from an older term
+   * ({@code currentTerm > appliedTerm}). The {@link HealthMonitor} requires this to persist for
+   * {@code HA_STALE_FOLLOWER_RECOVERY_DURATION_MS} before acting, which filters out the brief window
+   * around an election before the no-op commits. Returns false for the leader, when no leader is
+   * known, while actively catching up or installing a snapshot, and whenever the state cannot be read.
+   */
+  @Override
+  public boolean isFollowerStuckDiverged() {
+    if (raftServer == null || shutdownRequested || isLeader())
+      return false;
+    final ArcadeStateMachine sm = stateMachine;
+    if (sm == null)
+      return false;
+    final TermIndex applied = sm.getLastAppliedTermIndex();
+    if (applied == null)
+      return false;
+    // The values below are read as separate Ratis getDivision(...) calls, so they can observe slightly
+    // different moments during an election. We deliberately do not take an atomic snapshot: the
+    // HealthMonitor requires the stuck condition to persist for HA_STALE_FOLLOWER_RECOVERY_DURATION_MS
+    // before acting, which absorbs any one-tick inconsistency here.
+    return isStuckDivergedState(getLeaderId() != null, sm.isCatchingUp(), sm.isSnapshotDownloadPending(),
+        getCurrentTerm(), applied.getTerm(), applied.getIndex(), getCommitIndex());
+  }
+
+  /**
+   * Pure decision function behind {@link #isFollowerStuckDiverged()}, split out so the predicate can be
+   * unit-tested in isolation from the Ratis state plumbing (the destructive recovery makes the predicate
+   * the highest-risk piece). Returns {@code true} for the "stuck at a stale term" signature: a follower
+   * that recognizes a leader, is neither catching up nor installing a snapshot, has applied everything it
+   * could locally commit ({@code commitIndex == appliedIndex}) yet at a stale term
+   * ({@code currentTerm > appliedTerm}). Any negative term/index input (state not readable) yields
+   * {@code false}, including a negative {@code appliedTerm}.
+   * <p>
+   * Note this signature is satisfied by a genuine Raft-log divergence and also, in principle, by a
+   * follower that simply cannot receive the leader's current-term entries for a sustained period (a
+   * one-sided outage where heartbeats still arrive). The caller relies on the persistence window to
+   * separate a transient hiccup from a stuck state; both resolve to the same safe (non-data-losing)
+   * recovery, so the predicate does not try to distinguish them.
+   * <p>
+   * A freshly (re)joined / empty node does not match: before it applies anything its applied
+   * {@link TermIndex} is null (handled by the caller), while it is catching up it has
+   * {@code commitIndex > appliedIndex}, and once caught up its applied term equals the current term.
+   */
+  static boolean isStuckDivergedState(final boolean leaderPresent, final boolean catchingUp,
+      final boolean snapshotPending, final long currentTerm, final long appliedTerm, final long appliedIndex,
+      final long commitIndex) {
+    if (!leaderPresent || catchingUp || snapshotPending)
+      return false;
+    if (currentTerm < 0 || appliedTerm < 0 || appliedIndex < 0 || commitIndex < 0)
+      return false;
+    // We have applied everything we could locally commit, but at a stale term: we are rejecting the
+    // leader's current-term entries and cannot move forward.
+    return currentTerm > appliedTerm && commitIndex == appliedIndex;
+  }
+
+  @Override
+  public void recoverFromDivergence() {
+    if (shutdownRequested || isLeader())
+      return;
+    // Log the exact term/index values so an operator can confirm post-incident whether this was a genuine
+    // Raft-log divergence or a follower merely stuck at a stale term for another reason (e.g. a sustained
+    // one-sided network outage where heartbeats arrive but the leader's current-term entries do not).
+    final ArcadeStateMachine sm = stateMachine;
+    final TermIndex applied = sm != null ? sm.getLastAppliedTermIndex() : null;
+    LogManager.instance().log(this, Level.WARNING,
+        "Follower stuck at a stale term (currentTerm=%d, appliedTerm=%d, appliedIndex=%d, commitIndex=%d); "
+            + "reformatting Raft storage and rejoining so the leader can reconcile it via snapshot-install. "
+            + "If this recurs without a genuine log divergence, suspect a sustained one-sided outage to the leader.",
+        getCurrentTerm(), applied != null ? applied.getTerm() : -1L, applied != null ? applied.getIndex() : -1L,
+        getCommitIndex());
+    restartRatis(true);
+  }
+
+  /**
    * Recovers from a Ratis server that has entered CLOSED or CLOSING state, typically
    * after a network partition where the node was isolated long enough for Ratis to
    * give up on the group.
@@ -400,6 +653,18 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
    */
   @Override
   public void restartRatisIfNeeded() {
+    restartRatis(false);
+  }
+
+  /**
+   * Restarts the local Ratis server. When {@code formatStorage} is {@code true} the Raft storage
+   * directory is deleted first and the server starts with {@link RaftStorage.StartupOption#FORMAT},
+   * so this peer rejoins the group with an empty log and is reconciled by the leader via the
+   * snapshot-install path. This is the in-process equivalent of an operator restarting a node whose
+   * Raft log diverged (issue #4741). When {@code false} the existing storage is preserved and the
+   * server starts with {@link RaftStorage.StartupOption#RECOVER} (the CLOSED/EXCEPTION recovery path).
+   */
+  private void restartRatis(final boolean formatStorage) {
     synchronized (recoveryLock) {
       if (shutdownRequested) {
         HALog.log(this, HALog.BASIC, "Recovery skipped: shutdown requested");
@@ -453,13 +718,32 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
         final File storageDir = getRaftStorageDir();
         RaftServerConfigKeys.setStorageDir(properties, Collections.singletonList(storageDir));
 
+        // For a divergence reformat (#4741) discard the local Raft log so this peer rejoins as a fresh
+        // bootstrapping member; otherwise recover the existing log in place (CLOSED/EXCEPTION path).
+        final RaftStorage.StartupOption startupOption;
+        if (formatStorage) {
+          if (storageDir.exists()) {
+            deleteRecursive(storageDir);
+            // deleteRecursive swallows per-file failures (e.g. a locked file or a permission issue on
+            // Windows). FORMAT on a non-empty directory is undefined behaviour, so abort instead of
+            // proceeding: the throw is caught below, increments restartFailureCount, and the divergence
+            // reformat budget already counted this as an attempt - so the failure escalates through the
+            // existing retry/backoff machinery rather than starting Ratis on a half-deleted directory.
+            if (storageDir.exists())
+              throw new IOException("Could not fully delete Raft storage directory " + storageDir.getAbsolutePath()
+                  + " before reformat; aborting to avoid FORMAT on a non-empty directory");
+          }
+          startupOption = RaftStorage.StartupOption.FORMAT;
+        } else
+          startupOption = RaftStorage.StartupOption.RECOVER;
+
         this.raftServer = RaftServer.newBuilder()
             .setServerId(localPeerId)
             .setGroup(raftGroup)
             .setStateMachine(stateMachine)
             .setProperties(properties)
             .setParameters(buildParameters(configuration))
-            .setOption(RaftStorage.StartupOption.RECOVER)
+            .setOption(startupOption)
             .build();
         this.raftServer.start();
         this.raftProperties = properties;
@@ -502,6 +786,7 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       healthMonitor = null;
     }
     stopLagMonitor();
+    stalledResyncExecutor.shutdownNow();
     if (transactionBroker != null) {
       transactionBroker.stop();
       transactionBroker = null;
@@ -979,7 +1264,32 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     }
   }
 
+  /**
+   * Lenient overload (READ_YOUR_WRITES / bookmark wait): on timeout it logs and returns,
+   * allowing the read to proceed against possibly-stale local state. Never used by the
+   * LINEARIZABLE path - see {@link #waitForAppliedIndex(long, boolean)}.
+   */
   public void waitForAppliedIndex(final long targetIndex) {
+    waitForAppliedIndex(targetIndex, false);
+  }
+
+  /**
+   * Blocks until the local state machine has applied up to {@code targetIndex}, or the
+   * {@link #quorumTimeout} elapses.
+   *
+   * @param throwOnTimeout caller's consistency contract on timeout:
+   *                       <ul>
+   *                         <li>{@code true}  (LINEARIZABLE): a timeout means the local state
+   *                             machine could not be proven up-to-date, so we MUST fail the read
+   *                             (throw {@link ReplicationException} -> HTTP 503) rather than serve
+   *                             a value older than an already-committed write.</li>
+   *                         <li>{@code false} (READ_YOUR_WRITES / bookmark): a timeout degrades to
+   *                             best-effort - log and return, letting the read proceed.</li>
+   *                       </ul>
+   * @throws ReplicationException if {@code throwOnTimeout} is {@code true} and the deadline is
+   *                              reached before the local applied index catches up.
+   */
+  public void waitForAppliedIndex(final long targetIndex, final boolean throwOnTimeout) {
     if (targetIndex <= 0)
       return;
     try {
@@ -988,6 +1298,14 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
         while (getLastAppliedIndex() < targetIndex) {
           final long remaining = deadline - System.currentTimeMillis();
           if (remaining <= 0) {
+            if (throwOnTimeout) {
+              LogManager.instance().log(this, Level.WARNING,
+                  "LINEARIZABLE read failed: local apply timeout applied=%d < readIndex=%d after %dms (failing read)",
+                  getLastAppliedIndex(), targetIndex, quorumTimeout);
+              throw new ReplicationException(
+                  "LINEARIZABLE read timed out waiting for local apply: applied=" + getLastAppliedIndex()
+                      + " < readIndex=" + targetIndex);
+            }
             LogManager.instance().log(this, Level.WARNING,
                 "READ_YOUR_WRITES consistency timeout: applied=%d < target=%d (consistency degraded to EVENTUAL)",
                 getLastAppliedIndex(), targetIndex);
@@ -996,9 +1314,11 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
           applyNotifier.wait(remaining);
         }
       }
-      HALog.log(this, HALog.TRACE, "Bookmark wait complete: applied >= target=%d", targetIndex);
+      HALog.log(this, HALog.TRACE, "Apply wait complete: applied >= target=%d", targetIndex);
     } catch (final InterruptedException e) {
       Thread.currentThread().interrupt();
+      if (throwOnTimeout)
+        throw new ReplicationException("LINEARIZABLE read interrupted while waiting for local apply", e);
     }
   }
 
@@ -1071,8 +1391,23 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
 
   /**
    * Sends a ReadIndex RPC to the Raft leader and returns the confirmed commit index.
-   * The leader replies only after confirming its lease with a majority, guaranteeing
-   * that the returned index is committed and linearizable.
+   * The leader replies only after confirming its lease (or a majority heartbeat round)
+   * AND after committing at least one entry in its own current term, guaranteeing that
+   * the returned index covers every write that committed before this call - including
+   * writes committed under a prior leader/term (Raft §6.4, the new-leader hazard handled
+   * by Ratis {@code LeaderStateImpl.getReadIndex} / startup no-op entry).
+   * <p>
+   * IMPORTANT (issue: stale LINEARIZABLE follower read): in Apache Ratis 3.2.x a read-only
+   * reply does NOT carry the read index in {@link RaftClientReply#getLogIndex()} - that
+   * field is only populated for write replies and defaults to {@code 0} for reads
+   * ({@code RaftServerImpl.processQueryFuture} builds the reply without {@code setLogIndex}).
+   * Relying on {@code getLogIndex()} therefore yielded {@code 0}, which made
+   * {@link #waitForAppliedIndex(long, boolean)} a no-op and let a follower serve arbitrarily
+   * stale local state. Instead we read the leader's quorum-confirmed commit index out of the
+   * reply's {@code CommitInfoProto} list (every reply carries the commit index of the server
+   * that produced it, which for a leader-routed read is the leader itself). The reply is only
+   * produced after the leader's internal ReadIndex protocol confirmed leadership, so this
+   * commit index is a safe linearizable read index.
    *
    * @param expectSelfIsLeader if true and the reply indicates this node is not leader,
    *                           a {@link ReplicationException} is thrown with leader info
@@ -1081,7 +1416,7 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     try {
       final RaftClientReply reply = raftClient.io().sendReadOnly(Message.EMPTY);
       if (reply.isSuccess())
-        return reply.getLogIndex();
+        return extractLeaderCommitIndex(reply);
 
       final NotLeaderException nle = reply.getNotLeaderException();
       if (nle != null) {
@@ -1102,27 +1437,58 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   }
 
   /**
+   * Extracts the quorum-confirmed commit index of the server that produced {@code reply}
+   * (for a leader-routed read-only request, that is the leader) from the reply's
+   * {@code CommitInfoProto} list. See {@link #fetchReadIndex(boolean)} for why we cannot use
+   * {@link RaftClientReply#getLogIndex()} on a read reply (it is always {@code 0} in Ratis 3.2.x).
+   *
+   * @throws ReplicationException if the reply does not carry a commit index for its own server,
+   *                              which must NOT be silently treated as index 0 (that would
+   *                              re-introduce the stale-read bug).
+   */
+  private long extractLeaderCommitIndex(final RaftClientReply reply) {
+    final RaftPeerId replyServerId = reply.getServerId();
+    if (replyServerId != null && reply.getCommitInfos() != null) {
+      final var serverIdBytes = replyServerId.toByteString();
+      for (final RaftProtos.CommitInfoProto info : reply.getCommitInfos()) {
+        if (info.hasServer() && serverIdBytes.equals(info.getServer().getId()))
+          return info.getCommitIndex();
+      }
+    }
+    // The read succeeded but the leader's commit index is missing from the reply. We cannot
+    // prove linearizability, so fail loudly rather than serve a possibly-stale read.
+    throw new ReplicationException(
+        "ReadIndex reply did not include the leader commit index; cannot guarantee linearizable read");
+  }
+
+  /**
    * Ensures linearizable read consistency for the leader. Sends a ReadIndex RPC to
    * confirm the leader lease, then waits for the local state machine to apply up to
    * the confirmed commit index.
    * <p>
-   * Throws {@link ReplicationException} if leadership is lost before or after the RPC.
+   * Throws {@link ReplicationException} if leadership is lost before or after the RPC, or if
+   * the local state machine cannot catch up to the read index before the quorum timeout.
    */
   public void ensureLinearizableRead() {
     final long readIndex = fetchReadIndex(true);
     if (!isLeader())
       throw new ReplicationException("Lost leadership after ReadIndex confirmation");
-    waitForAppliedIndex(readIndex);
+    // LINEARIZABLE: a timeout MUST throw (HTTP 503) - never silently degrade to a stale read.
+    waitForAppliedIndex(readIndex, true);
   }
 
   /**
    * Ensures linearizable read consistency for a follower. Contacts the leader via
    * ReadIndex RPC to obtain the current commit index, then waits for the local state
    * machine to apply up to that index before allowing the read to proceed.
+   * <p>
+   * Throws {@link ReplicationException} if the read index cannot be obtained, or if the local
+   * state machine cannot catch up to it before the quorum timeout (never serves stale state).
    */
   public void ensureLinearizableFollowerRead() {
     final long readIndex = fetchReadIndex(false);
-    waitForAppliedIndex(readIndex);
+    // LINEARIZABLE: a timeout MUST throw (HTTP 503) - never silently degrade to a stale read.
+    waitForAppliedIndex(readIndex, true);
   }
 
   public List<Map<String, Object>> getFollowerStates() {
@@ -1222,7 +1588,8 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
    * The customizer adds a {@link PeerAddressAllowlistFilter} that rejects inbound Raft gRPC
    * connections from IPs not listed in {@code arcadedb.ha.serverList}.
    */
-  private static Parameters buildParameters(final ContextConfiguration configuration) {
+  private Parameters buildParameters(final ContextConfiguration configuration) {
+    this.allowlistFilter = null;
     final Parameters parameters = new Parameters();
     if (!configuration.getValueAsBoolean(GlobalConfiguration.HA_PEER_ALLOWLIST_ENABLED))
       return parameters;
@@ -1233,14 +1600,29 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     final long stickyTtlMs = configuration.getValueAsLong(GlobalConfiguration.HA_PEER_ALLOWLIST_STICKY_TTL_MS);
     final List<String> peerHosts = PeerAddressAllowlistFilter.extractPeerHosts(serverList);
     if (peerHosts.isEmpty()) {
-      LogManager.instance().log(RaftHAServer.class, Level.WARNING,
+      LogManager.instance().log(this, Level.WARNING,
           "arcadedb.ha.peerAllowlist.enabled=true but arcadedb.ha.serverList is empty; allowlist not installed");
       return parameters;
     }
-    final PeerAddressAllowlistFilter allowlistFilter = new PeerAddressAllowlistFilter(peerHosts, refreshMs, startupGraceMs,
+    final PeerAddressAllowlistFilter filter = new PeerAddressAllowlistFilter(peerHosts, refreshMs, startupGraceMs,
         stickyTtlMs);
-    GrpcConfigKeys.Server.setServicesCustomizer(parameters, new RaftGrpcServicesCustomizer(allowlistFilter));
+    this.allowlistFilter = filter;
+    GrpcConfigKeys.Server.setServicesCustomizer(parameters, new RaftGrpcServicesCustomizer(filter));
     return parameters;
+  }
+
+  /**
+   * Proactively reconciles the inbound Raft gRPC peer allowlist with current DNS (issue #4696).
+   * Invoked from the health monitor tick on every node so a peer that restarted with a new pod IP is
+   * admitted without first having to be rejected on an inbound connection - which a leader with a
+   * wedged outbound appender channel may never receive. No-op when the allowlist is disabled. The
+   * filter throttles the actual DNS re-resolution to its configured refresh interval.
+   */
+  @Override
+  public void refreshPeerAllowlist() {
+    final PeerAddressAllowlistFilter filter = allowlistFilter;
+    if (filter != null)
+      filter.proactiveRefresh();
   }
 
   private static void deleteRecursive(final File file) {
