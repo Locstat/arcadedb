@@ -23,6 +23,7 @@ import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.log.LogManager;
 import com.arcadedb.server.ArcadeDBServer;
 import com.arcadedb.server.http.HttpServer;
+import com.arcadedb.server.monitor.HAReplicationStatsProvider;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.Parameters;
@@ -139,6 +140,16 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   private volatile boolean                   shutdownRequested     = false;
   private volatile LifeCycle.State           forcedStateForTesting = null;
   private          HealthMonitor             healthMonitor;
+  // Follower-side Raft log catch-up narrative. Driven by the health-monitor tick; only active on a
+  // follower with a non-trivial apply backlog (committed-but-not-yet-applied entries) and not installing
+  // a snapshot.
+  private volatile FollowerResyncProgressTracker resyncProgressTracker = null;
+  // Applied index observed at the previous stale-follower lag check (issue #4840). Compared against the
+  // current applied index to tell a healthy-but-slow follower (applied advancing one entry at a time)
+  // apart from a genuinely stuck one (applied frozen). Read/written only on the single HealthMonitor
+  // tick thread, so it needs no synchronization. -1 = no prior sample (first check or just resumed
+  // follower duty).
+  private          long                      lastLagCheckAppliedIndex = -1;
   private          ClusterTokenProvider      tokenProvider;
   private volatile int                       restartFailureCount   = 0;
   private volatile BootstrapElection         bootstrapElection;
@@ -160,7 +171,32 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
 
     this.httpAddresses.putAll(parsed.httpAddresses());
     this.httpsAddresses.putAll(parsed.httpsAddresses());
-    this.localPeerId = RaftPeerAddressResolver.findLocalPeerId(peers, configuredPeerNames, serverName, arcadeServer);
+
+    RaftPeerId resolvedLocalPeerId;
+    try {
+      resolvedLocalPeerId = RaftPeerAddressResolver.findLocalPeerId(peers, configuredPeerNames, serverName, arcadeServer);
+    } catch (final IllegalArgumentException e) {
+      // Issue #4836: a Kubernetes StatefulSet scaled past the static HA_SERVER_LIST starts pods whose
+      // ordinal is beyond the configured peer list. Rather than crash-loop, synthesize the local peer
+      // from the pod name + DNS suffix and let KubernetesAutoJoin add it to the running cluster.
+      final RaftPeer synthesized = RaftPeerAddressResolver.synthesizeK8sScaleUpPeer(
+          configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S), peers, serverName,
+          configuration.getValueAsString(GlobalConfiguration.HA_K8S_DNS_SUFFIX), raftPort);
+      if (synthesized == null)
+        // Not a K8s scale-up node: surface the original, actionable resolution error.
+        throw e;
+
+      final int configuredPeers = peers.size();
+      final List<RaftPeer> augmented = new ArrayList<>(peers);
+      augmented.add(synthesized);
+      peers = Collections.unmodifiableList(augmented);
+      resolvedLocalPeerId = synthesized.getId();
+      LogManager.instance().log(this, Level.INFO,
+          "K8s scale-up detected: node '%s' is beyond the configured server list (%d peers). "
+              + "Synthesized local Raft peer %s; it will auto-join the existing cluster.",
+          serverName, configuredPeers, synthesized.getId());
+    }
+    this.localPeerId = resolvedLocalPeerId;
 
     // If this node is configured as a replica, override its Raft peer priority to 0
     // so Ratis never elects it as leader (useful for read-scale or witness nodes).
@@ -212,12 +248,14 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       this.peerDisplayNames.put(peerId, httpAddr != null ? nodeName + " (" + httpAddr + ")" : nodeName);
     }
 
-    this.stateMachine = new ArcadeStateMachine();
-    this.stateMachine.setServer(arcadeServer);
+    this.stateMachine = createStateMachine();
 
     final long stalledResyncDurationMs = configuration.getValueAsLong(
         GlobalConfiguration.HA_STALLED_REPLICA_RESYNC_DURATION_MS);
-    this.clusterMonitor = new ClusterMonitor(lagWarningThreshold, stalledResyncDurationMs, this::forceResyncStalledReplica);
+    final boolean resyncNarrative = configuration.getValueAsBoolean(GlobalConfiguration.HA_RESYNC_PROGRESS_LOGGING);
+    final long peerUnreachableThresholdMs = configuration.getValueAsLong(GlobalConfiguration.HA_PEER_UNREACHABLE_THRESHOLD);
+    this.clusterMonitor = new ClusterMonitor(lagWarningThreshold, stalledResyncDurationMs,
+        this::forceResyncStalledReplica, resyncNarrative, peerUnreachableThresholdMs);
     this.quorum = Quorum.parse(configuration.getValueAsString(GlobalConfiguration.HA_QUORUM));
     this.quorumTimeout = configuration.getValueAsLong(GlobalConfiguration.HA_QUORUM_TIMEOUT);
 
@@ -421,7 +459,7 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     // Only delete existing Raft storage when persistence is not requested.
     // Persistent mode (HA_RAFT_PERSIST_STORAGE=true) is used in tests that restart nodes
     // within a single test run, so the Raft log survives across stop/start calls.
-    final boolean persistStorage = configuration.getValueAsBoolean(GlobalConfiguration.HA_RAFT_PERSIST_STORAGE);
+    final boolean persistStorage = resolvePersistStorage(configuration);
     if (storageDir.exists() && !persistStorage)
       deleteRecursive(storageDir);
     RaftServerConfigKeys.setStorageDir(properties, Collections.singletonList(storageDir));
@@ -465,8 +503,9 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     final int queueSize = configuration.getValueAsInteger(GlobalConfiguration.HA_GROUP_COMMIT_QUEUE_SIZE);
     final int offerTimeout = configuration.getValueAsInteger(GlobalConfiguration.HA_GROUP_COMMIT_OFFER_TIMEOUT);
     final long grpcMessageSizeMax = configuration.getValueAsLong(GlobalConfiguration.HA_GRPC_MESSAGE_SIZE_MAX);
+    final long maxQueuedBytes = configuration.getValueAsLong(GlobalConfiguration.HA_GROUP_COMMIT_MAX_QUEUED_BYTES);
     transactionBroker = new RaftTransactionBroker(raftClient, quorum, quorumTimeout, batchSize, queueSize, offerTimeout,
-        grpcMessageSizeMax, this::refreshRaftClient);
+        grpcMessageSizeMax, maxQueuedBytes, this::refreshRaftClient);
 
     // Bootstrap election (issue #4147): runs once per cluster lifetime when this peer is elected
     // leader and the Raft log is still empty. Stays a no-op if disabled or on subsequent leader
@@ -488,6 +527,10 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     this.healthMonitor = new HealthMonitor(this, healthInterval, staleFollowerLagThreshold, staleFollowerRecoveryDurationMs,
         divergedFollowerRecovery, divergedFollowerMaxReformats);
     this.healthMonitor.start();
+    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_RESYNC_PROGRESS_LOGGING))
+      this.resyncProgressTracker = new FollowerResyncProgressTracker(
+          configuration.getValueAsLong(GlobalConfiguration.HA_RESYNC_PROGRESS_INTERVAL),
+          configuration.getValueAsLong(GlobalConfiguration.HA_RESYNC_CATCHUP_LAG_THRESHOLD));
   }
 
   /**
@@ -525,21 +568,60 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   /**
    * Stale-follower detection for the {@link HealthMonitor} (issue #3893): true only when this node
    * is a running follower lagging more than {@code lagThreshold} entries behind the commit index,
-   * is NOT actively catching up, and has no snapshot download already pending. Returns false for
-   * the leader and whenever the Raft state cannot be read.
+   * is NOT actively catching up, has no snapshot download already pending, AND is not making forward
+   * progress on its applied index (issue #4840). Returns false for the leader and whenever the Raft
+   * state cannot be read.
+   * <p>
+   * The progress check is what distinguishes a healthy-but-slow follower from a genuinely stuck one.
+   * The {@link ArcadeStateMachine} {@code catchingUp} flag only trips on a snapshot-style index jump
+   * ({@code gap > 1}); a follower applying steady-state AppendEntries one entry at a time never sets it,
+   * so without comparing the applied index between ticks a slow-but-progressing follower under sustained
+   * writes would be misclassified as lagging and needlessly resynced. By remembering the applied index
+   * seen on the previous tick, this returns false as soon as the index advances, and only true while the
+   * index is stuck beyond the threshold.
    */
   @Override
   public boolean isFollowerLaggingBeyond(final long lagThreshold) {
-    if (raftServer == null || shutdownRequested || isLeader())
+    if (raftServer == null || shutdownRequested || isLeader()) {
+      lastLagCheckAppliedIndex = -1; // not a follower right now: drop the progress baseline
       return false;
+    }
     final ArcadeStateMachine sm = stateMachine;
-    if (sm == null || sm.isCatchingUp() || sm.isSnapshotDownloadPending())
+    if (sm == null || sm.isCatchingUp() || sm.isSnapshotDownloadPending()) {
+      lastLagCheckAppliedIndex = -1; // already known to be catching up: re-baseline when normal checks resume
       return false;
+    }
     final long commit = getCommitIndex();
     final long applied = getLastAppliedIndex();
-    if (commit < 0 || applied < 0)
+    final boolean lagging = isPersistentlyLagging(commit, applied, lagThreshold, lastLagCheckAppliedIndex);
+    if (applied >= 0)
+      lastLagCheckAppliedIndex = applied;
+    return lagging;
+  }
+
+  /**
+   * Pure decision function behind {@link #isFollowerLaggingBeyond(long)}, split out so the predicate can be
+   * unit-tested without the Ratis state plumbing. Returns {@code true} only for a follower that is both far
+   * enough behind ({@code commitIndex - appliedIndex > lagThreshold}) AND stuck (no forward progress on the
+   * applied index since the previous tick). A follower applying entries one at a time keeps
+   * {@code appliedIndex > previousAppliedIndex} every tick, so it returns {@code false}: healthy-but-slow,
+   * must not be resynced (issue #4840). A negative {@code commitIndex}/{@code appliedIndex} (state not
+   * readable this tick) or a lag within the threshold returns {@code false}. {@code previousAppliedIndex < 0}
+   * means "no prior sample" (first observation or just resumed follower duty): progress cannot be determined
+   * yet, so the lag alone decides - the {@link HealthMonitor}'s persistence window still requires the
+   * condition to repeat before it acts.
+   */
+  static boolean isPersistentlyLagging(final long commitIndex, final long appliedIndex, final long lagThreshold,
+      final long previousAppliedIndex) {
+    if (commitIndex < 0 || appliedIndex < 0)
       return false;
-    return commit - applied > lagThreshold;
+    if (commitIndex - appliedIndex <= lagThreshold)
+      return false;
+    // Forward progress since the previous tick: the follower is actively replaying the backlog one entry
+    // at a time, so it is not stuck and must not be resynced even though it still trails the leader.
+    if (previousAppliedIndex >= 0 && appliedIndex > previousAppliedIndex)
+      return false;
+    return true;
   }
 
   @Override
@@ -547,6 +629,21 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     final ArcadeStateMachine sm = stateMachine;
     if (sm != null)
       sm.recoverFromPersistentLag();
+  }
+
+  @Override
+  public void reportResyncProgress() {
+    final FollowerResyncProgressTracker tracker = resyncProgressTracker;
+    if (tracker == null || raftServer == null || shutdownRequested || isLeader())
+      return;
+    final ArcadeStateMachine sm = stateMachine;
+    if (sm == null || sm.isSnapshotDownloadPending())
+      return; // the snapshot path logs its own bookends
+    final long applied = getLastAppliedIndex();
+    final long commit = getCommitIndex();
+    final FollowerResyncProgressTracker.Tick tick = tracker.onTick(applied, commit, System.currentTimeMillis());
+    if (tick.event() != FollowerResyncProgressTracker.Event.NONE)
+      LogManager.instance().log(this, Level.INFO, tick.message());
   }
 
   /**
@@ -657,6 +754,22 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   }
 
   /**
+   * Builds a fully wired {@link ArcadeStateMachine}. Both collaborators must be set: {@code setServer}
+   * gives it the {@link ArcadeDBServer} and {@code setRaftHAServer} the owning {@code RaftHAServer}.
+   * Missing the latter leaves {@code raftHAServer} null on the new machine, so the recovered node can
+   * no longer install snapshots ({@code notifyInstallSnapshotFromLeader} NPEs), never marks
+   * locally-originated transactions (origin-skip fails, the leader re-applies its own committed txns),
+   * and silently skips leader-change handling (issue #4839). Used by both the startup constructor and
+   * the {@link #restartRatis(boolean)} recovery path so the two can never drift.
+   */
+  private ArcadeStateMachine createStateMachine() {
+    final ArcadeStateMachine sm = new ArcadeStateMachine();
+    sm.setServer(arcadeServer);
+    sm.setRaftHAServer(this);
+    return sm;
+  }
+
+  /**
    * Restarts the local Ratis server. When {@code formatStorage} is {@code true} the Raft storage
    * directory is deleted first and the server starts with {@link RaftStorage.StartupOption#FORMAT},
    * so this peer rejoins the group with an empty log and is reconciled by the leader via the
@@ -711,8 +824,7 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       }
 
       try {
-        this.stateMachine = new ArcadeStateMachine();
-        this.stateMachine.setServer(arcadeServer);
+        this.stateMachine = createStateMachine();
 
         final RaftProperties properties = RaftPropertiesBuilder.build(configuration);
         final File storageDir = getRaftStorageDir();
@@ -753,8 +865,9 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
         final int queueSize = configuration.getValueAsInteger(GlobalConfiguration.HA_GROUP_COMMIT_QUEUE_SIZE);
         final int offerTimeout = configuration.getValueAsInteger(GlobalConfiguration.HA_GROUP_COMMIT_OFFER_TIMEOUT);
         final long grpcMessageSizeMax = configuration.getValueAsLong(GlobalConfiguration.HA_GRPC_MESSAGE_SIZE_MAX);
+        final long maxQueuedBytes = configuration.getValueAsLong(GlobalConfiguration.HA_GROUP_COMMIT_MAX_QUEUED_BYTES);
         this.transactionBroker = new RaftTransactionBroker(raftClient, quorum, quorumTimeout, batchSize, queueSize,
-            offerTimeout, grpcMessageSizeMax, this::refreshRaftClient);
+            offerTimeout, grpcMessageSizeMax, maxQueuedBytes, this::refreshRaftClient);
 
         restartFailureCount = 0;
         HALog.log(this, HALog.BASIC, "Ratis recovered successfully");
@@ -792,8 +905,16 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       transactionBroker = null;
     }
 
-    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S))
-      leaveCluster();
+    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S)) {
+      // Best-effort graceful leave during shutdown: leaveCluster() now surfaces failures (issue #4796),
+      // but the pod is going down regardless, so a refusal (e.g. would breach quorum) or a transient
+      // error must not abort the shutdown sequence.
+      try {
+        leaveCluster();
+      } catch (final Exception e) {
+        LogManager.instance().log(this, Level.WARNING, "Could not leave cluster gracefully on shutdown: %s", e.getMessage());
+      }
+    }
 
     // Suppress noisy Ratis gRPC warnings during shutdown (AlreadyClosedException, CANCELLED streams).
     // These are harmless - internal replication threads take a moment to notice the server is closed.
@@ -933,9 +1054,10 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       final int queueSize = configuration.getValueAsInteger(GlobalConfiguration.HA_GROUP_COMMIT_QUEUE_SIZE);
       final int offerTimeout = configuration.getValueAsInteger(GlobalConfiguration.HA_GROUP_COMMIT_OFFER_TIMEOUT);
       final long grpcMessageSizeMax = configuration.getValueAsLong(GlobalConfiguration.HA_GRPC_MESSAGE_SIZE_MAX);
+      final long maxQueuedBytes = configuration.getValueAsLong(GlobalConfiguration.HA_GROUP_COMMIT_MAX_QUEUED_BYTES);
       final RaftTransactionBroker oldBroker = transactionBroker;
       transactionBroker = new RaftTransactionBroker(raftClient, quorum, quorumTimeout, batchSize, queueSize,
-          offerTimeout, grpcMessageSizeMax, this::refreshRaftClient);
+          offerTimeout, grpcMessageSizeMax, maxQueuedBytes, this::refreshRaftClient);
       // Transfer undispatched entries from the old broker to the new one BEFORE stopping the old
       // broker, so a brief leader hiccup (e.g. self-stepdown -> re-elected leader) does not surface
       // "Group committer shutting down" errors to in-flight callers. transferPendingTo() also halts
@@ -1192,6 +1314,10 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     clusterManager.removePeer(peerId);
   }
 
+  public void removePeer(final String peerId, final boolean force) {
+    clusterManager.removePeer(peerId, force);
+  }
+
   /**
    * Registers or updates the display name for a peer. The stored value is
    * formatted as {@code name (httpAddress)} when the peer's HTTP address is known.
@@ -1239,23 +1365,79 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   }
 
   public void stepDown() {
-    for (final var peer : getLivePeers()) {
-      if (!peer.getId().toString().equals(localPeerId.toString())) {
-        try {
-          transferLeadership(peer.getId().toString(), 10_000);
-          return;
-        } catch (final Exception e) {
-          LogManager.instance().log(this, Level.SEVERE,
-              "Failed to step down (transfer to %s): %s", peer.getId(), e.getMessage());
-        }
+    final List<RaftPeer> candidates = selectStepDownTargets(getLivePeers(), localPeerId, clusterMonitor);
+
+    for (final RaftPeer peer : candidates) {
+      try {
+        transferLeadership(peer.getId().toString(), 10_000);
+        return;
+      } catch (final Exception e) {
+        LogManager.instance().log(this, Level.SEVERE,
+            "Failed to step down (transfer to %s): %s", peer.getId(), e.getMessage());
       }
     }
+
+    // No eligible explicit target (every other peer is a priority-0 witness/replica or is lagging, or
+    // every explicit transfer failed). Delegate the choice to Ratis: the no-target transfer honors Raft
+    // priorities and never elects a priority-0 peer, which is safer than abandoning the step-down (issue #4808).
+    LogManager.instance().log(this, Level.INFO,
+        "No explicit step-down target eligible; delegating leadership-transfer target selection to Ratis");
+    if (transferLeadership(10_000L))
+      return;
+
     LogManager.instance().log(this, Level.SEVERE,
         "Cannot step down: no other peer available for leadership transfer");
   }
 
+  /**
+   * Selects, in preference order, the peers eligible to receive leadership when this leader steps
+   * down (issue #4808). A peer is eligible when it is not this node, is not lagging behind the leader
+   * ({@link ClusterMonitor#isReplicaLagging}), and is not a priority-0 witness/replica while peers with
+   * a higher priority exist - Ratis is configured never to elect a priority-0 peer, so handing it
+   * leadership would just bounce it straight back and prolong write unavailability. The list is ordered
+   * by descending Raft priority so the strongest candidate is tried first; equal priorities keep the
+   * cluster iteration order.
+   *
+   * @return an ordered list of candidate peers, possibly empty (the caller then delegates the choice to
+   *         Ratis via the no-target transfer).
+   */
+  static List<RaftPeer> selectStepDownTargets(final Collection<RaftPeer> livePeers, final RaftPeerId localPeerId,
+      final ClusterMonitor clusterMonitor) {
+    final String localId = localPeerId.toString();
+
+    // Highest priority among the other peers. When it is 0 the cluster runs with the default,
+    // homogeneous priorities and every follower is equally electable; only when some peer carries an
+    // explicit positive priority do the priority-0 peers become non-electable witnesses to be skipped.
+    int maxPriority = 0;
+    for (final RaftPeer peer : livePeers)
+      if (!peer.getId().toString().equals(localId))
+        maxPriority = Math.max(maxPriority, peer.getPriority());
+
+    final List<RaftPeer> candidates = new ArrayList<>();
+    for (final RaftPeer peer : livePeers) {
+      final String peerId = peer.getId().toString();
+      if (peerId.equals(localId))
+        continue;
+      // Priority-0 witness/replica while real voters exist: Ratis would never keep it as leader.
+      if (maxPriority > 0 && peer.getPriority() <= 0)
+        continue;
+      // Lagging follower: promoting it would prolong write unavailability while it catches up.
+      if (clusterMonitor != null && clusterMonitor.isReplicaLagging(peerId))
+        continue;
+      candidates.add(peer);
+    }
+
+    // Strongest (highest priority) first; List.sort is stable so equal priorities keep iteration order.
+    candidates.sort((a, b) -> Integer.compare(b.getPriority(), a.getPriority()));
+    return candidates;
+  }
+
   public void leaveCluster() {
     clusterManager.leaveCluster();
+  }
+
+  public void leaveCluster(final boolean force) {
+    clusterManager.leaveCluster(force);
   }
 
   public void notifyApplied() {
@@ -1491,6 +1673,81 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     waitForAppliedIndex(readIndex, true);
   }
 
+  /**
+   * Aggregates {@link #getFollowerStates()} into a single replication-health snapshot for metrics
+   * (issue #4809 follow-up). The {@code maxFollowerLastContactMs} field is the leading indicator of
+   * election churn: it is the worst time since the leader last reached any follower, and when it
+   * approaches {@code arcadedb.ha.electionTimeoutMin} an election is imminent. Returns a not-leader
+   * placeholder ({@code -1}/{@code 0}) when this node is not the leader.
+   */
+  public HAReplicationStatsProvider.HAReplicationStats getReplicationStats() {
+    if (raftServer == null || !isLeader())
+      return new HAReplicationStatsProvider.HAReplicationStats(false, -1, -1, 0);
+
+    final List<Map<String, Object>> followers = getFollowerStates();
+    if (followers.isEmpty())
+      return new HAReplicationStatsProvider.HAReplicationStats(true, -1, -1, 0);
+
+    final long commitIndex = getCommitIndex();
+    long maxContactMs = -1;
+    long maxLag = -1;
+    for (final Map<String, Object> follower : followers) {
+      final Object elapsed = follower.get("lastRpcElapsedMs");
+      if (elapsed instanceof Number n)
+        maxContactMs = Math.max(maxContactMs, n.longValue());
+      final Object matchIndex = follower.get("matchIndex");
+      if (commitIndex >= 0 && matchIndex instanceof Number n)
+        maxLag = Math.max(maxLag, Math.max(0L, commitIndex - n.longValue()));
+    }
+    return new HAReplicationStatsProvider.HAReplicationStats(true, maxContactMs, maxLag, followers.size());
+  }
+
+  /**
+   * Per-follower health samples for metrics, the cluster JSON, and the lagging-follower alert (issue
+   * #4812). Combines the leader's Ratis follower indices ({@link #getFollowerStates()}) with the
+   * {@link ClusterMonitor}'s classification and sustained-lag duration. Empty when not the leader.
+   */
+  public List<HAReplicationStatsProvider.FollowerSample> getFollowerSamples() {
+    if (raftServer == null || !isLeader())
+      return List.of();
+
+    final List<Map<String, Object>> followers = getFollowerStates();
+    if (followers.isEmpty())
+      return List.of();
+
+    final long commitIndex = getCommitIndex();
+    final List<HAReplicationStatsProvider.FollowerSample> samples = new ArrayList<>(followers.size());
+    for (final Map<String, Object> follower : followers) {
+      final String peerId = (String) follower.get("peerId");
+      final long matchIndex = follower.get("matchIndex") instanceof Number n ? n.longValue() : -1;
+      final long nextIndex = follower.get("nextIndex") instanceof Number n ? n.longValue() : -1;
+      final long lastContactMs = follower.get("lastRpcElapsedMs") instanceof Number n ? n.longValue() : -1;
+      final long lag = commitIndex >= 0 && matchIndex >= 0 ? Math.max(0L, commitIndex - matchIndex) : -1;
+      final String status = clusterMonitor != null ? clusterMonitor.getReplicaStatus(peerId).name() : "UNKNOWN";
+      final long laggingForMs = clusterMonitor != null ? clusterMonitor.getReplicaLaggingForMs(peerId) : 0;
+      samples.add(new HAReplicationStatsProvider.FollowerSample(
+          peerId, matchIndex, nextIndex, lag, lastContactMs, status, laggingForMs));
+    }
+    return samples;
+  }
+
+  /**
+   * Returns one map per follower with its {@code peerId}, {@code matchIndex}, {@code nextIndex} and
+   * {@code lastRpcElapsedMs}, as seen by this leader.
+   * <p>
+   * The three Ratis APIs we read - the follower peer-id list ({@code RoleInfoProto.LeaderInfo}), the
+   * match-index array and the next-index array - are each built from an independent snapshot of the
+   * leader's internal {@code CopyOnWriteArrayList} of log appenders. They are positionally aligned
+   * only while cluster membership is stable. A membership change (adding, removing or replacing a
+   * peer) between the calls can shift array positions, so zipping them by index would attribute a
+   * follower's match/next index to the wrong peer id (issue #4842). The old {@code min(...)} guard
+   * protected length, not order.
+   * <p>
+   * We use a seqlock-style read: capture the peer-id ordering before and after reading the two index
+   * arrays and only trust the positional correlation when the ordering is unchanged and the array
+   * lengths line up. On divergence we retry a bounded number of times, then fall back to reporting
+   * the peers with unknown (omitted) indices rather than misattributing them.
+   */
   public List<Map<String, Object>> getFollowerStates() {
     if (raftServer == null || !isLeader())
       return List.of();
@@ -1498,32 +1755,88 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       final var division = raftServer.getDivision(raftGroup.getGroupId());
       final var info = division.getInfo();
 
-      final var roleInfo = info.getRoleInfoProto();
-      if (!roleInfo.hasLeaderInfo())
-        return List.of();
+      for (int attempt = 0; attempt < FOLLOWER_STATES_MAX_ATTEMPTS; attempt++) {
+        final List<RaftProtos.ServerRpcProto> before = leaderFollowerInfos(info);
+        if (before.isEmpty())
+          return List.of();
 
-      final List<RaftProtos.ServerRpcProto> followerInfos = roleInfo.getLeaderInfo().getFollowerInfoList();
-      final long[] matchIndices = info.getFollowerMatchIndices();
-      final long[] nextIndices = info.getFollowerNextIndices();
+        final long[] matchIndices = info.getFollowerMatchIndices();
+        final long[] nextIndices = info.getFollowerNextIndices();
 
-      // If sizes diverge, a membership change happened between calls - correlate what we can safely
-      final int safeSize = Math.min(followerInfos.size(), Math.min(matchIndices.length, nextIndices.length));
+        final List<RaftProtos.ServerRpcProto> after = leaderFollowerInfos(info);
 
-      final List<Map<String, Object>> result = new ArrayList<>(safeSize);
-      for (int i = 0; i < safeSize; i++) {
-        final String peerId = followerInfos.get(i).getId().getId().toStringUtf8();
-        final long lastRpcElapsedMs = followerInfos.get(i).getLastRpcElapsedTimeMs();
-        final Map<String, Object> state = new LinkedHashMap<>();
-        state.put("peerId", peerId);
-        state.put("matchIndex", matchIndices[i]);
-        state.put("nextIndex", nextIndices[i]);
-        state.put("lastRpcElapsedMs", lastRpcElapsedMs);
-        result.add(state);
+        final List<Map<String, Object>> correlated = correlateFollowerStates(before, matchIndices, nextIndices, after);
+        if (correlated != null)
+          return correlated;
+        // Membership changed while we read the index arrays - retry with a fresh, consistent snapshot.
       }
-      return result;
+
+      // Membership kept changing under us across every attempt: report the peers we currently know,
+      // without indices, rather than risk attributing a match/next index to the wrong peer.
+      return degradedFollowerStates(leaderFollowerInfos(info));
     } catch (final IOException e) {
       return List.of();
     }
+  }
+
+  /** Number of seqlock retries in {@link #getFollowerStates()} before degrading to index-less peers. */
+  private static final int FOLLOWER_STATES_MAX_ATTEMPTS = 3;
+
+  /** Returns the leader's follower peer-info list, or an empty list when this node is not a ready leader. */
+  private static List<RaftProtos.ServerRpcProto> leaderFollowerInfos(final org.apache.ratis.server.DivisionInfo info) {
+    final RaftProtos.RoleInfoProto roleInfo = info.getRoleInfoProto();
+    return roleInfo.hasLeaderInfo() ? roleInfo.getLeaderInfo().getFollowerInfoList() : List.of();
+  }
+
+  /**
+   * Correlates the {@code before} follower peer-id snapshot with the match/next index arrays, validating
+   * against the {@code after} snapshot. Returns the per-follower state maps when the snapshots are
+   * consistent (same peer ordering and matching array lengths), or {@code null} when a membership change
+   * raced the reads and positional correlation cannot be trusted.
+   */
+  static List<Map<String, Object>> correlateFollowerStates(final List<RaftProtos.ServerRpcProto> before,
+      final long[] matchIndices, final long[] nextIndices, final List<RaftProtos.ServerRpcProto> after) {
+    if (!samePeerOrder(before, after) || matchIndices.length != before.size() || nextIndices.length != before.size())
+      return null;
+
+    final List<Map<String, Object>> result = new ArrayList<>(before.size());
+    for (int i = 0; i < before.size(); i++) {
+      final Map<String, Object> state = new LinkedHashMap<>();
+      state.put("peerId", before.get(i).getId().getId().toStringUtf8());
+      state.put("matchIndex", matchIndices[i]);
+      state.put("nextIndex", nextIndices[i]);
+      state.put("lastRpcElapsedMs", before.get(i).getLastRpcElapsedTimeMs());
+      result.add(state);
+    }
+    return result;
+  }
+
+  /**
+   * Builds index-less follower states (peer id and last-RPC elapsed only) for the case where membership
+   * churned faster than {@link #getFollowerStates()} could take a consistent snapshot. The match/next
+   * index keys are intentionally omitted so downstream consumers treat the lag as unknown instead of
+   * reading a misattributed value.
+   */
+  static List<Map<String, Object>> degradedFollowerStates(final List<RaftProtos.ServerRpcProto> followerInfos) {
+    final List<Map<String, Object>> result = new ArrayList<>(followerInfos.size());
+    for (final RaftProtos.ServerRpcProto follower : followerInfos) {
+      final Map<String, Object> state = new LinkedHashMap<>();
+      state.put("peerId", follower.getId().getId().toStringUtf8());
+      state.put("lastRpcElapsedMs", follower.getLastRpcElapsedTimeMs());
+      result.add(state);
+    }
+    return result;
+  }
+
+  /** Returns true when both snapshots list the same follower peer ids in the same order. */
+  private static boolean samePeerOrder(final List<RaftProtos.ServerRpcProto> a, final List<RaftProtos.ServerRpcProto> b) {
+    if (a.size() != b.size())
+      return false;
+    for (int i = 0; i < a.size(); i++) {
+      if (!a.get(i).getId().getId().equals(b.get(i).getId().getId()))
+        return false;
+    }
+    return true;
   }
 
   /**
@@ -1559,12 +1872,56 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   }
 
   /**
+   * Decides whether the Raft storage directory must be preserved across server restarts instead of
+   * being wiped and re-FORMATted on every {@link #start()} (issue #4835).
+   * <p>
+   * {@link GlobalConfiguration#HA_RAFT_PERSIST_STORAGE} defaults to {@code false} (ephemeral) for
+   * testing convenience, but in Kubernetes the storage normally lives on a PersistentVolume that
+   * outlives the pod. Wiping it on every pod restart forces a full snapshot resync and, on a
+   * single-seed cluster, silently re-forms a fresh empty single-node cluster (data loss / split
+   * brain). So when running under Kubernetes ({@link GlobalConfiguration#HA_K8S}=true) and the
+   * operator has <em>not</em> explicitly opted into ephemeral storage, default to persisting.
+   * An explicit {@code raftPersistStorage=false} is still honored for the rare operator who really
+   * wants ephemeral storage in K8s.
+   */
+  static boolean resolvePersistStorage(final ContextConfiguration configuration) {
+    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_RAFT_PERSIST_STORAGE))
+      return true;
+
+    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S)
+        && !isExplicitlyConfigured(configuration, GlobalConfiguration.HA_RAFT_PERSIST_STORAGE)) {
+      LogManager.instance().log(RaftHAServer.class, Level.INFO,
+          "Kubernetes mode detected: preserving Raft storage across restarts (raftPersistStorage defaulted to true to "
+              + "avoid wiping PersistentVolume-backed storage on pod restart - issue #4835). Set raftPersistStorage=false "
+              + "explicitly to force ephemeral storage.");
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Returns {@code true} when the operator explicitly provided a value for the given configuration
+   * key, either through this {@link ContextConfiguration} (config file, programmatic set, or server
+   * settings) or via a JVM system property. Used by {@link #resolvePersistStorage} to distinguish a
+   * deliberate {@code raftPersistStorage=false} from the implicit default.
+   */
+  static boolean isExplicitlyConfigured(final ContextConfiguration configuration, final GlobalConfiguration key) {
+    return configuration.hasValue(key.getKey()) || System.getProperty(key.getKey()) != null;
+  }
+
+  /**
    * Starts a periodic task that updates the {@link ClusterMonitor} with the leader's commit index.
    * Called when this node becomes the Raft leader.
    */
   void startLagMonitor() {
     if (lagMonitorExecutor != null)
       return;
+    // Fresh leadership term: discard any per-replica lag state captured while this node led a previous
+    // term. Comparing the new term's (Ratis-reset) matchIndex against that stale baseline would
+    // mis-classify a healthy follower as STALLED on the first tick after the election (issue #4841).
+    // The executor==null guard above ensures this only fires on a genuine (re)acquisition, never on a
+    // same-term re-notification while the monitor is already running.
+    clusterMonitor.reset();
     lagMonitorExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
       final Thread t = new Thread(r, "arcadedb-raft-lag-monitor");
       t.setDaemon(true);

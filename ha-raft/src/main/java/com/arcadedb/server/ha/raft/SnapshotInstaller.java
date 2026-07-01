@@ -30,6 +30,7 @@ import com.arcadedb.utility.FileUtils;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FilterInputStream;
@@ -39,17 +40,25 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.KeyStore;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.logging.Level;
+import java.util.zip.CRC32;
+import java.util.zip.CheckedOutputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -71,6 +80,14 @@ import java.util.zip.ZipInputStream;
  * </ol>
  * On startup, {@link #recoverPendingSnapshotSwaps(Path)} detects incomplete swaps
  * via the {@code .snapshot-pending} marker and either completes or rolls back each one.
+ * <p>
+ * <b>Durability ordering (issue #4830).</b> Crash recovery is only sound if the on-disk state it reads
+ * back is actually durable, so each boundary is fsynced before the next step depends on it: extracted
+ * files are fsynced individually as they are written, the {@code .snapshot-pending}/{@code .snapshot-complete}
+ * markers are fsynced together with their parent directory, and the post-swap directory entries are fsynced
+ * before the retained backup is deleted. This guarantees the backup is never removed while the newly
+ * installed files are still only in the OS page cache, so a power loss can always fall back to a complete
+ * copy (either the old one via the backup, or the new one once the swap is durable).
  */
 public final class SnapshotInstaller {
 
@@ -122,6 +139,15 @@ public final class SnapshotInstaller {
    * the same JVM - which use distinct database directories - never raise a spurious overlap warning.
    */
   private static final Set<String> INSTALLS_IN_FLIGHT = ConcurrentHashMap.newKeySet();
+
+  /**
+   * Test-only barrier invoked once inside the registry-locked swap region of {@link #swapAndReopen}, after the
+   * live database has been closed/deregistered and before the staged snapshot is moved into place. {@code null}
+   * in production (the only cost is a single reference read per install). The issue-#4832 regression test sets it
+   * to pause inside the critical section and prove a concurrent {@link ArcadeDBServer#getDatabase} blocks on the
+   * registry lock instead of re-opening the database mid-swap.
+   */
+  static volatile Runnable swapBarrierForTesting = null;
 
   private SnapshotInstaller() {
   }
@@ -182,8 +208,10 @@ public final class SnapshotInstaller {
 
       Files.createDirectories(snapshotNew);
 
-      // Write the pending marker BEFORE starting extraction
-      Files.writeString(pendingMarker, "");
+      // Write the pending marker BEFORE starting extraction, and fsync it together with the parent
+      // directory so a crash right after this point still leaves the marker on disk for startup
+      // recovery to find (issue #4830).
+      writeMarkerDurable(pendingMarker);
 
       final int maxRetries = server.getConfiguration().getValueAsInteger(GlobalConfiguration.HA_SNAPSHOT_INSTALL_RETRIES);
       final long retryBaseMs = server.getConfiguration().getValueAsLong(GlobalConfiguration.HA_SNAPSHOT_INSTALL_RETRY_BASE_MS);
@@ -202,67 +230,100 @@ public final class SnapshotInstaller {
         throw e;
       }
 
-      // Mark download as complete
-      Files.writeString(snapshotNew.resolve(SNAPSHOT_COMPLETE_FILE), "");
+      // Mark download as complete. The extracted files were each fsynced as they were written
+      // (see extractAndVerifySnapshot), so fsyncing this marker and the staging directory now
+      // establishes the durability barrier: if this marker is on disk after a crash, every snapshot
+      // file it vouches for is on disk too, and the swap can be safely completed by startup recovery.
+      writeMarkerDurable(snapshotNew.resolve(SNAPSHOT_COMPLETE_FILE));
 
       // PHASE 2 - SWAP. Set the server-wide flag BEFORE closing the database so HTTP handlers return 503
       // while the files are being moved.
       server.setSnapshotInstallInProgress(true);
       try {
-        // Close + deregister the live database now that a complete snapshot is staged on disk. The DB
-        // must be closed before the file move so no open handles point at the directory being swapped.
-        // This deliberately closes the embedded instance directly (skipping the HA wrapper's replicated-
-        // close semantics): this is a local file swap, not a cluster-wide close. See closeLocalDatabaseIfOpen.
-        closeLocalDatabaseIfOpen(server, databaseName);
-
-        // Swap: live -> backup, new -> live. atomicSwap restores the original live files on a failure in
-        // either phase (see its contract), so on an IOException here dbPath holds the previous copy.
-        try {
-          atomicSwap(dbPath, snapshotNew, snapshotBackup);
-        } catch (final IOException swapEx) {
-          // Reopen the restored previous database so the node keeps serving. Leave the pending marker in
-          // place: if atomicSwap's own restore was interrupted, recoverPendingSnapshotSwaps reconciles
-          // dbPath (and removes the leftover .snapshot-new) on the next startup.
-          reopenQuietly(server, databaseName);
-          throw swapEx;
-        }
-
-        // Swap succeeded: live = new snapshot, .snapshot-backup = previous copy (retained until the new
-        // snapshot is confirmed to open). Cleanup then validate the install by reopening.
-        cleanupWalFiles(dbPath);
-        // Remove the completion marker from the now-live directory
-        Files.deleteIfExists(dbPath.resolve(SNAPSHOT_COMPLETE_FILE));
-
-        try {
-          // Re-open the database so the server registers it (also validates the snapshot is loadable)
-          server.getDatabase(databaseName);
-        } catch (final RuntimeException openEx) {
-          // The freshly installed snapshot will not open (corrupt/incompatible files). Roll back to the
-          // previous local copy and reopen it so the node is never left with a closed database.
-          // The pending marker is intentionally NOT cleared here: it is dropped only on the success path
-          // below. If rollbackToBackup succeeds, the next startup's recoverSingleDatabase sees both
-          // .snapshot-new and .snapshot-backup gone (!hasCompleteMarker && !hasBackup), logs "orphaned
-          // snapshot directory", and clears the marker - so leaving it is harmless and keeps recovery
-          // logic in one place. If the rollback was instead interrupted, that same startup pass restores
-          // the backup. Either way the marker is the single recovery hook.
-          LogManager.instance().log(SnapshotInstaller.class, Level.SEVERE,
-              "Installed snapshot for '%s' failed to open; rolling back to the previous local copy", openEx, databaseName);
-          rollbackToBackup(dbPath, snapshotBackup);
-          reopenQuietly(server, databaseName);
-          throw new IOException("Snapshot for '" + databaseName
-              + "' downloaded but failed to open; rolled back to the previous local copy", openEx);
-        }
-
-        // Success: drop the retained backup and clear the pending marker.
-        deleteDirectoryIfExists(snapshotBackup);
-        Files.deleteIfExists(pendingMarker);
-
-        HALog.log(SnapshotInstaller.class, HALog.BASIC, "Snapshot for '%s' installed successfully", databaseName);
+        swapAndReopen(databaseName, dbPath, snapshotNew, snapshotBackup, pendingMarker, server);
       } finally {
         server.setSnapshotInstallInProgress(false);
       }
     } finally {
       INSTALLS_IN_FLIGHT.remove(inFlightKey);
+    }
+  }
+
+  /**
+   * Closes the live database, atomically swaps the staged snapshot into place, and reopens it - the whole
+   * sequence held under the server's database-registry lock ({@link ArcadeDBServer#getDatabasesLock()}).
+   * <p>
+   * The {@link #atomicSwap} itself moves files entry-by-entry, so for a brief window the on-disk directory holds
+   * a mix of old-removed and new-installed files. The {@link ArcadeDBServer#setSnapshotInstallInProgress} flag
+   * deflects HTTP clients with a clean 503 during that window, but the engine-internal open paths
+   * (reconcile / apply / health-monitor threads calling {@link ArcadeDBServer#getDatabase}) do not consult that
+   * flag, and the close here deregisters the database, so a concurrent open could otherwise re-register it from
+   * the half-swapped directory. Holding the registry lock across close -&gt; swap -&gt; reopen makes the swap
+   * window invisible to <i>every</i> open path: a concurrent open blocks on the lock and, once it proceeds, sees
+   * the fully installed snapshot (or, on failure, the restored previous copy) - never an intermediate mix
+   * (issue #4832).
+   * <p>
+   * The database is closed via {@link #closeLocalDatabaseIfOpen} (which closes the embedded instance directly,
+   * skipping the HA wrapper's replicated-close semantics: this is a local file swap, not a cluster-wide close).
+   * On a swap or reopen failure the previous copy is restored and reopened so the node never stays closed; the
+   * caller's {@code .snapshot-pending} marker remains the single startup-recovery hook.
+   */
+  static void swapAndReopen(final String databaseName, final Path dbPath, final Path snapshotNew,
+      final Path snapshotBackup, final Path pendingMarker, final ArcadeDBServer server) throws IOException {
+    synchronized (server.getDatabasesLock()) {
+      // Close + deregister the live database now that a complete snapshot is staged on disk. The DB
+      // must be closed before the file move so no open handles point at the directory being swapped.
+      closeLocalDatabaseIfOpen(server, databaseName);
+
+      // Test seam: pause inside the critical section so a regression test can prove a concurrent open blocks
+      // on the registry lock rather than re-opening the half-swapped directory. No-op in production.
+      final Runnable barrier = swapBarrierForTesting;
+      if (barrier != null)
+        barrier.run();
+
+      // Swap: live -> backup, new -> live. atomicSwap restores the original live files on a failure in
+      // either phase (see its contract), so on an IOException here dbPath holds the previous copy.
+      try {
+        atomicSwap(dbPath, snapshotNew, snapshotBackup);
+      } catch (final IOException swapEx) {
+        // Reopen the restored previous database so the node keeps serving. Leave the pending marker in
+        // place: if atomicSwap's own restore was interrupted, recoverPendingSnapshotSwaps reconciles
+        // dbPath (and removes the leftover .snapshot-new) on the next startup.
+        reopenQuietly(server, databaseName);
+        throw swapEx;
+      }
+
+      // Swap succeeded: live = new snapshot, .snapshot-backup = previous copy (retained until the new
+      // snapshot is confirmed to open). Cleanup then validate the install by reopening.
+      cleanupWalFiles(dbPath);
+      // Remove the completion marker from the now-live directory
+      Files.deleteIfExists(dbPath.resolve(SNAPSHOT_COMPLETE_FILE));
+
+      try {
+        // Re-open the database so the server registers it (also validates the snapshot is loadable)
+        server.getDatabase(databaseName);
+      } catch (final RuntimeException openEx) {
+        // The freshly installed snapshot will not open (corrupt/incompatible files). Roll back to the
+        // previous local copy and reopen it so the node is never left with a closed database.
+        // The pending marker is intentionally NOT cleared here: it is dropped only on the success path
+        // below. If rollbackToBackup succeeds, the next startup's recoverSingleDatabase sees both
+        // .snapshot-new and .snapshot-backup gone (!hasCompleteMarker && !hasBackup), logs "orphaned
+        // snapshot directory", and clears the marker - so leaving it is harmless and keeps recovery
+        // logic in one place. If the rollback was instead interrupted, that same startup pass restores
+        // the backup. Either way the marker is the single recovery hook.
+        LogManager.instance().log(SnapshotInstaller.class, Level.SEVERE,
+            "Installed snapshot for '%s' failed to open; rolling back to the previous local copy", openEx, databaseName);
+        rollbackToBackup(dbPath, snapshotBackup);
+        reopenQuietly(server, databaseName);
+        throw new IOException("Snapshot for '" + databaseName
+            + "' downloaded but failed to open; rolled back to the previous local copy", openEx);
+      }
+
+      // Success: drop the retained backup and clear the pending marker.
+      deleteDirectoryIfExists(snapshotBackup);
+      Files.deleteIfExists(pendingMarker);
+
+      HALog.log(SnapshotInstaller.class, HALog.BASIC, "Snapshot for '%s' installed successfully", databaseName);
     }
   }
 
@@ -402,6 +463,9 @@ public final class SnapshotInstaller {
     } catch (final AtomicMoveNotSupportedException e) {
       Files.move(staging, dbPath);
     }
+    // Persist the new directory entry in the parent so a crash right after publish cannot lose the
+    // freshly-acquired database (issue #4830). The staged files were already fsynced at extraction.
+    fsyncDirectory(dbPath.getParent());
   }
 
   /**
@@ -747,50 +811,159 @@ public final class SnapshotInstaller {
       if (responseCode != 200)
         throw new IOException("Failed to download snapshot: HTTP " + responseCode);
 
+      // A leader on issue #4831 or later advertises a completeness manifest via this header; when present
+      // the manifest becomes mandatory, so a truncated download (manifest dropped) fails loudly. A leader
+      // predating #4831 omits the header, and the follower keeps the legacy "ZipInputStream reached EOF"
+      // acceptance for backward compatibility during a rolling upgrade.
+      final boolean manifestRequired = "1".equals(connection.getHeaderField(SnapshotManager.MANIFEST_HEADER));
+
       final CountingInputStream rawCounter = new CountingInputStream(connection.getInputStream());
-      try (final ZipInputStream zipIn = new ZipInputStream(rawCounter)) {
-        ZipEntry zipEntry;
-        while ((zipEntry = zipIn.getNextEntry()) != null) {
-          final Path targetFile = targetDir.resolve(zipEntry.getName()).normalize();
-
-          // Zip-slip protection: normalized path must remain inside targetDir
-          if (!targetFile.startsWith(targetDir))
-            throw new ReplicationException("Zip slip detected in snapshot: " + zipEntry.getName());
-
-          // Reject suspicious path components before touching the filesystem
-          if (zipEntry.getName().contains(".."))
-            throw new ReplicationException("Suspicious path in snapshot ZIP: " + zipEntry.getName());
-
-          // Create parent directories and perform real-path symlink-escape check
-          Files.createDirectories(targetFile.getParent());
-          final Path realParent = targetFile.getParent().toRealPath();
-          if (!realParent.startsWith(targetDir.toRealPath()))
-            throw new ReplicationException(
-                "Symlink escape detected in snapshot: entry '" + zipEntry.getName() + "' resolves outside target directory");
-
-          // Reject symlinks at the target file path
-          if (Files.isSymbolicLink(targetFile))
-            throw new ReplicationException("Symlink detected at extraction target: " + targetFile);
-
-          final long compressedStart = rawCounter.getCount();
-          try (final FileOutputStream fos = new FileOutputStream(targetFile.toFile())) {
-            final long uncompressedBytes = copyWithLimit(zipIn, fos, MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES, zipEntry.getName());
-
-            // Decompression-bomb defense: check ratio for entries large enough to matter.
-            // Uses raw counter delta (compressed bytes including headers) which slightly
-            // over-estimates compressed size, under-estimating ratio - safe direction.
-            final long compressedBytes = Math.max(1L, rawCounter.getCount() - compressedStart);
-            if (uncompressedBytes > MIN_RATIO_CHECK_BYTES
-                && uncompressedBytes / compressedBytes > MAX_COMPRESSION_RATIO)
-              throw new ReplicationException("Suspicious compression ratio for snapshot entry '"
-                  + zipEntry.getName() + "': inflated " + uncompressedBytes + " bytes from "
-                  + compressedBytes + " (ratio > " + MAX_COMPRESSION_RATIO + ":1)");
-          }
-          zipIn.closeEntry();
-        }
+      InputStream source = rawCounter;
+      final boolean progressLogging = server == null
+          || server.getConfiguration().getValueAsBoolean(GlobalConfiguration.HA_RESYNC_PROGRESS_LOGGING);
+      if (progressLogging) {
+        final String dbName = targetDir.getFileName() != null ? targetDir.getFileName().toString() : "snapshot";
+        final long intervalMs = server != null
+            ? server.getConfiguration().getValueAsLong(GlobalConfiguration.HA_RESYNC_PROGRESS_INTERVAL)
+            : 5000L;
+        source = new ProgressReportingInputStream(rawCounter, new SnapshotDownloadProgressMeter(dbName, intervalMs));
       }
+      extractAndVerifySnapshot(source, rawCounter, targetDir, manifestRequired);
     } finally {
       connection.disconnect();
+    }
+  }
+
+  /**
+   * Maximum bytes the manifest entry is allowed to occupy uncompressed (8 MB). The manifest is a small JSON
+   * document (one record per database file), so this is a generous ceiling that still caps a hostile or
+   * corrupt stream claiming a huge manifest. Package-private for unit testing.
+   */
+  static final long MAX_MANIFEST_BYTES = 8L * 1024 * 1024;
+
+  /**
+   * Extracts every entry of the snapshot ZIP read from {@code source} into {@code targetDir} and, when a
+   * {@link SnapshotManager#MANIFEST_ENTRY_NAME manifest} is present (or {@code manifestRequired}), verifies
+   * the transfer is complete: every file the manifest lists must have been extracted with a matching size
+   * and CRC32 (issue #4831).
+   * <p>
+   * The manifest entry itself is read into memory and never written to disk. Because the leader writes it
+   * last, a download truncated at any ZIP-entry boundary loses it; with {@code manifestRequired} the install
+   * then fails (and the caller retries) instead of opening a structurally-incomplete database.
+   * <p>
+   * Package-private and decoupled from the HTTP connection so the verification can be unit-tested by feeding
+   * a {@link ByteArrayInputStream} of a hand-built (and deliberately truncated) ZIP.
+   *
+   * @param source           the snapshot byte stream (possibly wrapped for progress reporting)
+   * @param rawCounter       the underlying byte counter, used for the per-entry compression-ratio check
+   * @param targetDir        the staging directory the entries are extracted into
+   * @param manifestRequired when true, a missing manifest is treated as a truncated download and rejected
+   */
+  static void extractAndVerifySnapshot(final InputStream source, final CountingInputStream rawCounter,
+      final Path targetDir, final boolean manifestRequired) throws IOException {
+    // Records the size+CRC32 of each file actually extracted, used to verify against the manifest.
+    final Map<String, long[]> extracted = new HashMap<>();
+    byte[] manifestBytes = null;
+
+    try (final ZipInputStream zipIn = new ZipInputStream(source)) {
+      ZipEntry zipEntry;
+      while ((zipEntry = zipIn.getNextEntry()) != null) {
+        final String entryName = zipEntry.getName();
+
+        // The manifest is metadata, not a database file: read it into memory (capped) and never write it
+        // to the staging directory, so it is not carried into the live database by the swap.
+        if (SnapshotManager.MANIFEST_ENTRY_NAME.equals(entryName)) {
+          final ByteArrayOutputStream buf = new ByteArrayOutputStream();
+          copyWithLimit(zipIn, buf, MAX_MANIFEST_BYTES, entryName);
+          manifestBytes = buf.toByteArray();
+          zipIn.closeEntry();
+          continue;
+        }
+
+        final Path targetFile = targetDir.resolve(entryName).normalize();
+
+        // Zip-slip protection: normalized path must remain inside targetDir
+        if (!targetFile.startsWith(targetDir))
+          throw new ReplicationException("Zip slip detected in snapshot: " + entryName);
+
+        // Reject suspicious path components before touching the filesystem
+        if (entryName.contains(".."))
+          throw new ReplicationException("Suspicious path in snapshot ZIP: " + entryName);
+
+        // Create parent directories and perform real-path symlink-escape check
+        Files.createDirectories(targetFile.getParent());
+        final Path realParent = targetFile.getParent().toRealPath();
+        if (!realParent.startsWith(targetDir.toRealPath()))
+          throw new ReplicationException(
+              "Symlink escape detected in snapshot: entry '" + entryName + "' resolves outside target directory");
+
+        // Reject symlinks at the target file path
+        if (Files.isSymbolicLink(targetFile))
+          throw new ReplicationException("Symlink detected at extraction target: " + targetFile);
+
+        final long compressedStart = rawCounter.getCount();
+        final CRC32 crc = new CRC32();
+        try (final FileOutputStream fos = new FileOutputStream(targetFile.toFile());
+            final CheckedOutputStream cos = new CheckedOutputStream(fos, crc)) {
+          final long uncompressedBytes = copyWithLimit(zipIn, cos, MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES, entryName);
+
+          // Decompression-bomb defense: check ratio for entries large enough to matter.
+          // Uses raw counter delta (compressed bytes including headers) which slightly
+          // over-estimates compressed size, under-estimating ratio - safe direction.
+          final long compressedBytes = Math.max(1L, rawCounter.getCount() - compressedStart);
+          if (uncompressedBytes > MIN_RATIO_CHECK_BYTES
+              && uncompressedBytes / compressedBytes > MAX_COMPRESSION_RATIO)
+            throw new ReplicationException("Suspicious compression ratio for snapshot entry '"
+                + entryName + "': inflated " + uncompressedBytes + " bytes from "
+                + compressedBytes + " (ratio > " + MAX_COMPRESSION_RATIO + ":1)");
+
+          // Force this file's bytes to stable storage before it is later renamed into the live
+          // database. Without this the extracted data lingers in the OS page cache and a power loss
+          // after the swap (when the backup is already gone) would expose torn/partial files with no
+          // way to roll back (issue #4830).
+          cos.flush();
+          fos.getFD().sync();
+
+          extracted.put(entryName, new long[] { uncompressedBytes, crc.getValue() });
+        }
+        zipIn.closeEntry();
+      }
+    }
+
+    verifyManifest(manifestBytes, extracted, manifestRequired);
+  }
+
+  /**
+   * Validates the extracted snapshot against its manifest (issue #4831).
+   * <ul>
+   *   <li>manifest absent + not required: legacy leader, nothing to verify;</li>
+   *   <li>manifest absent + required: the leader advertised a manifest but it never arrived - the download
+   *       was truncated before the final entry, so reject;</li>
+   *   <li>manifest present: every listed file must have been extracted with a matching size and CRC32.</li>
+   * </ul>
+   */
+  private static void verifyManifest(final byte[] manifestBytes, final Map<String, long[]> extracted,
+      final boolean manifestRequired) throws IOException {
+    if (manifestBytes == null) {
+      if (manifestRequired)
+        throw new IOException("Snapshot transfer incomplete: the leader advertised a completeness manifest but it was "
+            + "not received - the download was truncated before completion (" + extracted.size() + " file(s) extracted)");
+      return;
+    }
+
+    final List<SnapshotManager.ManifestEntry> manifest = SnapshotManager.parseManifest(
+        new String(manifestBytes, StandardCharsets.UTF_8));
+    for (final SnapshotManager.ManifestEntry entry : manifest) {
+      final long[] got = extracted.get(entry.name());
+      if (got == null)
+        throw new IOException("Snapshot transfer incomplete: file '" + entry.name()
+            + "' is listed in the manifest but was not received (truncated download)");
+      if (got[0] != entry.size())
+        throw new IOException("Snapshot file '" + entry.name() + "' size mismatch: manifest declares "
+            + entry.size() + " bytes but " + got[0] + " were received (truncated or corrupt download)");
+      if (got[1] != entry.crc())
+        throw new IOException("Snapshot file '" + entry.name() + "' CRC32 mismatch: manifest declares "
+            + entry.crc() + " but received content hashes to " + got[1] + " (corrupt download)");
     }
   }
 
@@ -898,6 +1071,47 @@ public final class SnapshotInstaller {
   }
 
   /**
+   * Wraps the snapshot download stream to feed the cumulative byte count to a progress meter and log
+   * any due progress line. Reports compressed bytes read off the wire (the meter measures download, not
+   * decompression). No-op when the meter is null (resync logging disabled).
+   */
+  private static final class ProgressReportingInputStream extends FilterInputStream {
+    private final SnapshotDownloadProgressMeter meter;
+    private       long                          total;
+
+    ProgressReportingInputStream(final InputStream in, final SnapshotDownloadProgressMeter meter) {
+      super(in);
+      this.meter = meter;
+    }
+
+    private void reportProgress() {
+      final String line = meter.lineIfDue(total, System.currentTimeMillis());
+      if (line != null)
+        // Log at INFO (not HALog.BASIC, which HA_LOG_VERBOSE gates off by default) so snapshot
+        // download progress is visible alongside the rest of the resync narrative.
+        LogManager.instance().log(SnapshotInstaller.class, Level.INFO, line);
+    }
+
+    @Override
+    public int read() throws IOException {
+      final int b = super.read();
+      if (b != -1)
+        total++; // single-byte path: only count; the bulk path samples the clock and reports progress
+      return b;
+    }
+
+    @Override
+    public int read(final byte[] b, final int off, final int len) throws IOException {
+      final int n = super.read(b, off, len);
+      if (n > 0) {
+        total += n;
+        reportProgress();
+      }
+      return n;
+    }
+  }
+
+  /**
    * Swaps a new snapshot directory into the live database path:
    * <ol>
    *   <li>move live contents from {@code dbDir} to {@code backupDir} (skipping {@code .snapshot-*});</li>
@@ -942,6 +1156,11 @@ public final class SnapshotInstaller {
           Files.move(entry, dbDir.resolve(name), StandardCopyOption.REPLACE_EXISTING);
         }
       }
+
+      // Make the rename directory entries durable before the caller deletes the retained backup. The
+      // file data itself was already fsynced at extraction time; this fsync persists the directory
+      // entries that now point at it, so a crash after the backup is gone cannot lose the swap (#4830).
+      fsyncDirectory(dbDir);
     } catch (final IOException e) {
       // Log the root cause FIRST, before any restore step can throw and mask it.
       LogManager.instance().log(SnapshotInstaller.class, Level.SEVERE,
@@ -975,6 +1194,9 @@ public final class SnapshotInstaller {
         // reconstruct the exact original set without leaving stale files behind.
         Files.move(entry, dbDir.resolve(entry.getFileName().toString()), StandardCopyOption.REPLACE_EXISTING);
     }
+    // Persist the restored directory entries before the backup is deleted so a crash during rollback
+    // recovery cannot lose the originals we just moved back (issue #4830).
+    fsyncDirectory(dbDir);
     deleteDirectoryIfExists(backupDir);
   }
 
@@ -985,6 +1207,39 @@ public final class SnapshotInstaller {
         if (!walFile.delete())
           LogManager.instance().log(SnapshotInstaller.class, Level.WARNING,
               "Failed to delete stale WAL file: %s", null, walFile.getName());
+  }
+
+  /**
+   * Writes an empty marker file and forces both the file and its parent directory to stable storage.
+   * Used for the {@code .snapshot-pending} and {@code .snapshot-complete} markers so the crash-recovery
+   * state machine never reads back a marker whose creation was still buffered in the OS page cache
+   * (issue #4830).
+   */
+  private static void writeMarkerDurable(final Path marker) throws IOException {
+    Files.writeString(marker, "");
+    try (final FileChannel channel = FileChannel.open(marker, StandardOpenOption.WRITE)) {
+      channel.force(true);
+    }
+    fsyncDirectory(marker.getParent());
+  }
+
+  /**
+   * Best-effort fsync of a directory so that file creations, renames and deletions within it survive a
+   * power loss. Opening a directory as a {@link FileChannel} and forcing it is the POSIX way to persist
+   * directory entries, but it is not supported on every platform (notably Windows, where opening a
+   * directory throws). A failure here is therefore logged at FINE and ignored rather than aborting the
+   * install: the snapshot file data itself is always fsynced individually, so the worst case on such a
+   * platform is the pre-existing behaviour, not a regression. Package-private for unit testing.
+   */
+  static void fsyncDirectory(final Path dir) {
+    if (dir == null)
+      return;
+    try (final FileChannel channel = FileChannel.open(dir, StandardOpenOption.READ)) {
+      channel.force(true);
+    } catch (final IOException e) {
+      LogManager.instance().log(SnapshotInstaller.class, Level.FINE,
+          "Directory fsync not supported or failed for %s: %s", null, dir, e.getMessage());
+    }
   }
 
   private static void deleteDirectoryIfExists(final Path dir) throws IOException {

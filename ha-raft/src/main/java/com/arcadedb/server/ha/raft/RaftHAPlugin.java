@@ -25,6 +25,7 @@ import com.arcadedb.log.LogManager;
 import com.arcadedb.server.ArcadeDBServer;
 import com.arcadedb.server.HAServerPlugin;
 import com.arcadedb.server.ServerException;
+import com.arcadedb.server.monitor.HAReplicationStatsProvider;
 import com.arcadedb.server.http.HttpServer;
 
 import io.undertow.server.handlers.PathHandler;
@@ -47,7 +48,7 @@ import java.util.logging.Level;
  * Discovered via Java ServiceLoader when either {@code HA_ENABLED=true} or
  * {@code HA_SERVER_LIST} is non-blank (a configured server list implies HA intent).
  */
-public class RaftHAPlugin implements HAServerPlugin {
+public class RaftHAPlugin implements HAServerPlugin, HAReplicationStatsProvider {
 
   private ArcadeDBServer       server;
   private ContextConfiguration configuration;
@@ -79,7 +80,9 @@ public class RaftHAPlugin implements HAServerPlugin {
 
     try {
       raftHAServer = new RaftHAServer(server, configuration);
-      raftHAServer.getStateMachine().setRaftHAServer(raftHAServer);
+      // The state machine is fully wired (server + raftHAServer) inside RaftHAServer itself, both at
+      // construction and on every HealthMonitor-driven Ratis restart, so no external wiring is needed
+      // here (issue #4839).
       raftHAServer.start();
 
       // Register the database wrapper so the server wraps databases with RaftReplicatedDatabase.
@@ -106,15 +109,10 @@ public class RaftHAPlugin implements HAServerPlugin {
   @Override
   public void stopService() {
     if (raftHAServer != null) {
-      // K8s auto-leave: gracefully remove self from cluster on shutdown
-      if (configuration != null && configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S)) {
-        try {
-          raftHAServer.leaveCluster();
-        } catch (final Exception e) {
-          LogManager.instance().log(this, Level.WARNING,
-              "K8s auto-leave failed (best-effort): %s", e.getMessage());
-        }
-      }
+      // K8s auto-leave is owned exclusively by RaftHAServer.stop() (see its HA_K8S branch), which is
+      // also reached via disconnectCluster(). Issuing leaveCluster() here as well removed self from the
+      // group and then stop() tried to remove an already-absent peer, doing redundant
+      // leader-transfer/reconfig work and logging a spurious WARNING on every pod shutdown (issue #4837).
       raftHAServer.stop();
       raftHAServer = null;
     }
@@ -197,6 +195,18 @@ public class RaftHAPlugin implements HAServerPlugin {
   @Override
   public boolean isLeader() {
     return raftHAServer != null && raftHAServer.isLeader();
+  }
+
+  @Override
+  public HAReplicationStats getHAReplicationStats() {
+    final RaftHAServer s = raftHAServer;
+    return s != null ? s.getReplicationStats() : new HAReplicationStats(false, -1, -1, 0);
+  }
+
+  @Override
+  public java.util.List<FollowerSample> getFollowerSamples() {
+    final RaftHAServer s = raftHAServer;
+    return s != null ? s.getFollowerSamples() : java.util.List.of();
   }
 
   @Override
@@ -296,9 +306,14 @@ public class RaftHAPlugin implements HAServerPlugin {
 
   @Override
   public void removePeer(final String peerId) {
+    removePeer(peerId, false);
+  }
+
+  @Override
+  public void removePeer(final String peerId, final boolean force) {
     if (raftHAServer == null)
       throw new RuntimeException("Raft HA server not started");
-    raftHAServer.removePeer(peerId);
+    raftHAServer.removePeer(peerId, force);
   }
 
   @Override
@@ -317,9 +332,14 @@ public class RaftHAPlugin implements HAServerPlugin {
 
   @Override
   public void leaveCluster() {
+    leaveCluster(false);
+  }
+
+  @Override
+  public void leaveCluster(final boolean force) {
     if (raftHAServer == null)
       throw new RuntimeException("Raft HA server not started");
-    raftHAServer.leaveCluster();
+    raftHAServer.leaveCluster(force);
   }
 
   private boolean isRaftEnabled() {

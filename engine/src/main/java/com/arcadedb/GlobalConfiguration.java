@@ -324,6 +324,15 @@ public enum GlobalConfiguration {
   ASYNC_BACK_PRESSURE("arcadedb.asyncBackPressure", SCOPE.DATABASE,
       "When the asynchronous queue is full at a certain percentage, back pressure is applied", Integer.class, 0),
 
+  TRUNCATE_BATCH_SIZE("arcadedb.truncateBatchSize", SCOPE.DATABASE,
+      """
+      Number of records TRUNCATE TYPE/BUCKET deletes per committed transaction. Each batch is committed as one \
+      transaction, which in HA becomes one Raft log entry: keeping the batch small keeps that entry small so the \
+      leader's per-follower append pipeline returns to sending heartbeats between batches instead of stalling on a \
+      single multi-MB entry (issue #4817, which caused leader churn, an interrupted commit and a partial truncate). \
+      Larger values reduce commit overhead on single-node setups at the cost of bigger transactions.""",
+      Integer.class, 1000),
+
   PAGE_FLUSH_QUEUE("arcadedb.pageFlushQueue", SCOPE.DATABASE, "Size of the asynchronous page flush queue", Integer.class, 512),
 
   FLUSH_SUSPEND_MAX_DEFERRED_RAM("arcadedb.flushSuspendMaxDeferredRAM", SCOPE.DATABASE,
@@ -649,6 +658,34 @@ public enum GlobalConfiguration {
       "Maximum size in bytes for HTTP request body content. Set to -1 for unlimited size (WARNING: removes DoS protection). Default is 100MB",
       Long.class, 100L * 1024 * 1024), // 100MB DEFAULT
 
+  // SERVER gRPC
+  SERVER_GRPC_QUERY_MAX_RESULT_ROWS("arcadedb.server.grpcQueryMaxResultRows", SCOPE.SERVER,
+      """
+      Hard ceiling on the number of rows the gRPC unary ExecuteQuery materializes. A request limit at or below \
+      this cap is honored; a result that would exceed it fails the call with RESOURCE_EXHAUSTED (consistent with \
+      the StreamQuery MATERIALIZE_ALL path) rather than silently truncating, and a client cannot bypass it with a \
+      larger limit. Bounds heap usage and protects against limitless-query DoS. The default is lower than \
+      grpcStreamMaxMaterializedRows because the unary response is built and returned as a single gRPC message \
+      (also bounded by the max inbound/outbound message size), whereas StreamQuery emits incrementally. \
+      Set to -1 or 0 for unlimited (WARNING: removes DoS protection). Default is 100000.""",
+      Integer.class, 100_000),
+
+  SERVER_GRPC_STREAM_MAX_MATERIALIZED_ROWS("arcadedb.server.grpcStreamMaxMaterializedRows", SCOPE.SERVER,
+      """
+      Maximum number of rows the gRPC StreamQuery MATERIALIZE_ALL retrieval mode buffers in memory before \
+      emitting. Exceeding the cap fails the call with RESOURCE_EXHAUSTED so clients fall back to CURSOR/PAGED \
+      streaming instead of running the server out of memory. Set to -1 or 0 for unlimited (WARNING: removes DoS \
+      protection). Default is 1000000.""",
+      Integer.class, 1_000_000),
+
+  SERVER_GRPC_STREAM_WRITE_TIMEOUT_MS("arcadedb.server.grpcStreamWriteTimeoutMs", SCOPE.SERVER,
+      """
+      Maximum time in milliseconds a gRPC StreamQuery worker waits for the client transport to become ready to \
+      accept the next batch before aborting the stream. Prevents a slow or abandoned client from pinning the \
+      worker thread (and the open ResultSet/transaction) indefinitely. Set to -1 to wait forever (WARNING: \
+      removes DoS protection). Default is 60000 (60s).""",
+      Long.class, 60_000L),
+
   // SERVER WS
   SERVER_WS_EVENT_BUS_QUEUE_SIZE("arcadedb.server.eventBusQueueSize", SCOPE.SERVER,
       "Size of the queue used as a buffer for unserviced database change events.", Integer.class, 1000),
@@ -831,6 +868,19 @@ public enum GlobalConfiguration {
       "Timeout in ms waiting for space in the group-commit queue before throwing ReplicationQueueFullException.",
       Integer.class, 100),
 
+  HA_GROUP_COMMIT_MAX_QUEUED_BYTES("arcadedb.ha.groupCommitMaxQueuedBytes", SCOPE.SERVER,
+      """
+      Maximum total bytes of pending (not-yet-dispatched) transactions allowed in the Raft group-commit \
+      queue. This is a memory backpressure bound that complements the entry-count bound \
+      (arcadedb.ha.groupCommitQueueSize): because a single transaction can be up to \
+      arcadedb.ha.grpcMessageSizeMax (128MB by default), a count-only bound would let a flood of large \
+      transactions exhaust the heap before backpressure engages. When adding a transaction would exceed \
+      this byte budget, the server waits up to arcadedb.ha.groupCommitOfferTimeout and then throws \
+      ReplicationQueueFullException (a retryable NeedRetryException) so heavy ingest backpressures \
+      instead of running the leader out of memory. Must be at least arcadedb.ha.grpcMessageSizeMax so a \
+      single maximum-size transaction can always be enqueued. Default 256MB.""",
+      Long.class, 256L * 1024 * 1024),
+
   HA_CLUSTER_TOKEN("arcadedb.ha.clusterToken", SCOPE.SERVER,
       """
       Shared secret for inter-node request forwarding authentication. \
@@ -848,6 +898,27 @@ public enum GlobalConfiguration {
   HA_HEALTH_CHECK_INTERVAL("arcadedb.ha.healthCheckInterval", SCOPE.SERVER,
       "Interval in milliseconds for the Raft health monitor to check for CLOSED/EXCEPTION state and auto-recover. 0 disables.",
       Long.class, 3000L),
+
+  HA_RESYNC_PROGRESS_LOGGING("arcadedb.ha.resyncProgressLogging", SCOPE.SERVER,
+      """
+      When true (default), the leader emits a concise per-follower unreachable/reconnected narrative and a \
+      restarting follower logs its resync progress (Raft log catch-up and full snapshot download). Set to false \
+      to disable that narrative. Note: this flag does NOT control the raw Apache Ratis retry flood - that is \
+      suppressed unconditionally by the org.apache.ratis.grpc.server.GrpcLogAppender level in \
+      arcadedb-log.properties, which is the switch to change to see those raw lines again.""",
+      Boolean.class, true),
+
+  HA_RESYNC_PROGRESS_INTERVAL("arcadedb.ha.resyncProgressInterval", SCOPE.SERVER,
+      "Minimum interval in milliseconds between follower resync progress log lines (Raft log catch-up and snapshot download). Throttles progress output so a fast resync logs only start and finish.",
+      Long.class, 5000L),
+
+  HA_PEER_UNREACHABLE_THRESHOLD("arcadedb.ha.peerUnreachableThreshold", SCOPE.SERVER,
+      "Time in milliseconds since the last successful RPC to a follower before the leader reports it as unreachable in the resync narrative. Does not change Raft membership or quorum.",
+      Long.class, 10000L),
+
+  HA_RESYNC_CATCHUP_LAG_THRESHOLD("arcadedb.ha.resyncCatchupLagThreshold", SCOPE.SERVER,
+      "Minimum apply backlog (Raft log entries a follower has committed/received but not yet applied to its state machine) before the catch-up resync narrative is logged. This is a locally observable signal, not the distance from the leader's commit index. Keeps the small steady-state apply backlog under write load from being narrated; only a genuine post-restart burst crosses this threshold. The narrative finishes once the backlog drains to within a tenth of it.",
+      Long.class, 1000L),
 
   HA_GRPC_FLOW_CONTROL_WINDOW("arcadedb.ha.grpcFlowControlWindow", SCOPE.SERVER,
       "gRPC flow control window size in bytes for Ratis append-entries traffic. Larger values help catch-up replication after partitions.",
@@ -1062,12 +1133,14 @@ public enum GlobalConfiguration {
   HA_PEER_ALLOWLIST_STARTUP_GRACE_MS("arcadedb.ha.peerAllowlistStartupGraceMs", SCOPE.SERVER,
       """
       Startup grace window in milliseconds during which the gRPC peer allowlist filter fails OPEN (accepts and logs a \
-      warning) for an inbound address it cannot yet match, as long as it has never resolved every host in \
-      arcadedb.ha.serverList at least once. This prevents a self-inflicted partition on Kubernetes, where a peer's \
-      headless-service DNS record is only published once its pod is Ready, so a legitimately-restarting peer connects \
-      before its own name resolves. Measured from filter creation. Once all peer hosts have resolved at least once, or \
-      the window elapses, the filter enforces normally. Set to 0 to disable fail-open (strict from the first connection); \
-      the filter is not an mTLS substitute (see issue #3890), so a bounded fail-open window is the safer default.""",
+      warning) for an inbound address it cannot yet match, as long as a quorum (majority) of the hosts in \
+      arcadedb.ha.serverList has never resolved at least once. This prevents a self-inflicted partition on Kubernetes, \
+      where a peer's headless-service DNS record is only published once its pod is Ready, so a legitimately-restarting \
+      peer connects before its own name resolves. Measured from filter creation. Once a quorum of peer hosts has \
+      resolved at least once, or the window elapses, the filter enforces normally; the gate is a quorum rather than the \
+      full peer set so a single permanently-down peer does not hold the window open for its full duration (issue #4828). \
+      Set to 0 to disable fail-open (strict from the first connection); the filter is not an mTLS substitute (see issue \
+      #3890), so a bounded fail-open window is the safer default.""",
       Long.class, 60_000L),
 
   HA_PEER_ALLOWLIST_STICKY_TTL_MS("arcadedb.ha.peerAllowlistStickyTtlMs", SCOPE.SERVER,

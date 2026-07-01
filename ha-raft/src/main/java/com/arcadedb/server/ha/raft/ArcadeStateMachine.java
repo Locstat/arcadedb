@@ -45,6 +45,7 @@ import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.server.storage.RaftStorage;
+import org.apache.ratis.statemachine.SnapshotRetentionPolicy;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
@@ -114,6 +115,24 @@ public class ArcadeStateMachine extends BaseStateMachine {
   private final    SimpleStateMachineStorage storage          = new SimpleStateMachineStorage();
   private final    AtomicLong                lastAppliedIndex = new AtomicLong(-1);
   private final    AtomicLong                electionCount    = new AtomicLong(0);
+
+  // Persisted applied-index bookkeeping. One ArcadeStateMachine multiplexes every database onto a
+  // single Raft group, so a single global scalar cannot answer a per-database question: a co-located
+  // database advancing the shared log past another database's entry would make the global value
+  // overstate that other database's progress (issue #4824). We keep BOTH: a global Raft-log position
+  // (the highest applied index across all databases, used by reinitialize()'s snapshot-gap check,
+  // which compares against the inherently global Ratis snapshot index) AND a per-database map (used by
+  // the per-database bootstrap replay-skip). The values live in memory so the hot apply path never
+  // reads the file back; the file is parsed once lazily on first access and serialised on each write.
+  // globalAppliedIndex tracks the same value as lastAppliedIndex (the AtomicLong above) on the apply
+  // path. They are seeded independently (this one from the persisted file on load, lastAppliedIndex
+  // from the Ratis snapshot in reinitialize()) and can briefly differ after reinitialize() - e.g. when
+  // there is no snapshot lastAppliedIndex is -1 while globalAppliedIndex may hold the persisted value -
+  // but every applyTransaction advances both to the same index, reconverging them.
+  private final    Map<String, Long>         appliedIndexByDb     = new ConcurrentHashMap<>();
+  private volatile long                      globalAppliedIndex   = -1;
+  private volatile boolean                   appliedIndexLoaded   = false;
+  private final    Object                    appliedIndexFileLock = new Object();
   private volatile long                      lastElectionTime = 0;
   private final    long                      startTime        = System.currentTimeMillis();
   // Tracks the previous leader so leader-change logs can show "X -> Y" instead of just "Y".
@@ -122,6 +141,9 @@ public class ArcadeStateMachine extends BaseStateMachine {
   // Tracks the highest term observed so notifyTermIndexUpdated can log only the first time we
   // see each term (otherwise it fires on every config/metadata entry, which is noisy).
   private final    AtomicLong                highestTermSeen  = new AtomicLong(-1);
+  // Raft term seen at the last notifyLeaderChanged. Lets us tell a genuine re-election (term
+  // advanced) from a same-term re-notification, so we only warn about real leader churn (#4809 follow-up).
+  private volatile long                      lastNotifiedLeaderTerm = -1;
 
   private volatile ArcadeDBServer server;
   private volatile RaftHAServer   raftHAServer;
@@ -158,13 +180,21 @@ public class ArcadeStateMachine extends BaseStateMachine {
   private final AtomicBoolean needsSnapshotDownload      = new AtomicBoolean(false);
   private final AtomicBoolean snapshotDownloadInProgress = new AtomicBoolean(false);
   private final AtomicBoolean catchingUp                 = new AtomicBoolean(false);
-  // Set to true after applyTransaction catches an unexpected Throwable (OOM, NPE, etc.). The
-  // state machine's in-memory schema/page state can be inconsistent at that point (issue #4219:
-  // mid-load OOM leaves bucketMap cleared but not repopulated), so any subsequent apply
-  // attempt would surface as a cascade of "Bucket with id X was not found" errors before the
-  // async server.stop() completes. Once tripped, applyTransaction fails fast without touching
-  // database state and the recovery path is the asynchronous server shutdown plus a snapshot
-  // resync on the next start.
+  // Set to true after applyTransaction hits a genuinely unrecoverable, node-wide condition: a JVM
+  // Error (OOM, StackOverflow - the JVM itself is unstable), an unknown committed entry type (#4798,
+  // rolling-upgrade safety), or an unexpected error on an entry with no single target database
+  // (e.g. SECURITY_USERS_ENTRY). In those cases the state machine's in-memory schema/page state can
+  // be inconsistent (issue #4219: mid-load OOM leaves bucketMap cleared but not repopulated), so any
+  // subsequent apply would cascade into "Bucket with id X was not found" errors before the async
+  // server.stop() completes. Once tripped, applyTransaction fails fast without touching database
+  // state and the recovery path is the asynchronous server shutdown plus a snapshot resync on the
+  // next start.
+  //
+  // NOTE (issue #4797): an unexpected error applying an entry for a SINGLE database no longer trips
+  // this node-wide flag. Because one ArcadeStateMachine multiplexes every database, halting the whole
+  // node for one database's bad entry froze replication for all co-located databases. Such failures
+  // are now quarantined per-database (see applyWithRetry): the affected database is marked diverged
+  // and resynced from the leader while the node stays up and healthy databases keep replicating.
   private final AtomicBoolean haltedAfterCriticalError = new AtomicBoolean(false);
 
   // Database names whose state has diverged from the committed Raft log (a WALVersionGapException
@@ -189,6 +219,20 @@ public class ArcadeStateMachine extends BaseStateMachine {
   private final        AtomicInteger divergedSwallowedErrors      = new AtomicInteger(0);
   private static final int           MAX_DIVERGED_SWALLOWED_ERRORS = 100;
 
+  // Locally-originated transactions whose leader-side phase 2 was abandoned because replication
+  // returned an INDETERMINATE result (the entry was dispatched to Ratis but submitAndWait timed out
+  // before quorum was confirmed - see ReplicationDispatchedTimeoutException). Keyed by
+  // "<databaseName>/<walTxId>" -> insertion time. If such an entry later reaches quorum and is
+  // applied here, applyTxEntry MUST apply it locally instead of origin-skipping it, otherwise the
+  // write lands on every follower but never on this leader: a silent, permanent divergence (issue
+  // #4790). Marking is always safe: it only changes behaviour IF the entry actually commits on this
+  // node's state machine (applying is then correct because the followers have it); if the entry
+  // never commits, the mark is inert and is pruned by TTL. Bounded by time-based pruning on insert.
+  private final        Map<String, Long> abandonedLocalTransactions    = new ConcurrentHashMap<>();
+  // Entries older than this are pruned on the next mark. Generous because a dispatched-but-stuck
+  // entry can take a long time to either commit or be overwritten by a new leader.
+  private static final long              ABANDONED_TX_TTL_MS           = 10 * 60 * 1000L;
+
 
   public void setServer(final ArcadeDBServer server) {
     this.server = server;
@@ -202,6 +246,11 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
   public void setRaftHAServer(final RaftHAServer raftHAServer) {
     this.raftHAServer = raftHAServer;
+  }
+
+  /** Owning Raft HA server. Package-private: used by the recovery-rewiring regression test (issue #4839). */
+  RaftHAServer getRaftHAServer() {
+    return raftHAServer;
   }
 
   /**
@@ -370,14 +419,19 @@ public class ArcadeStateMachine extends BaseStateMachine {
       final RaftLogEntryCodec.DecodedEntry decoded = RaftLogEntryCodec.decode(data);
 
       if (decoded.type() == null) {
-        LogManager.instance().log(this, Level.WARNING,
-            "Unknown Raft log entry type at index %d, skipping - likely from a newer node version", index);
-        lastAppliedIndex.set(index);
-        updateLastAppliedTermIndex(termIndex.getTerm(), index);
-        writePersistedAppliedIndex(index);
-        if (raftHAServer != null)
-          raftHAServer.notifyApplied();
-        return CompletableFuture.completedFuture(Message.valueOf("OK"));
+        // A committed entry whose leading type byte is unrecognised (e.g. written by a newer node
+        // during a rolling upgrade) is NOT safe to skip. Advancing lastAppliedIndex past it would
+        // permanently discard a committed mutation on this node, and because the index still moved
+        // forward no lag/gap recovery would ever notice - a silent divergence (issue #4798). Halt
+        // loudly instead: leave lastAppliedIndex untouched so the entry is replayed once this node
+        // is upgraded to a version that understands the type, and surface the problem to operators.
+        LogManager.instance().log(this, Level.SEVERE,
+            "CRITICAL: Unknown Raft log entry type at index %d (likely written by a newer node version). "
+                + "Refusing to skip a committed entry and halting to prevent silent state divergence; "
+                + "upgrade this node to a compatible version to resume.", index);
+        triggerCriticalHalt();
+        return CompletableFuture.failedFuture(new ReplicationException(
+            "Unknown Raft log entry type at index " + index + "; node halted to prevent silent divergence"));
       }
 
       final boolean originatedLocally = Boolean.TRUE.equals(trx.getStateMachineContext());
@@ -395,7 +449,16 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
       final long previousApplied = lastAppliedIndex.getAndSet(index);
       updateLastAppliedTermIndex(termIndex.getTerm(), index);
-      writePersistedAppliedIndex(index);
+      // Record the index globally AND against the database this entry targeted, so the per-database
+      // bootstrap replay-skip can trust a value that is not mixed across databases (issue #4824).
+      // decoded.databaseName() is null only for database-agnostic entries (e.g. SECURITY_USERS_ENTRY),
+      // which advance the global position only. A DROP entry removes the database, so the global
+      // position advances and its per-database entry is evicted in a single atomic write (avoids
+      // growing the map for the node lifetime with names of dropped databases).
+      if (decoded.type() == RaftLogEntryType.DROP_DATABASE_ENTRY)
+        writePersistedAppliedIndexDroppingDatabase(index, decoded.databaseName());
+      else
+        writePersistedAppliedIndex(index, decoded.databaseName());
 
       // Wake up any threads waiting for this index (READ_YOUR_WRITES, waitForLocalApply)
       final RaftHAServer raftHA = this.raftHAServer;
@@ -432,21 +495,34 @@ public class ArcadeStateMachine extends BaseStateMachine {
           """
           CRITICAL: Unexpected error applying Raft log entry at index %d. \
           Shutting down to prevent state divergence.""", e, index);
-      // Trip the halt flag BEFORE starting the async server.stop() so the StateMachineUpdater's
-      // next applyTransaction call short-circuits instead of cascading on inconsistent state.
-      haltedAfterCriticalError.set(true);
-      final Thread stopThread = new Thread(() -> {
-        try {
-          if (server != null)
-            server.stop();
-        } catch (final Throwable t) {
-          LogManager.instance().log(this, Level.SEVERE, "Emergency stop failed", t);
-        }
-      }, "arcadedb-emergency-stop");
-      stopThread.setDaemon(true);
-      stopThread.start();
+      triggerCriticalHalt();
       return CompletableFuture.failedFuture(e instanceof Exception ex ? ex : new RuntimeException(e));
     }
+  }
+
+  /**
+   * Trips the critical-error halt and asynchronously stops the server so the node recovers via a
+   * snapshot/log replay on the next start. Used by {@link #applyTransaction} for both unexpected
+   * apply errors and unknown (un-decodable) committed entry types (issue #4798).
+   * <p>
+   * The halt flag is set BEFORE the async {@code server.stop()} starts so the StateMachineUpdater's
+   * next {@code applyTransaction} call short-circuits instead of cascading on inconsistent state.
+   * Callers must NOT advance or persist {@link #lastAppliedIndex} before invoking this: leaving the
+   * index untouched is what lets the offending entry be replayed (instead of silently skipped) once
+   * the node restarts on a compatible version.
+   */
+  private void triggerCriticalHalt() {
+    haltedAfterCriticalError.set(true);
+    final Thread stopThread = new Thread(() -> {
+      try {
+        if (server != null)
+          server.stop();
+      } catch (final Throwable t) {
+        LogManager.instance().log(this, Level.SEVERE, "Emergency stop failed", t);
+      }
+    }, "arcadedb-emergency-stop");
+    stopThread.setDaemon(true);
+    stopThread.start();
   }
 
   /**
@@ -528,27 +604,48 @@ public class ArcadeStateMachine extends BaseStateMachine {
         // recoverable resync condition - leaving them uncaught lets them propagate unchanged to
         // applyTransaction's fatal halt path so the node stops loudly rather than masking a corrupt
         // runtime.
-        // When this database has already diverged (WAL gap detected earlier), an unexpected error
-        // most likely stems from the engine operating on the inconsistent in-memory state left by
-        // the gap - e.g. NPE on a page that wasn't refreshed, ClassCastException on a stale object.
-        // Treat it as a recoverable resync condition (issue #4740) instead of propagating to
-        // applyTransaction's fatal catch (Throwable) path that would halt the server. The ongoing
-        // snapshot download will restore consistent state once a stable leader is available.
-        if (databaseName != null && divergedDatabases.contains(databaseName)) {
+        //
+        // Per-database quarantine (issue #4797): a single ArcadeStateMachine multiplexes every
+        // database on the node, so tripping the node-wide critical halt for one entry would freeze
+        // the apply pipeline for ALL co-located databases. When the failing entry targets a single
+        // database (databaseName non-null and non-empty) the failure is isolable: quarantine that
+        // database (mark it diverged and trigger a targeted snapshot resync) and report the error as
+        // a recoverable ReplicationException instead of the fatal catch (Throwable) path that would
+        // halt the server. The node stays up, healthy databases keep replicating, and only the
+        // affected database is reinstalled from the leader. This subsumes the earlier issue #4740
+        // behaviour (an unexpected error on an already-diverged database is a resync condition): the
+        // only change is that the FIRST unexpected error on a healthy database now quarantines it
+        // rather than halting the node.
+        //
+        // Entries with no single target database (databaseName null or empty, e.g. a
+        // SECURITY_USERS_ENTRY) are NOT isolable to one database's state, so their failure still
+        // propagates to the node-wide fatal halt.
+        if (databaseName != null && !databaseName.isEmpty()) {
+          // Mark the database diverged on the first error so subsequent errors for it route here too.
+          // add() returns true only the first time, which is when we kick off the targeted resync.
+          if (divergedDatabases.add(databaseName)) {
+            LogManager.instance().log(this, Level.SEVERE,
+                "Unexpected error applying Raft entry for database '%s' at index %d; quarantining the database and "
+                    + "triggering a targeted snapshot resync instead of halting the node (issue #4797): %s",
+                databaseName, index, t.getMessage());
+            triggerDatabaseResync(databaseName);
+          } else {
+            LogManager.instance().log(this, Level.SEVERE,
+                "Unexpected error at index %d while database '%s' is quarantined (snapshot resync in progress); "
+                    + "treating as resync condition: %s",
+                index, databaseName, t.getMessage());
+          }
           // Bounded escalation: a node that can never resync (no stable leader) must not swallow
           // errors forever and degrade silently. Once the swallow count exceeds the threshold, let
           // the error propagate to the fatal halt path so a truly stuck node surfaces loudly.
           if (divergedSwallowedErrors.incrementAndGet() > MAX_DIVERGED_SWALLOWED_ERRORS) {
             LogManager.instance().log(this, Level.SEVERE,
-                "Diverged database '%s' swallowed over %d unexpected errors without resyncing (index %d); escalating to fatal halt: %s",
+                "Quarantined database '%s' swallowed over %d unexpected errors without resyncing (index %d); escalating to fatal halt: %s",
                 databaseName, MAX_DIVERGED_SWALLOWED_ERRORS, index, t.getMessage());
             throw t;
           }
-          LogManager.instance().log(this, Level.SEVERE,
-              "Unexpected error at index %d while database '%s' is diverged (WAL gap detected earlier); treating as resync condition: %s",
-              index, databaseName, t.getMessage());
           throw new ReplicationException(
-              "Apply error on diverged state at index " + index + "; snapshot resync in progress", t);
+              "Apply error on database '" + databaseName + "' at index " + index + "; per-database snapshot resync in progress", t);
         }
         throw t;
       }
@@ -568,14 +665,88 @@ public class ArcadeStateMachine extends BaseStateMachine {
    * transaction is already durably flushed by the {@link com.arcadedb.engine.TransactionManager}.
    * Returning the last-applied index here tells Ratis it may purge log entries up to that index,
    * reducing log disk usage over time.
+   * <p>
+   * <b>Why a marker file is written (issue #4829):</b> the returned index is the Ratis contract
+   * "state up to here is durable, you may purge the log up to it". Returning it without also writing
+   * a {@code snapshot.<term>_<index>} file would leave {@link SimpleStateMachineStorage#getLatestSnapshot()}
+   * (which discovers snapshots by scanning for those files) returning {@code null} forever. With
+   * auto-snapshot + {@code purgeUptoSnapshotIndex} enabled, Ratis would purge log entries up to the
+   * returned index even though no snapshot exists; after a restart {@link #reinitialize()} would seed
+   * {@code lastAppliedIndex = -1} and Ratis would try to replay from the start of a log whose early
+   * entries were already purged - permanently orphaning applied state. We therefore persist a real
+   * (empty) marker BEFORE returning the purge index, the same marker {@link #notifyInstallSnapshotFromLeader}
+   * writes on the follower install path. If the marker cannot be written we report
+   * {@link RaftLog#INVALID_LOG_INDEX} so Ratis does not purge a log with no backing snapshot.
    */
   @Override
   public long takeSnapshot() {
     final long currentIndex = lastAppliedIndex.get();
     if (currentIndex < 0)
       return RaftLog.INVALID_LOG_INDEX;
-    HALog.log(this, HALog.BASIC, "ArcadeStateMachine: snapshot checkpoint at index %d", currentIndex);
+
+    final TermIndex applied = getLastAppliedTermIndex();
+    final long term = applied != null && applied.getTerm() > 0 ? applied.getTerm() : 0L;
+    if (!registerSnapshotMarker(term, currentIndex)) {
+      LogManager.instance().log(this, Level.WARNING,
+          "Could not persist snapshot marker at index %d; not authorising log purge", currentIndex);
+      return RaftLog.INVALID_LOG_INDEX;
+    }
+    HALog.log(this, HALog.BASIC, "ArcadeStateMachine: snapshot checkpoint at index %d (term %d)", currentIndex, term);
     return currentIndex;
+  }
+
+  /**
+   * Writes an empty Ratis snapshot marker file at {@code (term, index)} and registers it as the
+   * latest snapshot in {@link #storage}, so {@link SimpleStateMachineStorage#getLatestSnapshot()}
+   * can rediscover it after a restart (it scans for {@code snapshot.<term>_<index>} files).
+   * <p>
+   * ArcadeDB's real snapshot is the set of database files on disk - every committed transaction is
+   * already durably flushed by the {@link com.arcadedb.engine.TransactionManager} - so the marker is
+   * a zero-byte placeholder whose name carries the {@code (term, index)} that Ratis's snapshot-index
+   * bookkeeping and log-purge contract point at. No {@code .md5} companion is written, so the
+   * rediscovered {@link SingleFileSnapshotInfo} carries a null digest, the same as a fresh boot;
+   * ArcadeDB never exercises Ratis's chunk-verification path (it resyncs over HTTP via
+   * {@link DatabaseReconciler}), so the empty file is safe across restarts.
+   * <p>
+   * Used by both {@link #takeSnapshot()} (leader-side periodic compaction checkpoint) and
+   * {@link #notifyInstallSnapshotFromLeader} (follower-side install). Only the most recent marker is
+   * retained; older zero-byte markers are pruned best-effort.
+   *
+   * @return {@code true} if the marker was written and registered, {@code false} on I/O failure
+   */
+  private boolean registerSnapshotMarker(final long term, final long index) {
+    try {
+      final File snapshotFile = storage.getSnapshotFile(term, index);
+      final File parentDir = snapshotFile.getParentFile();
+      if (parentDir != null && !parentDir.exists() && !parentDir.mkdirs()) {
+        LogManager.instance().log(this, Level.WARNING,
+            "Could not create snapshot storage directory %s; snapshot registration failed", parentDir);
+        return false;
+      }
+      if (!snapshotFile.exists())
+        snapshotFile.createNewFile();
+      storage.updateLatestSnapshot(new SingleFileSnapshotInfo(
+          new FileInfo(snapshotFile.toPath(), null), term, index));
+      // Keep only the latest marker; older zero-byte markers are obsolete once a newer one exists.
+      // SnapshotRetentionPolicy declares getNumSnapshotsRetained() as a default method (not abstract),
+      // so it is not a functional interface and cannot be supplied as a lambda.
+      try {
+        storage.cleanupOldSnapshots(new SnapshotRetentionPolicy() {
+          @Override
+          public int getNumSnapshotsRetained() {
+            return 1;
+          }
+        });
+      } catch (final IOException cleanupEx) {
+        LogManager.instance().log(this, Level.FINE,
+            "Could not clean up old snapshot markers: %s", cleanupEx.getMessage());
+      }
+      return true;
+    } catch (final IOException e) {
+      LogManager.instance().log(this, Level.WARNING,
+          "Failed to write Raft snapshot marker at (term=%d, index=%d): %s", term, index, e.getMessage());
+      return false;
+    }
   }
 
   /**
@@ -599,25 +770,40 @@ public class ArcadeStateMachine extends BaseStateMachine {
     previousLeaderId = newLeaderId;
 
     final String leaderName = raftHAServer.getPeerDisplayName(newLeaderId);
-    final long currentTerm = getLastAppliedTermIndex() != null ? getLastAppliedTermIndex().getTerm() : -1;
+    // Use the actual Raft term (not the lagging last-applied term) so we can tell a genuine
+    // re-election (term advanced) from a same-term re-notification that Ratis sometimes fires.
+    final long currentTerm = raftHAServer.getCurrentTerm();
+    final long prevTerm = lastNotifiedLeaderTerm;
+    lastNotifiedLeaderTerm = currentTerm;
 
     if (prevId == null) {
       // First leader observed since startup - no churn signal yet.
       LogManager.instance().log(this, Level.INFO, "Leader elected: %s (term=%d)", leaderName, currentTerm);
     } else if (prevId.equals(newLeaderId)) {
-      // The same node is leader again. Almost always means a step-down/re-election cycle: the
-      // leader couldn't keep heartbeats flowing (busy appender threads under bulk-load, GC pause,
-      // disk stall) and another node started an election with a higher term. The original leader
-      // sees the higher term, steps down, then wins the next election because it has the most
-      // up-to-date log. If you see this repeatedly under load, raise arcadedb.ha.electionTimeoutMin
-      // and Max, or reduce per-batch size.
-      final long sinceLast = previousElectionTime > 0 ? now - previousElectionTime : -1;
-      LogManager.instance().log(this, Level.WARNING,
-          """
-          Leader churn: %s re-elected (term=%d, %d ms since last leader change). \
-          Likely cause: leader heartbeat blocked by bulk-load replication. \
-          Tune arcadedb.ha.electionTimeoutMin/Max higher or reduce batch size.""",
-          leaderName, currentTerm, sinceLast);
+      // The same node is leader again. Only a term advance means an actual step-down/re-election
+      // cycle; a same-term re-notification (currentTerm == prevTerm) is a Ratis bookkeeping callback,
+      // not churn, so do not alarm the operator about it.
+      if (currentTerm <= prevTerm && currentTerm >= 0) {
+        LogManager.instance().log(this, Level.FINE,
+            "Leader re-notified: %s (term=%d, no term change)", leaderName, currentTerm);
+      } else {
+        // A real re-election kept the same leader: the previous leader could not keep heartbeats
+        // flowing long enough, another node started an election with a higher term, and the original
+        // leader won the next round (it has the most up-to-date log). The cause is whatever stalled
+        // the leader's heartbeat: CPU/GC pause, disk stall, network blip, or appender threads busy
+        // under bulk-load replication. Confirm with the arcadedb.ha.follower.* heartbeat-lag metrics
+        // before tuning. Mitigations: raise arcadedb.ha.electionTimeoutMin/Max, reduce per-batch size,
+        // or give the node more CPU/IO headroom.
+        final long sinceLast = previousElectionTime > 0 ? now - previousElectionTime : -1;
+        LogManager.instance().log(this, Level.WARNING,
+            """
+            Leader churn: %s re-elected (term=%d, %d ms since last leader change). \
+            A heartbeat stall triggered an election; likely causes include CPU/GC pauses, disk stalls, \
+            network blips, or appender threads saturated by bulk-load replication. Check the \
+            arcadedb.ha.follower.* metrics, then raise arcadedb.ha.electionTimeoutMin/Max, reduce batch \
+            size, or add CPU/IO headroom.""",
+            leaderName, currentTerm, sinceLast);
+      }
     } else {
       // Different node became leader. Normal failover (network, server restart, etc.).
       final String prevName = raftHAServer.getPeerDisplayName(prevId);
@@ -688,7 +874,7 @@ public class ArcadeStateMachine extends BaseStateMachine {
       final RaftProtos.RoleInfoProto roleInfoProto, final TermIndex firstTermIndexInLog) {
 
     LogManager.instance().log(this, Level.INFO,
-        "Snapshot installation requested from leader (firstLogIndex=%s). Starting full resync...", firstTermIndexInLog);
+        "HA resync started (mode=snapshot, reason=leader snapshot install): firstLogIndex=%s", firstTermIndexInLog);
 
     // Runs on the JDK common ForkJoinPool via supplyAsync(). Apache-ratis uses a dedicated pool
     // to avoid blocking Ratis internal threads, so this offload IS necessary - we must not run
@@ -745,33 +931,22 @@ public class ArcadeStateMachine extends BaseStateMachine {
 
         // Register the snapshot in SimpleStateMachineStorage. StateMachineUpdater.reload() calls
         // getLatestSnapshot() immediately after reinitialize() and requires a non-null result.
-        // We write an empty marker file - ArcadeDB's real snapshot is the database files on disk,
-        // not a Ratis-managed chunk file. The null FileDigest passed to FileInfo is intentional and
-        // safe: this path (file-less, notification-based snapshot install) does not use the Ratis
-        // chunk-based verification flow that would check the digest.
-        final File snapshotFile = storage.getSnapshotFile(snapshotTerm, snapshotIndex);
-        final File parentDir = snapshotFile.getParentFile();
-        if (parentDir != null && !parentDir.exists() && !parentDir.mkdirs())
-          LogManager.instance().log(this, Level.WARNING,
-              "Could not create snapshot storage directory %s; snapshot registration may fail", parentDir);
-        if (!snapshotFile.exists())
-          snapshotFile.createNewFile();
-        storage.updateLatestSnapshot(new SingleFileSnapshotInfo(
-            new FileInfo(snapshotFile.toPath(), null), snapshotTerm, snapshotIndex));
-        // The empty marker file will be re-discovered by SimpleStateMachineStorage.loadLatestSnapshot()
-        // on restart (it scans for files matching "snapshot.term_index"). No .md5 file is written
-        // alongside it, so MD5FileUtil.readStoredMd5ForFile() returns null and the SingleFileSnapshotInfo
-        // is constructed with a null digest - the same as when ArcadeDB boots fresh with no prior snapshot.
-        // ArcadeDB never validates snapshot file content via Ratis's chunk-verification path (it uses
-        // the HTTP-based DatabaseReconciler instead), so the empty file is safe across restarts.
+        // registerSnapshotMarker() writes the empty marker file and updates the latest-snapshot
+        // reference; see its javadoc for why a file-less, null-digest marker is safe for ArcadeDB.
+        if (!registerSnapshotMarker(snapshotTerm, snapshotIndex))
+          throw new IOException("Failed to register snapshot marker at index " + snapshotIndex);
 
         // Advance the local applied-index to the snapshot point so that the StateMachineUpdater
-        // knows which log entries have been consumed by this install.
+        // knows which log entries have been consumed by this install. A full state-machine install
+        // brings EVERY present database to the snapshot point, so record the snapshot index for each
+        // of them too (not just the global position) - this keeps the per-database bootstrap
+        // replay-skip honest after a full resync (issue #4824).
         lastAppliedIndex.set(snapshotIndex);
         updateLastAppliedTermIndex(snapshotTerm, snapshotIndex);
-        writePersistedAppliedIndex(snapshotIndex);
+        writePersistedAppliedIndexForAllDatabases(snapshotIndex);
 
-        LogManager.instance().log(this, Level.INFO, "Full resync from leader completed (snapshotIndex=%d)", snapshotIndex);
+        LogManager.instance().log(this, Level.INFO,
+            "HA resync finished (mode=snapshot, result=ok): snapshotIndex=%d", snapshotIndex);
         clearDivergedState();
         return installedTermIndex;
 
@@ -830,22 +1005,60 @@ public class ArcadeStateMachine extends BaseStateMachine {
    * durable page writes). Page-version guards in {@code applyChanges} detect and skip
    * already-applied pages; version-gap warnings are still logged.
    */
+  /**
+   * Marks a locally-originated transaction as abandoned by the leader's phase 2 because replication
+   * returned an indeterminate result ({@link ReplicationDispatchedTimeoutException}). If the entry
+   * later commits, {@link #applyTxEntry} applies it here instead of origin-skipping it (issue #4790).
+   * Called from {@link RaftReplicatedDatabase#commit()} on the dispatched-timeout path.
+   */
+  void markLocalTransactionAbandoned(final String databaseName, final long walTxId) {
+    final long now = System.currentTimeMillis();
+    // Prune stale marks (entries that were dispatched but never committed, e.g. the slot was
+    // overwritten by a new leader) so the map cannot grow unbounded.
+    if (!abandonedLocalTransactions.isEmpty())
+      abandonedLocalTransactions.values().removeIf(insertedAt -> now - insertedAt > ABANDONED_TX_TTL_MS);
+    abandonedLocalTransactions.put(abandonedKey(databaseName, walTxId), now);
+    HALog.log(this, HALog.BASIC,
+        "Marked locally-originated tx %d on database '%s' for local apply on commit (replication was indeterminate, #4790)",
+        walTxId, databaseName);
+  }
+
+  private static String abandonedKey(final String databaseName, final long walTxId) {
+    return databaseName + "/" + walTxId;
+  }
+
   private void applyTxEntry(final RaftLogEntryCodec.DecodedEntry decoded, final long entryIndex,
       final boolean originatedLocally) {
-    // If this entry was originated by this node in the current lifecycle, the transaction was
-    // already applied via commit2ndPhase() in RaftReplicatedDatabase. Skip to avoid double-apply.
-    // Using originatedLocally (set by startTransaction) instead of isLeader() avoids TOCTOU races
-    // when leadership changes between entry submission and state machine apply.
-    // After a crash and restart, originatedLocally is always false (startTransaction was not called
-    // in this lifecycle), so replayed entries are correctly re-applied with page-version guards
-    // providing idempotency.
-    if (originatedLocally) {
+    // Fast path (the leader's hot path): a locally-originated entry was already applied via
+    // commit2ndPhase() in RaftReplicatedDatabase, so skip to avoid double-apply. Using
+    // originatedLocally (set by startTransaction) instead of isLeader() avoids TOCTOU races when
+    // leadership changes between entry submission and state machine apply. After a crash and
+    // restart, originatedLocally is always false (startTransaction was not called in this lifecycle),
+    // so replayed entries are correctly re-applied with page-version guards providing idempotency.
+    // We short-circuit BEFORE deserializing the WAL when no abandoned transactions are pending (the
+    // common case), so the skip costs nothing extra on the hot path.
+    if (originatedLocally && abandonedLocalTransactions.isEmpty()) {
       HALog.log(this, HALog.TRACE, "Skipping tx apply on originator for database '%s'", decoded.databaseName());
       return;
     }
 
     final DatabaseInternal db = (DatabaseInternal) server.getDatabase(decoded.databaseName());
     final WALFile.WALTransaction walTx = deserializeWalTransaction(decoded.walData());
+
+    // EXCEPTION (issue #4790): commit() may have abandoned its phase 2 because replication returned
+    // an indeterminate result (entry dispatched to Ratis but the quorum wait timed out before quorum
+    // was confirmed). For such an entry phase 2 never ran, so it must be applied HERE instead of
+    // origin-skipped, otherwise this leader silently loses a write the followers already have. The
+    // mark is consumed (removed) so a later replay of the same entry correctly skips again.
+    if (originatedLocally) {
+      if (abandonedLocalTransactions.remove(abandonedKey(decoded.databaseName(), walTx.txId)) == null) {
+        HALog.log(this, HALog.TRACE, "Skipping tx apply on originator for database '%s'", decoded.databaseName());
+        return;
+      }
+      HALog.log(this, HALog.BASIC,
+          "Applying locally-originated tx %d on database '%s' whose phase 2 was abandoned (replication indeterminate, #4790)",
+          walTx.txId, decoded.databaseName());
+    }
 
     HALog.log(this, HALog.DETAILED, "Applying tx %d to database '%s' (pages=%d)",
         walTx.txId, decoded.databaseName(), walTx.pages.length);
@@ -1170,7 +1383,21 @@ public class ArcadeStateMachine extends BaseStateMachine {
     // the install path here would race leader-discovery (the StateMachineUpdater thread is
     // inside applyTransaction and blocks Ratis leader-info notifications), exhaust the snapshot
     // retry budget with null leader addresses, and trip the critical-error halt.
-    final long persistedApplied = readPersistedAppliedIndex();
+    // This is a PER-DATABASE decision, so it must consult THIS database's applied index, not the
+    // global one: one ArcadeStateMachine multiplexes every database, and a co-located database that
+    // advanced the global index past this entry must not suppress this database's verification
+    // (issue #4824). Absent positive per-database evidence the verification re-runs, which is
+    // idempotent (a fingerprint match returns immediately without moving any bytes).
+    //
+    // Upgrade note: a legacy plain-number applied-index file carries no per-database breakdown, so on
+    // the FIRST restart after upgrading, this read returns -1 for every database and verification
+    // re-runs for any bootstrap entry still above the latest Ratis snapshot. That is a bounded,
+    // one-time cost and is safe: a matching local fingerprint returns immediately; a locally-fresher
+    // copy (local lastTxId > baseline) hits the "refusing to overwrite local data" guard below (no
+    // data loss, just a SEVERE log line); a genuinely-behind copy re-installs from the leader, which
+    // is the correct action anyway. From the first post-upgrade apply onwards the per-database map is
+    // authoritative.
+    final long persistedApplied = readPersistedAppliedIndex(dbName);
     if (persistedApplied >= index) {
       HALog.log(this, HALog.BASIC,
           "Bootstrap baseline for '%s' already applied (persistedAppliedIndex=%d >= entryIndex=%d); skipping verification",
@@ -1414,26 +1641,161 @@ public class ArcadeStateMachine extends BaseStateMachine {
     HALog.log(this, HALog.DETAILED, "Applied SECURITY_USERS_ENTRY (%d bytes)", payload.length());
   }
 
-  private long readPersistedAppliedIndex() {
-    try {
-      final Path file = getAppliedIndexFile();
-      if (file != null && Files.exists(file))
-        return Long.parseLong(Files.readString(file).trim());
-    } catch (final Exception e) {
-      LogManager.instance().log(this, Level.FINE, "Could not read persisted applied index: %s", e.getMessage());
-    }
-    return -1;
+  /**
+   * Returns the GLOBAL persisted applied index: the highest Raft-log index applied across all
+   * databases multiplexed on this state machine, or {@code -1} if none was persisted. This is a
+   * Raft-log position, not a per-database guarantee; {@link #reinitialize()} compares it against the
+   * (inherently global) Ratis snapshot index. Package-private for tests.
+   */
+  long readPersistedAppliedIndex() {
+    ensureAppliedIndexLoaded();
+    return globalAppliedIndex;
   }
 
-  private void writePersistedAppliedIndex(final long index) {
+  /**
+   * Returns the persisted applied index for a single {@code dbName}, or {@code -1} when there is no
+   * per-database evidence that this database was advanced (issue #4824). A legacy plain-number file
+   * carries only the global value and therefore yields {@code -1} here: per-database decisions never
+   * fall back to the global value, so a co-located database can never falsely satisfy them.
+   * Package-private for tests.
+   */
+  long readPersistedAppliedIndex(final String dbName) {
+    if (dbName == null)
+      return -1;
+    ensureAppliedIndexLoaded();
+    final Long v = appliedIndexByDb.get(dbName);
+    return v != null ? v : -1;
+  }
+
+  /**
+   * Records {@code index} as the global applied position and, when {@code dbName} is non-null, as the
+   * per-database applied position for that database, then serialises the bookkeeping to disk.
+   * Package-private for tests.
+   * <p>
+   * Synchronised on {@link #appliedIndexFileLock}: the apply thread and the snapshot-install thread
+   * (see {@link #writePersistedAppliedIndexForAllDatabases}) are the two writers, and the lock keeps
+   * the in-memory update and the temp-file write+rename atomic with respect to each other so the
+   * shared {@code applied-index.tmp} is never raced.
+   */
+  void writePersistedAppliedIndex(final long index, final String dbName) {
+    synchronized (appliedIndexFileLock) {
+      ensureAppliedIndexLoaded();
+      globalAppliedIndex = index;
+      if (dbName != null)
+        appliedIndexByDb.put(dbName, index);
+      persistAppliedIndexFile();
+    }
+  }
+
+  /**
+   * Advances the global applied position to {@code index} and, in the SAME serialised write, evicts
+   * {@code dbName} from the per-database map. Used for a {@code DROP_DATABASE_ENTRY}: the database is
+   * gone, so its per-database entry must not linger and grow the map/persisted JSON for the node
+   * lifetime (issue #4824). Folding the global advance and the eviction into one atomic write avoids
+   * a crash window that could leave a stale per-database entry for a database that no longer exists.
+   * Package-private for tests.
+   */
+  void writePersistedAppliedIndexDroppingDatabase(final long index, final String dbName) {
+    synchronized (appliedIndexFileLock) {
+      ensureAppliedIndexLoaded();
+      globalAppliedIndex = index;
+      if (dbName != null)
+        appliedIndexByDb.remove(dbName);
+      persistAppliedIndexFile();
+    }
+  }
+
+  /**
+   * Records {@code index} as the global applied position and as the per-database position for every
+   * database currently present on this node, then serialises once. Used by the full state-machine
+   * snapshot install, after which every present database is at {@code index}. Synchronised on
+   * {@link #appliedIndexFileLock} so it never races the apply-thread writer on the in-memory state or
+   * the shared temp file.
+   */
+  void writePersistedAppliedIndexForAllDatabases(final long index) {
+    synchronized (appliedIndexFileLock) {
+      ensureAppliedIndexLoaded();
+      globalAppliedIndex = index;
+      if (server != null)
+        for (final String dbName : server.getDatabaseNames())
+          appliedIndexByDb.put(dbName, index);
+      persistAppliedIndexFile();
+    }
+  }
+
+  /**
+   * Lazily parses the persisted applied-index file once into the in-memory cache. Accepts both the
+   * new JSON document ({@code {"global": n, "db": {"name": n, ...}}}) and a legacy plain-number file
+   * (read as the global value with an empty per-database map). A missing/unreadable file simply means
+   * "nothing persisted yet" (-1) and still latches the cache as loaded.
+   * <p>
+   * When the file path cannot yet be resolved (no server wired, so {@code getAppliedIndexFile()} is
+   * {@code null}) the cache is NOT latched, so a later call retries once the server is available and
+   * a persisted file is no longer masked. In the current wiring {@code setServer(...)} always runs
+   * before the first read, so this only guards against a future reordering.
+   */
+  private void ensureAppliedIndexLoaded() {
+    if (appliedIndexLoaded)
+      return;
+    synchronized (appliedIndexFileLock) {
+      if (appliedIndexLoaded)
+        return;
+      final Path file = getAppliedIndexFile();
+      if (file == null)
+        return; // server not wired yet: do not latch, retry once the path is resolvable
+      try {
+        if (Files.exists(file)) {
+          final String content = Files.readString(file).trim();
+          if (!content.isEmpty()) {
+            if (content.charAt(0) == '{') {
+              final JSONObject json = new JSONObject(content);
+              globalAppliedIndex = json.getLong("global", -1);
+              final JSONObject perDb = json.getJSONObject("db", new JSONObject());
+              for (final String name : perDb.keySet())
+                appliedIndexByDb.put(name, perDb.getLong(name, -1));
+            } else
+              // Legacy format: a single plain number is the global Raft-log position.
+              globalAppliedIndex = Long.parseLong(content);
+          }
+        }
+      } catch (final Exception e) {
+        LogManager.instance().log(this, Level.FINE, "Could not read persisted applied index: %s", e.getMessage());
+      } finally {
+        // The path was resolvable and we attempted a read: latch even on a parse failure so a corrupt
+        // file is not re-read on every apply (it degrades to -1, re-running the idempotent verification).
+        // Deliberate coupling: a corrupt file leaving globalAppliedIndex at -1 also makes
+        // reinitialize()'s snapshot-gap check (persistedApplied >= 0 && ...) evaluate false, i.e. it
+        // suppresses the "snapshot ahead, download from leader" path. This matches the pre-change
+        // behavior (a parse failure already returned -1), so it is intentional, not a regression.
+        appliedIndexLoaded = true;
+      }
+    }
+  }
+
+  /**
+   * Serialises the in-memory applied-index bookkeeping to {@code .raft/applied-index} via a temp file
+   * and atomic rename, so a crash mid-write never leaves a corrupt file.
+   * <p>
+   * Called once per applied entry (the file was already rewritten every apply before this change).
+   * The per-database map is tiny (one entry per co-located database) and the small JSON it allocates
+   * is dominated by the {@code createDirectories} + {@code writeString} + atomic {@code move} syscalls
+   * that already ran every apply, so the extra allocation is negligible on the apply path.
+   */
+  private void persistAppliedIndexFile() {
     try {
       final Path file = getAppliedIndexFile();
       if (file == null)
         return;
+      final JSONObject json = new JSONObject();
+      json.put("global", globalAppliedIndex);
+      final JSONObject perDb = new JSONObject();
+      for (final Map.Entry<String, Long> entry : appliedIndexByDb.entrySet())
+        perDb.put(entry.getKey(), entry.getValue());
+      json.put("db", perDb);
+
       Files.createDirectories(file.getParent());
-      // Write via a temp file + atomic rename to avoid corruption on crash
       final Path tmp = file.resolveSibling("applied-index.tmp");
-      Files.writeString(tmp, Long.toString(index));
+      Files.writeString(tmp, json.toString());
       Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     } catch (final Exception e) {
       LogManager.instance().log(this, Level.FINE, "Could not write persisted applied index: %s", e.getMessage());
@@ -1487,6 +1849,73 @@ public class ArcadeStateMachine extends BaseStateMachine {
   }
 
   /**
+   * Triggers a targeted snapshot resync of a single database from the leader (issue #4797).
+   * <p>
+   * Used when an unexpected error while applying an entry for {@code dbName} quarantines it: only the
+   * affected database is reinstalled from the leader, leaving the healthy co-located databases on the
+   * same shared {@link ArcadeStateMachine} untouched and the node running. On success the database is
+   * removed from the diverged set via {@link #clearDivergedDatabase(String)}.
+   * <p>
+   * Participates in the same {@link #snapshotDownloadInProgress} single-flight protocol as
+   * {@link #triggerSnapshotDownload()} so a targeted resync never overlaps a full download; if a full
+   * download is already running it reinstalls this database too, so skipping here is safe. A skipped
+   * resync is recovered by the {@link HealthMonitor} persistent-lag backstop ({@link #recoverFromPersistentLag()}).
+   * No-op when there is no leader/server context or the lifecycle executor is shutting down.
+   */
+  private void triggerDatabaseResync(final String dbName) {
+    if (raftHAServer == null || server == null)
+      return;
+    try {
+      lifecycleExecutor.submit(() -> {
+        if (!snapshotDownloadInProgress.compareAndSet(false, true)) {
+          HALog.log(this, HALog.BASIC, "Snapshot download already in progress, skipping targeted resync of '%s'", dbName);
+          return;
+        }
+        try {
+          final String leaderHttpAddr = raftHAServer.getLeaderHttpAddress();
+          if (leaderHttpAddr == null) {
+            LogManager.instance().log(this, Level.WARNING,
+                "Cannot resync quarantined database '%s': leader HTTP address unknown", dbName);
+            return;
+          }
+          final String leaderHttpsAddr = raftHAServer.getLeaderHttpsAddress();
+          final String clusterToken = raftHAServer.getClusterToken();
+          // install() keeps the database open during the download and rolls back on failure, so a
+          // targeted resync never leaves it closed.
+          if (server.existsDatabase(dbName)) {
+            SnapshotInstaller.install(dbName, SnapshotInstaller.resolveDatabasePath(server, dbName),
+                leaderHttpAddr, leaderHttpsAddr, clusterToken, server);
+            LogManager.instance().log(this, Level.INFO,
+                "Targeted snapshot resync of quarantined database '%s' completed", dbName);
+            clearDivergedDatabase(dbName);
+          }
+        } catch (final Exception e) {
+          LogManager.instance().log(this, Level.SEVERE,
+              "Targeted snapshot resync of quarantined database '" + dbName + "' failed", e);
+        } finally {
+          snapshotDownloadInProgress.set(false);
+        }
+      });
+    } catch (final RejectedExecutionException ree) {
+      LogManager.instance().log(this, Level.WARNING,
+          "Cannot schedule targeted resync for database '%s': executor is shut down", ree, dbName);
+    }
+  }
+
+  /**
+   * Removes a single database from the diverged set after a targeted resync restored its state
+   * (issue #4797). When the set becomes empty the bounded-escalation counter is reset, mirroring
+   * {@link #clearDivergedState()} which clears everything after a full resync. The counter is shared
+   * across databases, so it is only safe to reset once no database remains quarantined.
+   */
+  // @VisibleForTesting
+  void clearDivergedDatabase(final String dbName) {
+    divergedDatabases.remove(dbName);
+    if (divergedDatabases.isEmpty())
+      divergedSwallowedErrors.set(0);
+  }
+
+  /**
    * Marks {@code dbName} as diverged from the committed Raft log (issue #4740). While a database is
    * diverged, unexpected Throwables raised while applying its entries are treated as recoverable
    * resync conditions in {@link #applyWithRetry} rather than fatal halts.
@@ -1516,6 +1945,11 @@ public class ArcadeStateMachine extends BaseStateMachine {
   // @VisibleForTesting
   int divergedSwallowedErrorCount() {
     return divergedSwallowedErrors.get();
+  }
+
+  // @VisibleForTesting
+  boolean isHaltedAfterCriticalError() {
+    return haltedAfterCriticalError.get();
   }
 
   /**
