@@ -25,7 +25,7 @@
     <groupId>com.arcadedb</groupId>
     <artifactId>arcadedb-parent</artifactId>
     <packaging>pom</packaging>
-    <version>26.7.1-SNAPSHOT</version>
+    <version>26.7.2-SNAPSHOT</version>
 
     <name>ArcadeDB</name>
     <url>https://arcadedata.com/</url>
@@ -82,7 +82,7 @@
         <micrometer.version>1.17.0</micrometer.version>
         <micrometer-tracing.version>1.7.0</micrometer-tracing.version>
         <opentelemetry.version>1.63.0</opentelemetry.version>
-        <postgres.version>42.7.11</postgres.version>
+        <postgres.version>42.7.12</postgres.version>
 
         <assertj-core.version>3.27.7</assertj-core.version>
         <junit.jupiter.version>6.1.1</junit.jupiter.version>
@@ -96,7 +96,7 @@
         <byte-buddy.version>1.17.7</byte-buddy.version>
 
 
-        <protobuf-maven-plugin.version>5.1.6</protobuf-maven-plugin.version>
+        <protobuf-maven-plugin.version>5.1.7</protobuf-maven-plugin.version>
         <grpc.version>1.79.0</grpc.version>
         <protoc.version>4.33.0</protoc.version>
         <protobuf-java.version>4.35.1</protobuf-java.version>

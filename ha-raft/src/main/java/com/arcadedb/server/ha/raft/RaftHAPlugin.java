@@ -50,9 +50,11 @@ import java.util.logging.Level;
  */
 public class RaftHAPlugin implements HAServerPlugin, HAReplicationStatsProvider {
 
-  private ArcadeDBServer       server;
-  private ContextConfiguration configuration;
-  private RaftHAServer         raftHAServer;
+  private          ArcadeDBServer       server;
+  private          ContextConfiguration configuration;
+  // Read by concurrent HTTP worker threads (e.g. the readiness probe via getReadinessSignal) while it is
+  // (re)assigned by the server startup/shutdown thread, so the reference must be published with volatile.
+  private volatile RaftHAServer         raftHAServer;
 
   // Databases already warned about single-bucket types, so the diagnostic is logged once per
   // database per plugin lifetime instead of on every (re)wrap.
@@ -204,9 +206,9 @@ public class RaftHAPlugin implements HAServerPlugin, HAReplicationStatsProvider 
   }
 
   @Override
-  public java.util.List<FollowerSample> getFollowerSamples() {
+  public List<FollowerSample> getFollowerSamples() {
     final RaftHAServer s = raftHAServer;
-    return s != null ? s.getFollowerSamples() : java.util.List.of();
+    return s != null ? s.getFollowerSamples() : List.of();
   }
 
   @Override
@@ -219,6 +221,14 @@ public class RaftHAPlugin implements HAServerPlugin, HAReplicationStatsProvider 
     if (raftHAServer == null)
       return ELECTION_STATUS.DONE;
     return raftHAServer.getLeaderId() != null ? ELECTION_STATUS.DONE : ELECTION_STATUS.VOTING_FOR_ME;
+  }
+
+  @Override
+  public HAServerPlugin.READINESS_SIGNAL getReadinessSignal(final long maxLagEntries) {
+    final RaftHAServer s = raftHAServer;
+    // Raft not started yet means this node has not joined the consensus group, so it is not ready.
+    final boolean ready = s != null && s.isReadyForTraffic(maxLagEntries);
+    return ready ? READINESS_SIGNAL.READY : READINESS_SIGNAL.NOT_READY;
   }
 
   @Override
@@ -249,6 +259,11 @@ public class RaftHAPlugin implements HAServerPlugin, HAReplicationStatsProvider 
   @Override
   public String getReplicaAddresses() {
     return raftHAServer != null ? raftHAServer.getReplicaAddresses() : "";
+  }
+
+  @Override
+  public BoltRoutingTable getBoltRoutingTable() {
+    return raftHAServer != null ? raftHAServer.getBoltRoutingTable() : null;
   }
 
   @Override

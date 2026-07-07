@@ -18,6 +18,7 @@
  */
 package com.arcadedb.server;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -50,11 +51,41 @@ public interface HAServerPlugin extends ServerPlugin {
     ANY, REPLICA
   }
 
+  /**
+   * Consensus-level readiness signal for the readiness probe. {@code READY}: a leader is known, this node
+   * is in the current configuration and (as a follower) has caught up. {@code NOT_READY}: one of those
+   * conditions does not hold. A {@code null} return from {@link #getReadinessSignal(long)} means the HA
+   * implementation exposes no such signal and the probe applies no additional gating.
+   */
+  enum READINESS_SIGNAL {
+    READY, NOT_READY
+  }
+
   boolean isLeader();
 
   String getLeaderName();
 
   ELECTION_STATUS getElectionStatus();
+
+  /**
+   * Reports the consensus-level readiness of this node for the readiness probe. {@code READY} requires a
+   * known leader (election settled), membership in the current cluster configuration, and - for a
+   * follower - a local applied index within {@code maxLagEntries} of the commit index. The leader is always
+   * considered caught up with itself.
+   * <p>
+   * Used so a node does not advertise Ready before it has (re)joined the configuration and replayed the
+   * committed log. During a Kubernetes StatefulSet rolling restart, a follower that reports Ready with an
+   * empty/lagging log lets the orchestrator terminate the next pod and drop the write quorum.
+   * <p>
+   * Returns {@code null} when this HA implementation provides no consensus readiness signal; callers treat
+   * {@code null} as "no additional gating". The Raft implementation returns a concrete
+   * {@link READINESS_SIGNAL}.
+   *
+   * @param maxLagEntries maximum tolerated {@code commitIndex - lastAppliedIndex} for a follower to be ready
+   */
+  default READINESS_SIGNAL getReadinessSignal(final long maxLagEntries) {
+    return null;
+  }
 
   String getClusterName();
 
@@ -80,6 +111,25 @@ public interface HAServerPlugin extends ServerPlugin {
    * Returns a comma-separated list of replica HTTP addresses, or empty string if none.
    */
   String getReplicaAddresses();
+
+  /**
+   * Immutable snapshot of the Bolt routing topology: the current leader's client-reachable Bolt address
+   * (writer) and the non-leader replicas' Bolt addresses (readers). Both sets are derived from a single
+   * leader read so a concurrent leader change cannot make them mutually inconsistent.
+   */
+  record BoltRoutingTable(String writer, List<String> readers) {
+  }
+
+  /**
+   * Returns a single-snapshot Bolt routing table for the ROUTE response, or null when HA is inactive,
+   * no leader is currently known, or the leader has no resolvable Bolt address. Readers reflect the
+   * configured cluster membership (parity with {@link #getReplicaAddresses()}); a down or partitioned
+   * follower is still advertised until it leaves the group, and the driver fails over. Used to build the
+   * Bolt ROUTE routing table.
+   */
+  default BoltRoutingTable getBoltRoutingTable() {
+    return null;
+  }
 
   /**
    * Sends a shutdown command to a remote server in the cluster.

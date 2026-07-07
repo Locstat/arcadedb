@@ -18,11 +18,13 @@
  */
 package com.arcadedb.bolt;
 
+import com.arcadedb.bolt.packstream.PackStreamReader;
 import com.arcadedb.bolt.packstream.PackStreamWriter;
 import com.arcadedb.bolt.structure.BoltNode;
 import com.arcadedb.bolt.structure.BoltPath;
 import com.arcadedb.bolt.structure.BoltRelationship;
 import com.arcadedb.bolt.structure.BoltStructureMapper;
+import com.arcadedb.bolt.structure.BoltTemporalStructure;
 import com.arcadedb.bolt.structure.BoltUnboundRelationship;
 import com.arcadedb.database.RID;
 
@@ -261,6 +263,54 @@ class BoltStructureTest {
     assertThat(str).contains("relationships=1");
   }
 
+  @Test
+  void nodeWritesElementIdOnBolt5() throws Exception {
+    final BoltNode node = new BoltNode(1L, List.of("Person"), Map.of("name", "Alice"), "#1:0");
+
+    final PackStreamWriter v4 = new PackStreamWriter();
+    node.writeTo(v4);
+    // Tiny-struct marker: 0xB0 | fieldCount. v4 => 3 fields, signature 0x4E.
+    assertThat(v4.toByteArray()[0]).isEqualTo((byte) (0xB0 | 3));
+    assertThat(v4.toByteArray()[1]).isEqualTo(BoltNode.SIGNATURE);
+
+    final PackStreamWriter v5 = new PackStreamWriter().boltMajorVersion(5);
+    node.writeTo(v5);
+    assertThat(v5.toByteArray()[0]).isEqualTo((byte) (0xB0 | 4));
+    assertThat(v5.toByteArray()[1]).isEqualTo(BoltNode.SIGNATURE);
+    // Last field is the element_id string "#1:0" -> tiny-string 0x84 then ASCII bytes.
+    final byte[] b = v5.toByteArray();
+    assertThat(b[b.length - 5]).isEqualTo((byte) (0x80 | 4));
+    assertThat(new String(b, b.length - 4, 4, java.nio.charset.StandardCharsets.UTF_8)).isEqualTo("#1:0");
+  }
+
+  @Test
+  void relationshipWritesElementIdsOnBolt5() throws Exception {
+    final BoltRelationship rel = new BoltRelationship(10L, 1L, 2L, "KNOWS", Map.of(), "#10:0", "#1:0", "#2:0");
+
+    final PackStreamWriter v4 = new PackStreamWriter();
+    rel.writeTo(v4);
+    assertThat(v4.toByteArray()[0]).isEqualTo((byte) (0xB0 | 5));
+
+    final PackStreamWriter v5 = new PackStreamWriter().boltMajorVersion(5);
+    rel.writeTo(v5);
+    assertThat(v5.toByteArray()[0]).isEqualTo((byte) (0xB0 | 8));
+    assertThat(v5.toByteArray()[1]).isEqualTo(BoltRelationship.SIGNATURE);
+  }
+
+  @Test
+  void unboundRelationshipWritesElementIdOnBolt5() throws Exception {
+    final BoltUnboundRelationship rel = new BoltUnboundRelationship(10L, "KNOWS", Map.of(), "#10:0");
+
+    final PackStreamWriter v4 = new PackStreamWriter();
+    rel.writeTo(v4);
+    assertThat(v4.toByteArray()[0]).isEqualTo((byte) (0xB0 | 3));
+
+    final PackStreamWriter v5 = new PackStreamWriter().boltMajorVersion(5);
+    rel.writeTo(v5);
+    assertThat(v5.toByteArray()[0]).isEqualTo((byte) (0xB0 | 4));
+    assertThat(v5.toByteArray()[1]).isEqualTo(BoltUnboundRelationship.SIGNATURE);
+  }
+
   // ============ BoltStructureMapper tests ============
 
   @Test
@@ -361,59 +411,88 @@ class BoltStructureTest {
     assertThat(result).containsEntry("normalKey", "normalValue");
   }
 
+  // Temporal values are now emitted as native Bolt PackStream structures (issue #4907), not ISO strings.
+  // Each is verified by a full wire round-trip: toPackStreamValue -> write -> read -> decode.
+
   @Test
-  void mapperLocalDate() {
+  void mapperLocalDate() throws Exception {
     final LocalDate date = LocalDate.of(2024, 1, 15);
-    assertThat(BoltStructureMapper.toPackStreamValue(date)).isEqualTo("2024-01-15");
+    assertThat(BoltStructureMapper.toPackStreamValue(date)).isInstanceOf(BoltTemporalStructure.class);
+    assertThat(wireRoundTrip(date)).isEqualTo(date);
   }
 
   @Test
-  void mapperLocalTime() {
+  void mapperLocalTime() throws Exception {
     final LocalTime time = LocalTime.of(10, 30, 45);
-    assertThat(BoltStructureMapper.toPackStreamValue(time)).isEqualTo("10:30:45");
+    assertThat(wireRoundTrip(time)).isEqualTo(time);
   }
 
   @Test
-  void mapperLocalDateTime() {
+  void mapperLocalDateTime() throws Exception {
     final LocalDateTime dateTime = LocalDateTime.of(2024, 1, 15, 10, 30, 45);
-    assertThat(BoltStructureMapper.toPackStreamValue(dateTime)).isEqualTo("2024-01-15T10:30:45");
+    assertThat(wireRoundTrip(dateTime)).isEqualTo(dateTime);
   }
 
   @Test
-  void mapperOffsetDateTime() {
-    final OffsetDateTime dateTime = OffsetDateTime.of(2024, 1, 15, 10, 30, 45, 0, ZoneOffset.UTC);
-    assertThat(BoltStructureMapper.toPackStreamValue(dateTime)).isEqualTo("2024-01-15T10:30:45Z");
+  void mapperOffsetDateTime() throws Exception {
+    final OffsetDateTime dateTime = OffsetDateTime.of(2024, 1, 15, 10, 30, 45, 0, ZoneOffset.ofHours(2));
+    assertThat(wireRoundTrip(dateTime)).isEqualTo(dateTime);
   }
 
   @Test
-  void mapperZonedDateTime() {
-    final ZonedDateTime dateTime = ZonedDateTime.of(2024, 1, 15, 10, 30, 45, 0, ZoneId.of("UTC"));
-    assertThat((String) BoltStructureMapper.toPackStreamValue(dateTime)).contains("2024-01-15T10:30:45");
+  void mapperZonedDateTime() throws Exception {
+    final ZonedDateTime dateTime = ZonedDateTime.of(2024, 1, 15, 10, 30, 45, 0, ZoneId.of("Europe/Rome"));
+    assertThat(wireRoundTrip(dateTime)).isEqualTo(dateTime);
   }
 
   @Test
-  void mapperOffsetTime() {
-    final OffsetTime time = OffsetTime.of(10, 30, 45, 0, ZoneOffset.UTC);
-    assertThat(BoltStructureMapper.toPackStreamValue(time)).isEqualTo("10:30:45Z");
+  void mapperOffsetTime() throws Exception {
+    final OffsetTime time = OffsetTime.of(10, 30, 45, 0, ZoneOffset.ofHours(2));
+    assertThat(wireRoundTrip(time)).isEqualTo(time);
   }
 
   @Test
-  void mapperInstant() {
+  void mapperInstant() throws Exception {
     final Instant instant = Instant.parse("2024-01-15T10:30:45Z");
-    assertThat(BoltStructureMapper.toPackStreamValue(instant)).isEqualTo("2024-01-15T10:30:45Z");
+    // Instant maps to a DateTime struct; assert the instant survives the round-trip.
+    assertThat(((OffsetDateTime) wireRoundTrip(instant)).toInstant()).isEqualTo(instant);
   }
 
   @Test
-  void mapperJavaDate() {
+  void mapperJavaDate() throws Exception {
     final Date date = Date.from(Instant.parse("2024-01-15T10:30:45Z"));
-    assertThat(BoltStructureMapper.toPackStreamValue(date)).isEqualTo("2024-01-15T10:30:45Z");
+    assertThat(((OffsetDateTime) wireRoundTrip(date)).toInstant()).isEqualTo(date.toInstant());
   }
 
   @Test
-  void mapperCalendar() {
+  void mapperSqlDate() throws Exception {
+    // java.sql.Date extends java.util.Date but has no time component (toInstant() throws): must map to a Date struct.
+    final java.sql.Date sqlDate = java.sql.Date.valueOf(LocalDate.of(2024, 1, 15));
+    assertThat(wireRoundTrip(sqlDate)).isEqualTo(sqlDate.toLocalDate());
+  }
+
+  @Test
+  void mapperSqlTime() throws Exception {
+    final java.sql.Time sqlTime = java.sql.Time.valueOf(LocalTime.of(10, 30, 45));
+    assertThat(wireRoundTrip(sqlTime)).isEqualTo(sqlTime.toLocalTime());
+  }
+
+  @Test
+  void mapperCalendar() throws Exception {
     final Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
     calendar.setTimeInMillis(Instant.parse("2024-01-15T10:30:45Z").toEpochMilli());
-    assertThat(BoltStructureMapper.toPackStreamValue(calendar)).isEqualTo("2024-01-15T10:30:45Z");
+    // The calendar's named zone is preserved, so it round-trips as a zoned datetime; assert the instant.
+    assertThat(((ZonedDateTime) wireRoundTrip(calendar)).toInstant()).isEqualTo(calendar.toInstant());
+  }
+
+  /**
+   * Map a value to its outbound PackStream form, serialize it, read it back, and decode - the full
+   * outbound+inbound wire path. Returns the decoded java.time value.
+   */
+  private static Object wireRoundTrip(final Object value) throws Exception {
+    final PackStreamWriter writer = new PackStreamWriter();
+    writer.writeValue(BoltStructureMapper.toPackStreamValue(value));
+    return BoltStructureMapper.fromPackStreamValue(new PackStreamReader(writer.toByteArray()).readValue());
   }
 
   @Test

@@ -105,6 +105,7 @@ import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.ExecutionStep;
 import com.arcadedb.query.sql.executor.InternalResultSet;
 import com.arcadedb.query.sql.executor.IteratorResultSet;
+import com.arcadedb.query.sql.executor.QueryStatistics;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
@@ -270,12 +271,22 @@ public class CypherExecutionPlan {
       while (resultSet.hasNext()) {
         materializedResults.add((ResultInternal) resultSet.next());
       }
+      // Surface the CRUD-count accumulator built up by the mutation steps (CreateStep, SetStep,
+      // DeleteStep, RemoveStep, MergeStep) on the returned result set. Always present after a
+      // write statement, even if it performed no actual mutation (containsUpdates() is false then).
+      final QueryStatistics stats = context.getStatistics();
+
       // If no RETURN clause (or GQL FINISH was used), return empty results
       // (write side effects still happened). Issue #3365 section 1.3.
-      if (statement.getReturnClause() == null || statement.hasFinishClause())
-        return new IteratorResultSet(Collections.<Result>emptyList().iterator());
+      if (statement.getReturnClause() == null || statement.hasFinishClause()) {
+        final IteratorResultSet empty = new IteratorResultSet(Collections.<Result>emptyList().iterator());
+        empty.setStatistics(stats);
+        return empty;
+      }
       // Return the materialized results
-      return new IteratorResultSet(materializedResults.iterator());
+      final IteratorResultSet out = new IteratorResultSet(materializedResults.iterator());
+      out.setStatistics(stats);
+      return out;
     }
 
     // Read-only path: GQL FINISH still suppresses any rows the MATCH would have produced.
@@ -298,6 +309,10 @@ public class CypherExecutionPlan {
    * @return result set from the inner query execution
    */
   public ResultSet executeWithSeedRow(final Result seedRow) {
+    // Limitation: each branch/inner plan runs with its own BasicCommandContext, so QueryStatistics
+    // from writes performed inside this CALL subquery are not aggregated into the outer plan's
+    // statistics. The ResultSet returned to the caller only reflects top-level mutation steps.
+
     // Handle UNION inside CALL subqueries: execute each branch with the seed row
     if (statement instanceof UnionStatement unionStmt) {
       final List<CypherExecutionPlan> branchPlans = new ArrayList<>();
@@ -389,6 +404,10 @@ public class CypherExecutionPlan {
    * @return combined result set
    */
   private ResultSet executeUnion() {
+    // Limitation: each UNION branch executes as its own sub-plan with its own QueryStatistics, so
+    // write statistics from inside a branch are not aggregated into the combined ResultSet's
+    // statistics; only top-level mutation steps outside the UNION are reflected there.
+
     // Use UnionStep to combine results from all subqueries
     final BasicCommandContext context = new BasicCommandContext();
     context.setDatabase(database);
@@ -3459,9 +3478,37 @@ public class CypherExecutionPlan {
               return true;
           break;
         }
+        case REMOVE: {
+          // REMOVE r.prop / REMOVE r:Label keeps the edge binding alive. Missing this dropped the
+          // edge binding, so a top-level REMOVE on a relationship property silently found no edge
+          // and became a no-op unless the edge was also projected through WITH (issue #5013).
+          final RemoveClause rc = entry.getTypedClause();
+          for (final RemoveClause.RemoveItem item : rc.getItems())
+            if (variable.equals(item.getVariable()))
+              return true;
+          break;
+        }
         case DELETE: {
           final DeleteClause dc = entry.getTypedClause();
-          if (dc.getVariables().contains(variable))
+          if (deleteReferencesVariable(dc, variable))
+            return true;
+          break;
+        }
+        case FOREACH: {
+          // FOREACH can reference the edge variable in its list expression (e.g. FOREACH (x IN [r] | ...))
+          // or inside any of its inner write clauses. Missing this dropped the edge binding, so DELETE
+          // inside FOREACH silently found no edge (issue #4912).
+          final ForeachClause fc = entry.getTypedClause();
+          if (foreachReferencesVariable(fc, variable))
+            return true;
+          break;
+        }
+        case SUBQUERY: {
+          // A scoped CALL (r) { ... } imports the edge variable, and CALL { WITH r ... } references it in
+          // the inner statement. Missing this dropped the edge binding, so DELETE inside a CALL subquery
+          // silently found no edge (issue #4913).
+          final SubqueryClause sq = entry.getTypedClause();
+          if (subqueryReferencesVariable(sq, variable))
             return true;
           break;
         }
@@ -3497,6 +3544,156 @@ public class CypherExecutionPlan {
       if (expressionReferencesVariable(uc.getListExpression().getText(), variable))
         return true;
 
+    return false;
+  }
+
+  /**
+   * Checks whether a FOREACH clause references the given variable, either in its list expression
+   * or inside any of its inner write clauses (recursively for nested FOREACH). Used to keep the
+   * edge binding alive when a FOREACH consumes it (issue #4912).
+   */
+  private boolean foreachReferencesVariable(final ForeachClause foreachClause, final String variable) {
+    if (foreachClause == null)
+      return false;
+    if (foreachClause.getListExpression() != null
+        && expressionReferencesVariable(foreachClause.getListExpression().getText(), variable))
+      return true;
+    if (foreachClause.getInnerClauses() != null) {
+      for (final ClauseEntry inner : foreachClause.getInnerClauses()) {
+        switch (inner.getType()) {
+        case DELETE:
+          if (deleteReferencesVariable(inner.getTypedClause(), variable))
+            return true;
+          break;
+        case SET: {
+          final SetClause sc = inner.getTypedClause();
+          for (final SetClause.SetItem item : sc.getItems()) {
+            if (variable.equals(item.getVariable()))
+              return true;
+            if (item.getValueExpression() != null
+                && expressionReferencesVariable(item.getValueExpression().getText(), variable))
+              return true;
+            if (item.getTargetExpression() != null
+                && expressionReferencesVariable(item.getTargetExpression().getText(), variable))
+              return true;
+          }
+          break;
+        }
+        case REMOVE: {
+          final RemoveClause rc = inner.getTypedClause();
+          for (final RemoveClause.RemoveItem item : rc.getItems())
+            if (variable.equals(item.getVariable()))
+              return true;
+          break;
+        }
+        case FOREACH:
+          if (foreachReferencesVariable(inner.getTypedClause(), variable))
+            return true;
+          break;
+        case CREATE:
+        case MERGE:
+          // Inline property expressions inside CREATE/MERGE patterns may reference the variable.
+          // Enumerating them cheaply is awkward, so stay conservative: keep the edge binding.
+          // A false positive only forgoes the GAV/CSR fast path; a false negative would silently
+          // drop a still-referenced edge (the class of bug this method exists to prevent).
+          return true;
+        default:
+          break;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Checks whether a scoped CALL subquery references the given variable, either because the variable is
+   * imported via the explicit scope list {@code CALL (r) { ... }} or because the inner statement references
+   * it (e.g. {@code CALL { WITH r ... DELETE r }}). Used to keep the edge binding alive when a CALL subquery
+   * consumes it (issue #4913).
+   */
+  private boolean subqueryReferencesVariable(final SubqueryClause subqueryClause, final String variable) {
+    if (subqueryClause == null)
+      return false;
+    // Explicit scope: CALL (r) { ... } imports r from the outer row.
+    final List<String> scope = subqueryClause.getScopeVariables();
+    if (scope != null && scope.contains(variable))
+      return true;
+    // Otherwise inspect the inner statement's clauses (e.g. CALL { WITH r ... DELETE r }).
+    final CypherStatement inner = subqueryClause.getInnerStatement();
+    if (inner == null || inner.getClausesInOrder() == null)
+      return false;
+    for (final ClauseEntry entry : inner.getClausesInOrder()) {
+      switch (entry.getType()) {
+      case WITH: {
+        final WithClause wc = entry.getTypedClause();
+        for (final ReturnClause.ReturnItem item : wc.getItems())
+          if (expressionReferencesVariable(item.getExpression().getText(), variable))
+            return true;
+        if (wc.getWhereClause() != null && wc.getWhereClause().getConditionExpression() != null
+            && expressionReferencesVariable(wc.getWhereClause().getConditionExpression().getText(), variable))
+          return true;
+        break;
+      }
+      case UNWIND:
+        if (expressionReferencesVariable(((UnwindClause) entry.getTypedClause()).getListExpression().getText(), variable))
+          return true;
+        break;
+      case SET: {
+        final SetClause sc = entry.getTypedClause();
+        for (final SetClause.SetItem item : sc.getItems()) {
+          if (variable.equals(item.getVariable()))
+            return true;
+          if (item.getValueExpression() != null
+              && expressionReferencesVariable(item.getValueExpression().getText(), variable))
+            return true;
+          if (item.getTargetExpression() != null
+              && expressionReferencesVariable(item.getTargetExpression().getText(), variable))
+            return true;
+        }
+        break;
+      }
+      case REMOVE: {
+        final RemoveClause rc = entry.getTypedClause();
+        for (final RemoveClause.RemoveItem item : rc.getItems())
+          if (variable.equals(item.getVariable()))
+            return true;
+        break;
+      }
+      case DELETE:
+        if (deleteReferencesVariable(entry.getTypedClause(), variable))
+          return true;
+        break;
+      case RETURN: {
+        final ReturnClause rc = entry.getTypedClause();
+        for (final ReturnClause.ReturnItem item : rc.getReturnItems())
+          if (expressionReferencesVariable(item.getExpression().getText(), variable))
+            return true;
+        break;
+      }
+      case FOREACH:
+        if (foreachReferencesVariable(entry.getTypedClause(), variable))
+          return true;
+        break;
+      case SUBQUERY:
+        if (subqueryReferencesVariable(entry.getTypedClause(), variable))
+          return true;
+        break;
+      default:
+        break;
+      }
+    }
+    return false;
+  }
+
+  /** Checks whether a DELETE clause references the given variable, by name or within a target expression. */
+  private boolean deleteReferencesVariable(final DeleteClause deleteClause, final String variable) {
+    if (deleteClause.getVariables().contains(variable))
+      return true;
+    final List<Expression> expressions = deleteClause.getExpressions();
+    if (expressions != null)
+      for (final Expression expression : expressions)
+        if (expression != null && expressionReferencesVariable(expression.getText(), variable))
+          return true;
     return false;
   }
 
@@ -3779,6 +3976,13 @@ public class CypherExecutionPlan {
    * Unified entry point: tries all count-push-down patterns and wraps the result in a CSRCountStep.
    */
   private AbstractExecutionStep tryOptimizeCountStar(final CommandContext context) {
+    // Count-push-down operators reason only about node labels and edge types; they cannot honor
+    // inline property filters (e.g. (a:Node {id: 1})) or dynamic labels on the pattern's nodes.
+    // If any node carries such a filter, skip all push-down detectors so the query falls back to
+    // the normal materialization pipeline, which applies the filter. See issue #5071.
+    if (hasInlineNodePropertyOrDynamicLabel())
+      return null;
+
     CountOp op = tryDetectChainCountStar();
     if (op == null)
       op = tryDetectAntiJoinChainCountStar();
@@ -3792,6 +3996,27 @@ public class CypherExecutionPlan {
       return null;
     final String alias = isCountStarReturn();
     return new CSRCountStep(op, alias, context);
+  }
+
+  /**
+   * Returns true if any node in any MATCH path pattern carries an inline property filter
+   * (e.g. {@code {id: 1}} or {@code $props}) or a dynamic label. Such filters cannot be honored by
+   * the count-push-down operators, which key purely off node labels and edge types. See issue #5071.
+   */
+  private boolean hasInlineNodePropertyOrDynamicLabel() {
+    if (statement.getMatchClauses() == null)
+      return false;
+    for (final MatchClause mc : statement.getMatchClauses()) {
+      if (!mc.hasPathPatterns())
+        continue;
+      for (final PathPattern pp : mc.getPathPatterns())
+        for (int i = 0; i <= pp.getRelationshipCount(); i++) {
+          final NodePattern node = pp.getNode(i);
+          if (node.hasProperties() || node.hasDynamicLabels())
+            return true;
+        }
+    }
+    return false;
   }
 
   private CountOp tryDetectChainCountStar() {

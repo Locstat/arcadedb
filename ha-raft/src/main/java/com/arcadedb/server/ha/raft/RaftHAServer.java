@@ -22,6 +22,7 @@ import com.arcadedb.ContextConfiguration;
 import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.log.LogManager;
 import com.arcadedb.server.ArcadeDBServer;
+import com.arcadedb.server.HAServerPlugin;
 import com.arcadedb.server.http.HttpServer;
 import com.arcadedb.server.monitor.HAReplicationStatsProvider;
 import org.apache.ratis.client.RaftClient;
@@ -38,8 +39,11 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.retry.RetryPolicies;
+import org.apache.ratis.server.DivisionInfo;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.RaftServerRpc;
+import org.apache.ratis.server.RaftServerRpcWithProxy;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.util.LifeCycle;
@@ -117,6 +121,11 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   private final    AtomicBoolean           httpFallbackWarned = new AtomicBoolean(false);
   // Logged at most once: notes that peer HTTPS endpoints are derived from this node's local HTTPS port.
   private final    AtomicBoolean           httpsFallbackWarned = new AtomicBoolean(false);
+  // Client-reachable Bolt endpoints (optional object-form 'bolt' field in HA_SERVER_LIST). Advertised
+  // in the Bolt ROUTE routing table so neo4j:// drivers can discover leader/followers.
+  private final    Map<RaftPeerId, String> boltAddresses      = new HashMap<>();
+  // Logged at most once: warns operators that Bolt routing addresses are derived (not explicitly configured).
+  private final    AtomicBoolean           boltFallbackWarned = new AtomicBoolean(false);
   private final    Map<RaftPeerId, String> peerDisplayNames   = new ConcurrentHashMap<>();
   private final    String                  clusterName;
 
@@ -164,13 +173,21 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     final long lagWarningThreshold = configuration.getValueAsLong(GlobalConfiguration.HA_REPLICATION_LAG_WARNING);
     final int raftPort = configuration.getValueAsInteger(GlobalConfiguration.HA_RAFT_PORT);
 
-    final RaftPeerAddressResolver.ParsedPeerList parsed = RaftPeerAddressResolver.parsePeerList(serverList, raftPort);
+    // Inside Kubernetes the DNS suffix must reach peers too, not only the self-advertised host built in
+    // ArcadeDBServer.assignHostAddress; otherwise short pod names in the server list never resolve.
+    final String k8sDnsSuffix = configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S)
+        ? configuration.getValueAsString(GlobalConfiguration.HA_K8S_DNS_SUFFIX)
+        : "";
+
+    final RaftPeerAddressResolver.ParsedPeerList parsed = RaftPeerAddressResolver.parsePeerList(serverList, raftPort,
+        k8sDnsSuffix);
     List<RaftPeer> peers = parsed.peers();
     final Map<RaftPeerId, String> configuredPeerNames = parsed.peerNames();
     final String serverName = arcadeServer.getServerName();
 
     this.httpAddresses.putAll(parsed.httpAddresses());
     this.httpsAddresses.putAll(parsed.httpsAddresses());
+    this.boltAddresses.putAll(parsed.boltAddresses());
 
     RaftPeerId resolvedLocalPeerId;
     try {
@@ -254,8 +271,10 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
         GlobalConfiguration.HA_STALLED_REPLICA_RESYNC_DURATION_MS);
     final boolean resyncNarrative = configuration.getValueAsBoolean(GlobalConfiguration.HA_RESYNC_PROGRESS_LOGGING);
     final long peerUnreachableThresholdMs = configuration.getValueAsLong(GlobalConfiguration.HA_PEER_UNREACHABLE_THRESHOLD);
+    final long peerChannelResetDurationMs = configuration.getValueAsLong(GlobalConfiguration.HA_PEER_CHANNEL_RESET_DURATION);
     this.clusterMonitor = new ClusterMonitor(lagWarningThreshold, stalledResyncDurationMs,
-        this::forceResyncStalledReplica, resyncNarrative, peerUnreachableThresholdMs);
+        this::forceResyncStalledReplica, resyncNarrative, peerUnreachableThresholdMs, peerChannelResetDurationMs,
+        this::resetPeerReplicationChannel);
     this.quorum = Quorum.parse(configuration.getValueAsString(GlobalConfiguration.HA_QUORUM));
     this.quorumTimeout = configuration.getValueAsLong(GlobalConfiguration.HA_QUORUM_TIMEOUT);
 
@@ -372,6 +391,64 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
         }
       }
     });
+  }
+
+  /**
+   * Leader-side recovery for a follower whose outbound replication gRPC channel has wedged on a stale
+   * DNS result after the follower restarted with a new address (issue #4696, "Gap 1"). Invoked by
+   * {@link ClusterMonitor} on the leader's lag-monitor thread once the follower has stayed continuously
+   * unreachable (no successful RPC) for {@link GlobalConfiguration#HA_PEER_CHANNEL_RESET_DURATION}.
+   * <p>
+   * Ratis keeps one outbound {@code GrpcServerProtocolClient} (wrapping a gRPC {@code ManagedChannel})
+   * per follower in the leader's server-RPC {@code PeerProxyMap}. When the follower's pod IP changes,
+   * grpc-java can keep returning the stale/negative DNS result on that cached channel indefinitely -
+   * Ratis's own error path only calls {@code resetConnectBackoff()}, which never recreates the channel
+   * or re-resolves DNS - so the appender never reconnects. {@code resetProxy} closes that one channel
+   * and drops it from the map; the appender's next send rebuilds a fresh channel against the same peer
+   * DNS name, which re-resolves to the follower's current IP. Only this one follower's channel is
+   * touched and leadership is unchanged, so there is no flapping risk (unlike a leadership transfer).
+   * <p>
+   * This is the automatic, less-disruptive alternative to the manual {@code transferLeadership} lever
+   * that Gap 1 was previously left to.
+   */
+  void resetPeerReplicationChannel(final String peerId) {
+    final RaftServer server = raftServer;
+    if (peerId == null || server == null || shutdownRequested || !isLeader())
+      return;
+
+    final RaftPeerId targetId = RaftPeerId.valueOf(peerId);
+    if (targetId.equals(localPeerId))
+      return; // the leader keeps no appender channel to itself
+
+    // ClusterMonitor already logs the operator-facing WARNING announcing the reset (with the attempt
+    // count and how long the follower has been unreachable), so a success is only confirmed at FINE to
+    // avoid a redundant second WARNING. A no-op is the surprising case worth surfacing at WARNING.
+    if (resetPeerAppenderChannel(server.getServerRpc(), targetId))
+      LogManager.instance().log(this, Level.FINE,
+          "Reset the replication gRPC channel to unreachable follower '%s' to force a fresh DNS re-resolution and reconnect (issue #4696).",
+          peerId);
+    else
+      LogManager.instance().log(this, Level.WARNING,
+          "Requested a replication-channel reset for follower '%s' but the Raft server RPC is not proxy-based; cannot reset the channel.",
+          peerId);
+  }
+
+  /**
+   * Closes and re-creates the leader's outbound gRPC proxy (channel) for {@code peerId}, forcing a
+   * fresh DNS re-resolution on the next send. Returns {@code true} when the reset was applied, or
+   * {@code false} when the RPC layer is not the expected proxy-based Ratis implementation.
+   * <p>
+   * Package-private and static so the Ratis-coupling seam can be unit-tested without a live cluster.
+   */
+  static boolean resetPeerAppenderChannel(final RaftServerRpc rpc, final RaftPeerId peerId) {
+    if (rpc instanceof RaftServerRpcWithProxy<?, ?> withProxy) {
+      final var proxies = withProxy.getProxies();
+      if (proxies != null) {
+        proxies.resetProxy(peerId);
+        return true;
+      }
+    }
+    return false;
   }
 
   private static ThreadPoolExecutor createStalledResyncExecutor() {
@@ -1173,6 +1250,31 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   }
 
   /**
+   * Builds a single-snapshot Bolt routing table (leader as writer, followers as readers) from one
+   * {@link #getLeaderId()} read, so a concurrent leader change cannot make the writer and reader sets
+   * mutually inconsistent. Returns {@code null} when no leader is known or the leader has no resolvable
+   * Bolt address. Readers reflect the configured cluster membership, matching {@link #getReplicaAddresses()};
+   * peers whose Bolt address cannot be resolved are skipped.
+   */
+  public HAServerPlugin.BoltRoutingTable getBoltRoutingTable() {
+    final RaftPeerId leaderId = getLeaderId();
+    if (leaderId == null)
+      return null;
+    final String writer = resolveBoltAddress(leaderId);
+    if (writer == null)
+      return null;
+    final List<String> readers = new ArrayList<>();
+    for (final RaftPeer peer : raftGroup.getPeers()) {
+      if (!peer.getId().equals(leaderId)) {
+        final String reader = resolveBoltAddress(peer.getId());
+        if (reader != null)
+          readers.add(reader);
+      }
+    }
+    return new HAServerPlugin.BoltRoutingTable(writer, List.copyOf(readers));
+  }
+
+  /**
    * Resolves the HTTP address (host:port) of a peer. When the peer's HTTP port was declared
    * explicitly in {@link GlobalConfiguration#HA_SERVER_LIST} (the {@code host:raftPort:httpPort}
    * syntax) that value is returned. Otherwise a best-effort address is synthesized by combining the
@@ -1197,6 +1299,43 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
     if (configured != null)
       return configured;
     return deriveHttpAddressWithWarning(peer.getAddress());
+  }
+
+  /**
+   * Resolves the client-reachable Bolt address (host:boltPort) of a peer. Returns the address declared
+   * with the object-form {@code bolt:} field when present; otherwise derives it from the peer's Raft host
+   * plus this node's local Bolt port. The fallback is correct only for homogeneous deployments where every
+   * node listens on the same Bolt port (e.g. a Kubernetes StatefulSet); a one-time WARNING is logged so
+   * operators declare explicit Bolt ports for heterogeneous clusters. Returns {@code null} when the peer is
+   * unknown or the local Bolt port is unavailable.
+   */
+  private String resolveBoltAddress(final RaftPeerId peerId) {
+    if (peerId == null)
+      return null;
+    final String configured = boltAddresses.get(peerId);
+    if (configured != null)
+      return configured;
+    final int localBoltPort = configuration.getValueAsInteger(GlobalConfiguration.BOLT_PORT);
+    final String derived = deriveBoltAddress(peerRaftAddress(peerId), localBoltPort);
+    if (derived != null && boltFallbackWarned.compareAndSet(false, true))
+      LogManager.instance().log(this, Level.WARNING,
+          "HA Bolt routing addresses are not configured in '%s': deriving peer Bolt endpoints from each peer's Raft host plus this node's Bolt port (%d). "
+              + "This is correct only when every node listens on the same Bolt port (e.g. a Kubernetes StatefulSet). For clusters with heterogeneous "
+              + "Bolt ports, declare them explicitly using the 'host:{raft:..,bolt:..}' object syntax in %s.",
+          GlobalConfiguration.HA_SERVER_LIST.getKey(), localBoltPort, GlobalConfiguration.HA_SERVER_LIST.getKey());
+    return derived;
+  }
+
+  /**
+   * Derives a Bolt address (host:boltPort) by combining a peer's Raft host with the given Bolt port.
+   * Returns {@code null} when the port is not positive or the host cannot be extracted. Package-private
+   * for testing.
+   */
+  static String deriveBoltAddress(final String raftAddress, final int boltPort) {
+    if (raftAddress == null || boltPort <= 0)
+      return null;
+    final String host = extractHost(raftAddress);
+    return host != null ? host + ":" + boltPort : null;
   }
 
   private String deriveHttpAddressWithWarning(final String raftAddress) {
@@ -1296,6 +1435,69 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
       }
     }
     return raftGroup.getPeers();
+  }
+
+  /**
+   * Reports whether this node is ready to serve traffic for the readiness probe (issue #4834): a leader is
+   * known, this node is a member of the current Raft configuration, and - for a follower - the local
+   * applied index is within {@code maxLagEntries} of the commit index. The leader is always caught up with
+   * itself. Returns {@code false} before the Raft server has started, during shutdown, or when the state
+   * cannot be read.
+   * <p>
+   * All inputs are read from a single {@code getDivision(...)} snapshot so leader/membership/commit/applied
+   * come from one consistent view rather than re-resolving the division per field (cheaper, and avoids a
+   * torn read if leadership changes mid-evaluation). Membership uses the <em>current</em> configuration
+   * (the most recent conf in the log, which during a joint-consensus change may not yet be committed); that
+   * is conservative for the targeted scenario - a wiped/lagging follower is not in it either way. See
+   * {@link #isReadyForTrafficState} for the pure decision.
+   */
+  public boolean isReadyForTraffic(final long maxLagEntries) {
+    final RaftServer server = raftServer;
+    if (server == null || shutdownRequested)
+      return false;
+    try {
+      final var division = server.getDivision(raftGroup.getGroupId());
+      final var info = division.getInfo();
+      final var conf = division.getRaftConf();
+      final boolean leaderPresent = info.getLeaderId() != null;
+      final boolean localInConfig = conf != null && isPeerInConfig(conf.getCurrentPeers(), localPeerId);
+      final long commitIndex = division.getRaftLog().getLastCommittedIndex();
+      final long appliedIndex = info.getLastAppliedIndex();
+      return isReadyForTrafficState(leaderPresent, localInConfig, info.isLeader(), commitIndex, appliedIndex,
+          maxLagEntries);
+    } catch (final IOException e) {
+      LogManager.instance().log(this, Level.FINE, "Cannot read Raft state for readiness probe", e);
+      return false;
+    }
+  }
+
+  /**
+   * Pure decision function behind {@link #isReadyForTraffic(long)}, split out so the predicate can be
+   * unit-tested without the Ratis state plumbing. Returns {@code true} only when a leader is present and
+   * this node is in the current configuration, and either this node is the leader (caught up with itself by
+   * definition) or - as a follower - the lag {@code commitIndex - appliedIndex} is in
+   * {@code [0, maxLagEntries]}. A negative {@code commitIndex}/{@code appliedIndex} (state not readable this
+   * tick) or a negative lag ({@code appliedIndex > commitIndex}, an inconsistent state) returns
+   * {@code false} so the probe fails closed rather than advertising Ready on unreadable/inconsistent state.
+   */
+  static boolean isReadyForTrafficState(final boolean leaderPresent, final boolean localInConfig,
+      final boolean leader, final long commitIndex, final long appliedIndex, final long maxLagEntries) {
+    if (!leaderPresent || !localInConfig)
+      return false;
+    if (leader)
+      return true;
+    if (commitIndex < 0 || appliedIndex < 0)
+      return false;
+    final long lag = commitIndex - appliedIndex;
+    return lag >= 0 && lag <= maxLagEntries;
+  }
+
+  /** True when {@code peerId} is a member of the given Raft peer set (the current configuration). */
+  private static boolean isPeerInConfig(final Collection<RaftPeer> peers, final RaftPeerId peerId) {
+    for (final RaftPeer peer : peers)
+      if (peer.getId().equals(peerId))
+        return true;
+    return false;
   }
 
   Object getLeaderChangeNotifier() {
@@ -1783,7 +1985,7 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
   private static final int FOLLOWER_STATES_MAX_ATTEMPTS = 3;
 
   /** Returns the leader's follower peer-info list, or an empty list when this node is not a ready leader. */
-  private static List<RaftProtos.ServerRpcProto> leaderFollowerInfos(final org.apache.ratis.server.DivisionInfo info) {
+  private static List<RaftProtos.ServerRpcProto> leaderFollowerInfos(final DivisionInfo info) {
     final RaftProtos.RoleInfoProto roleInfo = info.getRoleInfoProto();
     return roleInfo.hasLeaderInfo() ? roleInfo.getLeaderInfo().getFollowerInfoList() : List.of();
   }
@@ -1875,28 +2077,26 @@ public class RaftHAServer implements HealthMonitor.HealthTarget {
    * Decides whether the Raft storage directory must be preserved across server restarts instead of
    * being wiped and re-FORMATted on every {@link #start()} (issue #4835).
    * <p>
-   * {@link GlobalConfiguration#HA_RAFT_PERSIST_STORAGE} defaults to {@code false} (ephemeral) for
-   * testing convenience, but in Kubernetes the storage normally lives on a PersistentVolume that
-   * outlives the pod. Wiping it on every pod restart forces a full snapshot resync and, on a
-   * single-seed cluster, silently re-forms a fresh empty single-node cluster (data loss / split
-   * brain). So when running under Kubernetes ({@link GlobalConfiguration#HA_K8S}=true) and the
-   * operator has <em>not</em> explicitly opted into ephemeral storage, default to persisting.
-   * An explicit {@code raftPersistStorage=false} is still honored for the rare operator who really
-   * wants ephemeral storage in K8s.
+   * {@link GlobalConfiguration#HA_RAFT_PERSIST_STORAGE} defaults to {@code true} (durable): wiping the
+   * Raft log on restart turns a follower that was merely lagging into a permanently diverged node on a
+   * full-cluster cold restart, and on a single-seed cluster it can silently re-form a fresh empty
+   * single-node cluster (data loss / split brain). Persisting was previously the default only under
+   * Kubernetes (where a PersistentVolume made it essential - issue #4835); it is now the default
+   * everywhere, so the Kubernetes special case has collapsed into the global default.
+   * <p>
+   * An explicit {@code raftPersistStorage=false} is always honored for a throwaway/test cluster that
+   * really wants ephemeral storage. A JVM system property is read directly because a
+   * {@link ContextConfiguration} built after {@link GlobalConfiguration} was initialised does not
+   * necessarily reflect a late {@code System.setProperty}.
    */
   static boolean resolvePersistStorage(final ContextConfiguration configuration) {
-    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_RAFT_PERSIST_STORAGE))
-      return true;
-
-    if (configuration.getValueAsBoolean(GlobalConfiguration.HA_K8S)
-        && !isExplicitlyConfigured(configuration, GlobalConfiguration.HA_RAFT_PERSIST_STORAGE)) {
-      LogManager.instance().log(RaftHAServer.class, Level.INFO,
-          "Kubernetes mode detected: preserving Raft storage across restarts (raftPersistStorage defaulted to true to "
-              + "avoid wiping PersistentVolume-backed storage on pod restart - issue #4835). Set raftPersistStorage=false "
-              + "explicitly to force ephemeral storage.");
-      return true;
+    if (isExplicitlyConfigured(configuration, GlobalConfiguration.HA_RAFT_PERSIST_STORAGE)) {
+      final String sysProp = System.getProperty(GlobalConfiguration.HA_RAFT_PERSIST_STORAGE.getKey());
+      return sysProp != null
+          ? Boolean.parseBoolean(sysProp)
+          : configuration.getValueAsBoolean(GlobalConfiguration.HA_RAFT_PERSIST_STORAGE);
     }
-    return false;
+    return GlobalConfiguration.HA_RAFT_PERSIST_STORAGE.getValueAsBoolean();
   }
 
   /**

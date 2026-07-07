@@ -50,8 +50,18 @@ import com.arcadedb.engine.TransactionManager;
 import com.arcadedb.engine.WALFile;
 import com.arcadedb.engine.WALFileFactory;
 import com.arcadedb.exception.ArcadeDBException;
+import com.arcadedb.exception.CommandExecutionException;
+import com.arcadedb.exception.CommandParsingException;
+import com.arcadedb.exception.CommandSQLParsingException;
+import com.arcadedb.exception.CommandSemanticException;
+import com.arcadedb.exception.DuplicatedKeyException;
+import com.arcadedb.exception.LockTimeoutException;
 import com.arcadedb.exception.NeedRetryException;
+import com.arcadedb.exception.QueryNotIdempotentException;
+import com.arcadedb.exception.SchemaException;
+import com.arcadedb.exception.TimeoutException;
 import com.arcadedb.exception.TransactionException;
+import com.arcadedb.exception.ValidationException;
 import com.arcadedb.graph.Edge;
 import com.arcadedb.graph.GraphBatch;
 import com.arcadedb.graph.GraphEngine;
@@ -88,7 +98,6 @@ import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -99,6 +108,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 
@@ -138,6 +148,43 @@ public class RaftReplicatedDatabase implements DatabaseInternal, HAReplicatedDat
       ThreadLocal.withInitial(ArrayList::new);
 
   private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+
+  /**
+   * Registry of leader-side exception class names to a factory that rebuilds the same type from its
+   * message, used by {@link #reconstructLeaderException} on forwarded-command errors. Reconstructing
+   * the exact type (rather than collapsing to a common supertype) preserves retry semantics for
+   * callers: a {@link com.arcadedb.exception.ConcurrentModificationException} or
+   * {@link LockTimeoutException} stays a {@link NeedRetryException} subtype and therefore retryable,
+   * while a non-retryable {@link TimeoutException} stays distinct instead of being mistaken for a
+   * retryable one. It also lets callers catch the specific type directly.
+   * <p>
+   * Only {@link ArcadeDBException} subtypes with a single {@code (String)} constructor belong here:
+   * non-{@code ArcadeDBException} types (e.g. {@code SecurityException}) would not be caught by the
+   * {@code catch (ArcadeDBException)} on the forwarding path and would be re-wrapped anyway, and
+   * types that need structured arguments (e.g. {@link DuplicatedKeyException}) are reconstructed
+   * explicitly in {@link #reconstructLeaderException}. New entries are safe to add as one line each;
+   * extending this map is preferred over reflectively instantiating an arbitrary class name from the
+   * response. {@link Map#ofEntries} is used (rather than {@link Map#of}) because the latter caps at
+   * ten pairs.
+   * <p>
+   * ArcadeDB's {@code ConcurrentModificationException} is referenced by its fully qualified name, and
+   * {@link java.util.ConcurrentModificationException} is intentionally NOT imported, so that a bare
+   * {@code ConcurrentModificationException} anywhere in this file cannot silently bind to the JDK type
+   * (which the engine never throws) - the root cause of issue #5018.
+   */
+  private static final Map<String, Function<String, RuntimeException>> LEADER_EXCEPTION_FACTORIES = Map.ofEntries(
+      Map.entry(NeedRetryException.class.getName(), NeedRetryException::new),
+      Map.entry(com.arcadedb.exception.ConcurrentModificationException.class.getName(), com.arcadedb.exception.ConcurrentModificationException::new),
+      Map.entry(LockTimeoutException.class.getName(), LockTimeoutException::new),
+      Map.entry(TimeoutException.class.getName(), TimeoutException::new),
+      Map.entry(TransactionException.class.getName(), TransactionException::new),
+      Map.entry(CommandExecutionException.class.getName(), CommandExecutionException::new),
+      Map.entry(CommandParsingException.class.getName(), CommandParsingException::new),
+      Map.entry(CommandSQLParsingException.class.getName(), CommandSQLParsingException::new),
+      Map.entry(CommandSemanticException.class.getName(), CommandSemanticException::new),
+      Map.entry(QueryNotIdempotentException.class.getName(), QueryNotIdempotentException::new),
+      Map.entry(ValidationException.class.getName(), ValidationException::new),
+      Map.entry(SchemaException.class.getName(), SchemaException::new));
 
   /** Poll cadence while waiting for a leader to be (re)elected before forwarding a write (issue #4728 follow-up). */
   private static final long LEADER_WAIT_POLL_INTERVAL_MS = 100;
@@ -386,21 +433,7 @@ public class RaftReplicatedDatabase implements DatabaseInternal, HAReplicatedDat
         if (getSchema().getEmbedded().isDirty())
           getSchema().getEmbedded().saveConfiguration();
       } catch (final Exception e) {
-        if (e instanceof ConcurrentModificationException)
-          LogManager.instance().log(this, Level.SEVERE,
-              """
-              Phase 2 commit failed AFTER successful Raft replication with a page version conflict (db=%s, txId=%s). \
-              A page was concurrently modified under file lock - this may indicate a locking bug. \
-              Followers have applied this transaction but the leader has not. \
-              Stepping down to prevent stale reads. Error: %s""",
-              getName(), payload.tx(), e.getMessage());
-        else
-          LogManager.instance().log(this, Level.SEVERE,
-              """
-              Phase 2 commit failed AFTER successful Raft replication (db=%s, txId=%s). \
-              Followers have applied this transaction but the leader has not. \
-              Stepping down to prevent stale reads. Error: %s""",
-              getName(), payload.tx(), e.getMessage());
+        LogManager.instance().log(this, Level.SEVERE, phase2CommitFailureMessage(e), getName(), payload.tx(), e.getMessage());
         reconcileLeaderPagesAfterPhase2Failure(payload);
         recoverLeadershipAfterPhase2Failure(payload.tx().toString());
         throw e;
@@ -468,6 +501,33 @@ public class RaftReplicatedDatabase implements DatabaseInternal, HAReplicatedDat
 
   private static final int  STEP_DOWN_MAX_RETRIES    = 3;
   private static final long STEP_DOWN_RETRY_DELAY_MS = 500;
+
+  /**
+   * Selects the SEVERE log template for a phase-2 commit failure that happened AFTER Raft had already
+   * replicated the entry (followers applied it, the leader did not). A page-version conflict - the
+   * engine's {@link com.arcadedb.exception.ConcurrentModificationException}, NOT
+   * {@link java.util.ConcurrentModificationException} - gets the more specific wording because it
+   * points at a locking bug rather than an arbitrary failure. Both templates take
+   * {@code (db, txId, errorMessage)} as their three arguments.
+   * <p>
+   * The type test is written against the fully qualified engine exception on purpose: before issue
+   * #5018 the check bound to the JDK {@code java.util.ConcurrentModificationException} (an unrelated
+   * type the engine never throws), so the page-conflict branch was dead and every phase-2 conflict
+   * was logged with the generic wording.
+   */
+  static String phase2CommitFailureMessage(final Throwable e) {
+    if (e instanceof com.arcadedb.exception.ConcurrentModificationException)
+      return """
+          Phase 2 commit failed AFTER successful Raft replication with a page version conflict (db=%s, txId=%s). \
+          A page was concurrently modified under file lock - this may indicate a locking bug. \
+          Followers have applied this transaction but the leader has not. \
+          Stepping down to prevent stale reads. Error: %s""";
+
+    return """
+        Phase 2 commit failed AFTER successful Raft replication (db=%s, txId=%s). \
+        Followers have applied this transaction but the leader has not. \
+        Stepping down to prevent stale reads. Error: %s""";
+  }
 
   /**
    * Attempts to bring the leader's pages into sync with the committed Raft entry after
@@ -1691,11 +1751,10 @@ public class RaftReplicatedDatabase implements DatabaseInternal, HAReplicatedDat
     try {
       final HttpResponse<String> response = HTTP_CLIENT.send(builder.build(), HttpResponse.BodyHandlers.ofString());
       if (response.statusCode() != 200)
-        throw new TransactionException(
-            "Leader returned HTTP " + response.statusCode() + " for forwarded command: " + response.body());
+        throw reconstructLeaderException(response.statusCode(), response.body());
 
       return parseResultSetFromJson(response.body());
-    } catch (final TransactionException e) {
+    } catch (final ArcadeDBException e) {
       throw e;
     } catch (final InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -1757,5 +1816,55 @@ public class RaftReplicatedDatabase implements DatabaseInternal, HAReplicatedDat
     }
 
     return resultSet;
+  }
+
+  /**
+   * Parses the JSON error body returned by the leader and reconstructs the original exception so
+   * the Follower throws the same type the Leader would have thrown locally. For example, a
+   * {@link DuplicatedKeyException} is reconstructed with its index name, keys, and existing RID so
+   * callers can catch it directly instead of having to inspect a generic
+   * {@link TransactionException} message string. Other known types are reconstructed via
+   * {@link #LEADER_EXCEPTION_FACTORIES} to keep their exact type (and retry semantics).
+   * <p>
+   * If the body is non-JSON, empty, or the exception class is not recognised, a generic
+   * {@link TransactionException} wrapping the full response body is returned as a safe fallback.
+   */
+  static RuntimeException reconstructLeaderException(final int httpStatus, final String body) {
+    final String message = "Leader returned HTTP " + httpStatus + " for forwarded command: " + body;
+    String detail = null;
+    String exceptionClass = null;
+    String exceptionArgs = null;
+
+    try {
+      if (body != null && !body.isEmpty()) {
+        final JSONObject json = new JSONObject(body);
+        detail = json.getString("detail", json.getString("error", null));
+        exceptionClass = json.getString("exception", null);
+        exceptionArgs = json.getString("exceptionArgs", null);
+      }
+    } catch (final Exception ignored) {
+      return new TransactionException(message);
+    }
+
+    if (exceptionClass == null)
+      return new TransactionException(message);
+
+    // DuplicatedKeyException carries structured args (index name, keys, existing RID), so it is
+    // reconstructed explicitly rather than from a plain message.
+    if (DuplicatedKeyException.class.getName().equals(exceptionClass) && exceptionArgs != null) {
+      final String[] parts = exceptionArgs.split("\\|", 3);
+      if (parts.length == 3)
+        try {
+          return new DuplicatedKeyException(parts[0], parts[1], new RID(parts[2]));
+        } catch (final Exception ignored) {
+          // fall through if the RID token is malformed
+        }
+    }
+
+    final Function<String, RuntimeException> factory = LEADER_EXCEPTION_FACTORIES.get(exceptionClass);
+    if (factory != null)
+      return factory.apply(detail != null ? detail : message);
+
+    return new TransactionException(message);
   }
 }

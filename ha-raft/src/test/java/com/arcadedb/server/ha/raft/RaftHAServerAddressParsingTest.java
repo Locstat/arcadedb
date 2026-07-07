@@ -276,4 +276,124 @@ class RaftHAServerAddressParsingTest {
     final var parsed = RaftPeerAddressResolver.parsePeerList("alpha@myhost:9999", 2434);
     assertThat(parsed.peers().get(0).getId().toString()).isEqualTo("myhost_9999");
   }
+
+  // --- Issue #4838: HA_K8S_DNS_SUFFIX must be applied to peer addresses, not only to the self host ---
+
+  @Test
+  void k8sSuffixAppendedToShortPeerHosts() {
+    // Short pod names with a K8s DNS suffix must be expanded to the cluster-internal FQDN so peers resolve.
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "arcadedb-0:2434:2480,arcadedb-1:2434:2480", 2434, ".arcadedb.default.svc.cluster.local");
+    final var peer0 = parsed.peers().get(0);
+    final var peer1 = parsed.peers().get(1);
+    assertThat(peer0.getAddress()).isEqualTo("arcadedb-0.arcadedb.default.svc.cluster.local:2434");
+    assertThat(peer1.getAddress()).isEqualTo("arcadedb-1.arcadedb.default.svc.cluster.local:2434");
+    assertThat(parsed.httpAddresses()).containsEntry(peer0.getId(), "arcadedb-0.arcadedb.default.svc.cluster.local:2480");
+    assertThat(parsed.httpAddresses()).containsEntry(peer1.getId(), "arcadedb-1.arcadedb.default.svc.cluster.local:2480");
+  }
+
+  @Test
+  void k8sSuffixReflectedInPeerId() {
+    // The peer ID is derived from the (now-qualified) Raft address.
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "arcadedb-0:2434:2480", 2434, ".arcadedb.default.svc.cluster.local");
+    assertThat(parsed.peers().get(0).getId().toString())
+        .isEqualTo("arcadedb-0.arcadedb.default.svc.cluster.local_2434");
+  }
+
+  @Test
+  void k8sSuffixAppendedInObjectFormAndToHttps() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "arcadedb-0:{raft:2434,http:2480,https:2490}", 2434, ".svc.local");
+    final var peer = parsed.peers().get(0);
+    assertThat(peer.getAddress()).isEqualTo("arcadedb-0.svc.local:2434");
+    assertThat(parsed.httpAddresses()).containsEntry(peer.getId(), "arcadedb-0.svc.local:2480");
+    assertThat(parsed.httpsAddresses()).containsEntry(peer.getId(), "arcadedb-0.svc.local:2490");
+  }
+
+  @Test
+  void k8sSuffixIsIdempotentWhenHostAlreadyQualified() {
+    // An operator who already wrote FQDNs must not get the suffix appended twice.
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "arcadedb-0.svc.local:2434:2480", 2434, ".svc.local");
+    assertThat(parsed.peers().get(0).getAddress()).isEqualTo("arcadedb-0.svc.local:2434");
+  }
+
+  @Test
+  void k8sSuffixSkippedForIpLiteral() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "10.0.0.5:2434:2480", 2434, ".svc.local");
+    assertThat(parsed.peers().get(0).getAddress()).isEqualTo("10.0.0.5:2434");
+  }
+
+  @Test
+  void k8sSuffixSkippedForLocalhost() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "localhost:2434:2480", 2434, ".svc.local");
+    assertThat(parsed.peers().get(0).getAddress()).isEqualTo("localhost:2434");
+  }
+
+  @Test
+  void emptyK8sSuffixLeavesHostsUnchanged() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList(
+        "arcadedb-0:2434:2480", 2434, "");
+    assertThat(parsed.peers().get(0).getAddress()).isEqualTo("arcadedb-0:2434");
+  }
+
+  @Test
+  void legacyTwoArgParsePeerListLeavesHostsUnchanged() {
+    // The 2-arg overload must behave exactly as before (no suffix).
+    final var parsed = RaftPeerAddressResolver.parsePeerList("arcadedb-0:2434:2480", 2434);
+    assertThat(parsed.peers().get(0).getAddress()).isEqualTo("arcadedb-0:2434");
+  }
+
+  @Test
+  void objectFormParsesBoltPort() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList("myhost:{raft:2434,http:2480,bolt:7687}", 2434);
+    final var peerId = parsed.peers().get(0).getId();
+    assertThat(parsed.boltAddresses()).containsEntry(peerId, "myhost:7687");
+    assertThat(parsed.httpAddresses()).containsEntry(peerId, "myhost:2480");
+  }
+
+  @Test
+  void objectFormWithoutBoltLeavesBoltAddressesEmpty() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList("myhost:{raft:2434,http:2480}", 2434);
+    assertThat(parsed.boltAddresses()).isEmpty();
+  }
+
+  @Test
+  void positionalFormNeverPopulatesBoltAddresses() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList("myhost:2434:2480:7:2490", 2434);
+    assertThat(parsed.boltAddresses()).isEmpty();
+  }
+
+  @Test
+  void namedObjectFormParsesBoltPort() {
+    final var parsed = RaftPeerAddressResolver.parsePeerList("alpha@myhost:{raft:2434,bolt:7690}", 2434);
+    final var peerId = parsed.peers().get(0).getId();
+    assertThat(parsed.boltAddresses()).containsEntry(peerId, "myhost:7690");
+    assertThat(parsed.peerNames()).containsEntry(peerId, "alpha");
+  }
+
+  @Test
+  void unknownObjectKeyStillThrows() {
+    assertThatThrownBy(() -> RaftPeerAddressResolver.parsePeerList("myhost:{raft:2434,ftp:21}", 2434))
+        .isInstanceOf(ServerException.class);
+  }
+
+  @Test
+  void deriveBoltAddressCombinesRaftHostWithBoltPort() {
+    assertThat(RaftHAServer.deriveBoltAddress("db1:2434", 7687)).isEqualTo("db1:7687");
+  }
+
+  @Test
+  void deriveBoltAddressReturnsNullForNonPositivePort() {
+    assertThat(RaftHAServer.deriveBoltAddress("db1:2434", 0)).isNull();
+    assertThat(RaftHAServer.deriveBoltAddress("db1:2434", -1)).isNull();
+  }
+
+  @Test
+  void deriveBoltAddressHandlesIpv6Literal() {
+    assertThat(RaftHAServer.deriveBoltAddress("[::1]:2434", 7687)).isEqualTo("[::1]:7687");
+  }
 }
