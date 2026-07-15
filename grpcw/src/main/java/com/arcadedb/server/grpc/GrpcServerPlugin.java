@@ -44,6 +44,7 @@ import io.micrometer.core.instrument.Metrics;
 import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 
 /**
@@ -64,12 +65,17 @@ import java.util.logging.Level;
  */
 public class GrpcServerPlugin implements ServerPlugin {
 
-  private ArcadeDBServer      arcadeServer;
-  private Server              grpcServer;
-  private Server              xdsServer;
-  private HealthStatusManager healthManager;
-  private ArcadeDbGrpcService grpcService;  // Keep reference for cleanup
-  private Thread              shutdownHook;
+  private          ArcadeDBServer      arcadeServer;
+  private volatile Server              grpcServer;
+  private volatile Server              xdsServer;
+  private volatile HealthStatusManager healthManager;
+  private volatile ArcadeDbGrpcService grpcService;  // Keep reference for cleanup
+  private volatile Thread              shutdownHook;
+
+  // Guards stopService() so the JVM shutdown hook and the plugin-lifecycle stop cannot run the cleanup twice. The
+  // plugin is intentionally single-use: stop is terminal and is never reset, matching the create-once/destroy-once
+  // ServerPlugin lifecycle. Restart-in-place is not supported (it would require nulling grpcService/healthManager too).
+  private final AtomicBoolean stopped = new AtomicBoolean(false);
 
   // Configuration keys as simple strings
   private static final String CONFIG_PREFIX              = "arcadedb.grpc.";
@@ -82,6 +88,9 @@ public class GrpcServerPlugin implements ServerPlugin {
   private static final String CONFIG_TLS_CERT            = CONFIG_PREFIX + "tls.cert";
   private static final String CONFIG_TLS_KEY             = CONFIG_PREFIX + "tls.key";
   private static final String CONFIG_MAX_MESSAGE_SIZE    = CONFIG_PREFIX + "maxMessageSize";
+  private static final String CONFIG_MAX_METADATA_SIZE   = CONFIG_PREFIX + "maxMetadataSize";
+  private static final String CONFIG_MAX_CONCURRENT_TX   = CONFIG_PREFIX + "maxConcurrentTransactions";
+  private static final String CONFIG_MAX_CONCURRENT_TX_PER_PRINCIPAL = CONFIG_PREFIX + "maxConcurrentTransactionsPerPrincipal";
   private static final String CONFIG_REFLECTION_ENABLED  = CONFIG_PREFIX + "reflection.enabled";
   private static final String CONFIG_HEALTH_ENABLED      = CONFIG_PREFIX + "health.enabled";
   private static final String CONFIG_COMPRESSION_ENABLED = CONFIG_PREFIX + "compression.enabled";
@@ -153,9 +162,10 @@ public class GrpcServerPlugin implements ServerPlugin {
     // Configure the server
     configureServer(serverBuilder, config);
 
+    // Inbound message size is set from grpc.maxMessageSize inside configureServer(); do not override it here so the
+    // configured limit wins. The metadata cap is lowered from the former 32MB to a sane, configurable value.
     grpcServer = serverBuilder
-        .maxInboundMessageSize(256 * 1024 * 1024)
-        .maxInboundMetadataSize(32 * 1024 * 1024)
+        .maxInboundMetadataSize(getMaxMetadataSizeBytes(config))
         .build().start();
 
     // Build status message
@@ -185,37 +195,53 @@ public class GrpcServerPlugin implements ServerPlugin {
   private void startXdsServer(ContextConfiguration config) throws IOException {
     int port = getConfigInt(config, CONFIG_XDS_PORT, 50052);
 
-    // XDS server for service mesh integration
-    // XdsServerBuilder requires ServerCredentials
-    XdsServerBuilder xdsBuilder = XdsServerBuilder.forPort(port, InsecureServerCredentials.create());
+    // XDS server for service mesh integration. Credentials are derived from grpc.tls.* and fail closed when TLS is
+    // requested but misconfigured, so xds/both modes honor TLS instead of always running insecure.
+    final ServerCredentials xdsCredentials = resolveXdsCredentials(config);
+    XdsServerBuilder xdsBuilder = XdsServerBuilder.forPort(port, xdsCredentials);
 
     // Configure the XDS server as a ServerBuilder
     configureServer(xdsBuilder, config);
 
     xdsServer = xdsBuilder
-        .maxInboundMessageSize(256 * 1024 * 1024)
-        .maxInboundMetadataSize(32 * 1024 * 1024)
+        .maxInboundMetadataSize(getMaxMetadataSizeBytes(config))
         .build().start();
 
     LogManager.instance().log(this, Level.INFO, "gRPC XDS server started on port %s (xDS management enabled)", port);
   }
 
-  private void configureServer(ServerBuilder<?> serverBuilder, ContextConfiguration config) {
+  // synchronized so the check-then-act initialization of the shared grpcService/healthManager fields stays thread-safe
+  // even though this method is package-private (invoked from tests); in production startService drives it sequentially.
+  synchronized void configureServer(ServerBuilder<?> serverBuilder, ContextConfiguration config) {
 
     // Get database directory path
     String databasePath = arcadeServer.getRootPath() + File.separator + "databases";
 
-    // Idle-transaction reaper thresholds (issue #4802): reclaim abandoned transactions left open by clients that
-    // disconnected without committing or rolling back.
-    final long txMaxIdleMs = getConfigLong(config, CONFIG_TX_MAX_IDLE_MS, ArcadeDbGrpcService.DEFAULT_TX_MAX_IDLE_MS);
-    final long txMaxAgeMs = getConfigLong(config, CONFIG_TX_MAX_AGE_MS, ArcadeDbGrpcService.DEFAULT_TX_MAX_AGE_MS);
-    final long txReaperPeriodMs = getConfigLong(config, CONFIG_TX_REAPER_PERIOD_MS,
-        ArcadeDbGrpcService.DEFAULT_TX_REAPER_PERIOD_MS);
+    // Build the main service only once and reuse it across every server builder. In "both" mode this method is
+    // invoked twice (standard + xDS); constructing a fresh service per call would start a second idle-transaction
+    // reaper thread and a second transaction registry that stopService() would never close, leaking both (issue #5050).
+    if (this.grpcService == null) {
+      // Idle-transaction reaper thresholds (issue #4802): reclaim abandoned transactions left open by clients that
+      // disconnected without committing or rolling back.
+      final long txMaxIdleMs = getConfigLong(config, CONFIG_TX_MAX_IDLE_MS, ArcadeDbGrpcService.DEFAULT_TX_MAX_IDLE_MS);
+      final long txMaxAgeMs = getConfigLong(config, CONFIG_TX_MAX_AGE_MS, ArcadeDbGrpcService.DEFAULT_TX_MAX_AGE_MS);
+      final long txReaperPeriodMs = getConfigLong(config, CONFIG_TX_REAPER_PERIOD_MS,
+          ArcadeDbGrpcService.DEFAULT_TX_REAPER_PERIOD_MS);
 
-    // Create the main service and store reference for cleanup
-    this.grpcService = new ArcadeDbGrpcService(databasePath, arcadeServer, txMaxIdleMs, txMaxAgeMs, txReaperPeriodMs);
+      // Concurrent-transaction caps (issue #5048): bound the per-transaction executor allocation so an authenticated
+      // client cannot loop beginTransaction to exhaust threads/memory. A non-positive value disables the corresponding bound.
+      final int maxConcurrentTx = getConfigInt(config, CONFIG_MAX_CONCURRENT_TX,
+          ArcadeDbGrpcService.DEFAULT_MAX_CONCURRENT_TX);
+      final int maxConcurrentTxPerPrincipal = getConfigInt(config, CONFIG_MAX_CONCURRENT_TX_PER_PRINCIPAL,
+          ArcadeDbGrpcService.DEFAULT_MAX_CONCURRENT_TX_PER_PRINCIPAL);
 
-    // Add the main service
+      this.grpcService = new ArcadeDbGrpcService(databasePath, arcadeServer, txMaxIdleMs, txMaxAgeMs, txReaperPeriodMs,
+          maxConcurrentTx, maxConcurrentTxPerPrincipal);
+    }
+
+    // Add the main service. In "both" mode the same BindableService instance is added to both the standard and xDS
+    // builders; gRPC calls bindService() per server at build time, so sharing one service (and thus one tx registry
+    // and reaper) across both transports is safe and is exactly the intended semantics.
     serverBuilder.addService(grpcService);
 
     // Create the Admin service
@@ -224,16 +250,18 @@ public class GrpcServerPlugin implements ServerPlugin {
     // Add the Admin service
     serverBuilder.addService(adminService);
 
-    // Add health service if enabled
+    // Add health service if enabled. Reuse a single manager across both server builders (issue #5050).
     if (getConfigBoolean(config, CONFIG_HEALTH_ENABLED, true)) {
-      healthManager = new HealthStatusManager();
-      serverBuilder.addService(healthManager.getHealthService());
+      if (healthManager == null) {
+        healthManager = new HealthStatusManager();
 
-      // Set initial health status
-      healthManager.setStatus(
-          ArcadeDbGrpcService.class.getName(),
-          HealthCheckResponse.ServingStatus.SERVING
-      );
+        // Set initial health status
+        healthManager.setStatus(
+            ArcadeDbGrpcService.class.getName(),
+            HealthCheckResponse.ServingStatus.SERVING
+        );
+      }
+      serverBuilder.addService(healthManager.getHealthService());
     }
 
     // Add reflection service if enabled
@@ -244,10 +272,12 @@ public class GrpcServerPlugin implements ServerPlugin {
     serverBuilder.compressorRegistry(CompressorRegistry.getDefaultInstance())
         .decompressorRegistry(DecompressorRegistry.getDefaultInstance());
 
-    // Configure max message size
-    int maxMessageSizeMB = getConfigInt(config, CONFIG_MAX_MESSAGE_SIZE, 100);
+    // Configure max message size. Clamp the lower bound to 1 MB (a non-positive value would be rejected by gRPC at
+    // startup) and compute in long so a large MB value (>= 2048) does not overflow int and wrap negative.
+    final int maxMessageSizeMB = Math.max(1, getConfigInt(config, CONFIG_MAX_MESSAGE_SIZE, 100));
+    final long maxMessageSizeBytes = (long) maxMessageSizeMB * 1024 * 1024;
 
-    serverBuilder.maxInboundMessageSize(maxMessageSizeMB * 1024 * 1024);
+    serverBuilder.maxInboundMessageSize((int) Math.min(maxMessageSizeBytes, Integer.MAX_VALUE));
 
     // Add interceptors for logging, metrics, auth, etc.
     serverBuilder.intercept(new GrpcLoggingInterceptor());
@@ -277,59 +307,65 @@ public class GrpcServerPlugin implements ServerPlugin {
   }
 
   private NettyServerBuilder configureStandardTls(int port, ContextConfiguration config) {
-    String certPath = getConfigString(config, CONFIG_TLS_CERT, null);
-    String keyPath = getConfigString(config, CONFIG_TLS_KEY, null);
-
-    if (certPath == null || keyPath == null) {
-      LogManager.instance()
-          .log(this, Level.WARNING, "TLS enabled but certificate or key path not provided. Falling back to insecure.");
-      return NettyServerBuilder.forPort(port);
-    }
-
-    File certFile = new File(certPath);
-    File keyFile = new File(keyPath);
-
-    if (!certFile.exists() || !keyFile.exists()) {
-      LogManager.instance().log(this, Level.WARNING, "TLS certificate or key file not found. Falling back to insecure.");
-      return NettyServerBuilder.forPort(port);
-    }
-
+    final File[] certKey = resolveTlsCertKey(config);
     try {
       // Configure Netty with TLS using SslContext
       return NettyServerBuilder.forPort(port)
           .sslContext(GrpcSslContexts
-              .forServer(certFile, keyFile)
+              .forServer(certKey[0], certKey[1])
               .build());
-    } catch (Exception e) {
-      LogManager.instance().log(this, Level.SEVERE, "Failed to configure TLS", e);
-      return NettyServerBuilder.forPort(port);
+    } catch (final Exception e) {
+      // Fail closed: TLS was explicitly requested, so refuse to start rather than downgrade to cleartext.
+      throw new SecurityException(
+          "gRPC TLS is enabled but the SSL context could not be built from cert '" + certKey[0] + "' and key '" + certKey[1]
+              + "'. Refusing to start with cleartext.", e);
     }
   }
 
   private ServerCredentials configureTlsCredentials(ContextConfiguration config) {
-    String certPath = getConfigString(config, CONFIG_TLS_CERT, null);
-    String keyPath = getConfigString(config, CONFIG_TLS_KEY, null);
-
-    if (certPath == null || keyPath == null) {
-      LogManager.instance()
-          .log(this, Level.WARNING, "TLS enabled but certificate or key path not provided. Using insecure credentials.");
-      return InsecureServerCredentials.create();
-    }
-
-    File certFile = new File(certPath);
-    File keyFile = new File(keyPath);
-
-    if (!certFile.exists() || !keyFile.exists()) {
-      LogManager.instance().log(this, Level.WARNING, "TLS certificate or key file not found. Using insecure credentials.");
-      return InsecureServerCredentials.create();
-    }
-
+    final File[] certKey = resolveTlsCertKey(config);
     try {
-      return TlsServerCredentials.create(certFile, keyFile);
-    } catch (Exception e) {
-      LogManager.instance().log(this, Level.SEVERE, "Failed to configure TLS credentials", e);
-      return InsecureServerCredentials.create();
+      return TlsServerCredentials.create(certKey[0], certKey[1]);
+    } catch (final Exception e) {
+      // Fail closed: TLS was explicitly requested, so refuse to start rather than downgrade to cleartext.
+      throw new SecurityException(
+          "gRPC TLS is enabled but TLS server credentials could not be built from cert '" + certKey[0] + "' and key '"
+              + certKey[1] + "'. Refusing to start with cleartext.", e);
     }
+  }
+
+  /**
+   * Resolves and validates the configured TLS certificate/key when TLS is enabled. Fails closed: a request for TLS
+   * with a missing path or absent file throws instead of silently downgrading to cleartext, so the server never
+   * accepts plaintext while an operator believes TLS is active.
+   */
+  private File[] resolveTlsCertKey(ContextConfiguration config) {
+    final String certPath = getConfigString(config, CONFIG_TLS_CERT, null);
+    final String keyPath = getConfigString(config, CONFIG_TLS_KEY, null);
+
+    if (certPath == null || keyPath == null)
+      throw new SecurityException("gRPC TLS is enabled (" + CONFIG_TLS_ENABLED + "=true) but the certificate ("
+          + CONFIG_TLS_CERT + ") or key (" + CONFIG_TLS_KEY + ") path is not configured. Refusing to start with cleartext.");
+
+    final File certFile = new File(certPath);
+    final File keyFile = new File(keyPath);
+
+    if (!certFile.exists() || !keyFile.exists())
+      throw new SecurityException("gRPC TLS is enabled but the certificate or key file does not exist (cert='" + certPath
+          + "', key='" + keyPath + "'). Refusing to start with cleartext.");
+
+    return new File[] { certFile, keyFile };
+  }
+
+  /**
+   * Derives the XDS server credentials from {@code grpc.tls.*}. When TLS is enabled the credentials are built
+   * fail-closed from the configured cert/key; when TLS is disabled the XDS transport is intentionally insecure and
+   * relies on the service mesh to provide mTLS at the transport layer.
+   */
+  private ServerCredentials resolveXdsCredentials(ContextConfiguration config) {
+    if (getConfigBoolean(config, CONFIG_TLS_ENABLED, false))
+      return configureTlsCredentials(config);
+    return InsecureServerCredentials.create();
   }
 
   private void registerShutdownHook() {
@@ -342,6 +378,11 @@ public class GrpcServerPlugin implements ServerPlugin {
 
   @Override
   public void stopService() {
+    // Idempotency / concurrency guard: the JVM shutdown hook and the plugin-lifecycle stop may both call this. Only
+    // the first invocation performs the cleanup; later ones return immediately (issue #5050).
+    if (!stopped.compareAndSet(false, true))
+      return;
+
     try {
       // Update health status to NOT_SERVING
       if (healthManager != null) {
@@ -444,6 +485,20 @@ public class GrpcServerPlugin implements ServerPlugin {
       }
     }
     return defaultValue;
+  }
+
+  /**
+   * Resolves the inbound metadata cap in bytes from {@code grpc.maxMetadataSize} (KB, default 16). gRPC headers are
+   * small; a cap far above a few KB only invites metadata-flood memory pressure. A non-positive configured value is
+   * clamped to 1 KB.
+   */
+  int getMaxMetadataSizeBytes(ContextConfiguration config) {
+    final int kb = getConfigInt(config, CONFIG_MAX_METADATA_SIZE, 16);
+    // Guard against int overflow for an absurdly large configured value (kb * 1024 would wrap negative and make
+    // gRPC reject the builder at startup).
+    if (kb >= Integer.MAX_VALUE / 1024)
+      return Integer.MAX_VALUE;
+    return Math.max(1, kb) * 1024;
   }
 
   private boolean getConfigBoolean(ContextConfiguration config, String key, boolean defaultValue) {

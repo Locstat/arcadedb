@@ -53,7 +53,9 @@ import com.arcadedb.graph.Edge;
 import com.arcadedb.graph.GraphBatch;
 import com.arcadedb.graph.GraphEngine;
 import com.arcadedb.graph.GraphTraversalProviderRegistry;
+import com.arcadedb.graph.MutableEdgeSegment;
 import com.arcadedb.graph.MutableVertex;
+import com.arcadedb.graph.StripeDirectory;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.graph.VertexInternal;
 import com.arcadedb.graph.olap.GraphAnalyticalView;
@@ -1018,6 +1020,13 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
       transaction.updateRecordInCache(record);
       transaction.updateBucketRecordDelta(bucket.getFileId(), +1);
 
+      // A brand-new edge chunk cannot be edge-append rebased: the committed version of its page does not contain
+      // this chunk yet, so replaying appends against it would target the wrong bytes. Exclude the whole page
+      // (it may be shared with a pre-existing chunk) from the commutative append merge. Same for a new stripe
+      // directory (super-node promotion, #5156). See TransactionContext.
+      if (record instanceof MutableEdgeSegment || record instanceof StripeDirectory)
+        transaction.poisonEdgeAppendPage(record.getIdentity());
+
       // TRACK USER DOCUMENTS (NOT INTERNAL RECORDS LIKE EDGE SEGMENTS) SO A ROLLBACK CAN RESET THEIR IDENTITY AND ALLOW
       // A CLEAN RE-INSERT INSTEAD OF AN UPDATE OF A MISSING RECORD (ISSUE #4562).
       if (record instanceof MutableDocument)
@@ -1339,7 +1348,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
           // concurrency-induced duplicate can succeed on retry, and one retry is enough to disambiguate:
           // fail fast instead of burning all the remaining attempts plus their retry delays.
           //
-          // #5061 review: a TRANSIENT duplicate from an in-flight sibling transaction that later rolls back
+          // #5061: a TRANSIENT duplicate from an in-flight sibling transaction that later rolls back
           // is unreachable - checkUniqueIndexKeys reads committed pages plus THIS transaction's own overlay
           // (TransactionIndexContext is per-transaction), so uncommitted sibling entries are invisible and a
           // detected duplicate is always against durable state (or this same transaction). The one retry
@@ -1496,7 +1505,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
       final Object[] destinationVertexKeyValues, final boolean createVertexIfNotExist,
       final String edgeType,
       final boolean bidirectional, final Object... properties) {
-    if (!bidirectional && ((EdgeType) schema.getType(edgeType)).isBidirectional())
+    if (!bidirectional && schema.getType(edgeType) instanceof EdgeType type && type.isBidirectional())
       throw new IllegalArgumentException("Edge type '" + edgeType + "' is not bidirectional");
 
     return newEdgeByKeys(sourceVertex, destinationVertexType, destinationVertexKeyNames, destinationVertexKeyValues,
@@ -2039,10 +2048,53 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
   }
 
   private void closeInternal(final boolean drop) {
+    // Graceful async drain FIRST, with the caller's interrupt flag INTACT so an interrupted caller bails
+    // this wait fast; the warning distinguishes an interrupt from a real timeout.
     if (async != null) {
       try {
         // EXECUTE OUTSIDE LOCK
-        async.waitCompletion();
+        // #5080: bound the graceful drain so a worker wedged inside a user task or callback cannot make
+        // close()/drop() hang forever. On expiry, closeDurableParts() below force-shuts the workers (that
+        // path is itself bounded: FORCE_EXIT offer + interrupt + a ~10s join, escalated to a second one).
+        final long asyncCloseTimeout = configuration.getValueAsLong(GlobalConfiguration.ASYNC_CLOSE_TIMEOUT);
+        if (!async.waitCompletion(asyncCloseTimeout)) {
+          // waitCompletion also returns false when the caller thread is interrupted (it re-sets the flag
+          // and returns), not only on timeout - distinguish the two so the message is accurate and never
+          // prints "within 0 ms" for the wait-forever (interrupt) case.
+          if (Thread.currentThread().isInterrupted())
+            LogManager.instance().log(this, Level.WARNING, """
+                Interrupted while draining the asynchronous tasks of database '%s' on close: forcing the \
+                async workers down. A task blocked inside user code may not have completed""", name);
+          else
+            LogManager.instance().log(this, Level.WARNING, """
+                Asynchronous tasks of database '%s' did not drain within %d ms on close: forcing the async \
+                workers down. A task blocked inside user code may not have completed""", name, asyncCloseTimeout);
+        }
+      } catch (final Throwable e) {
+        LogManager.instance()
+            .log(this, Level.WARNING, """
+                Error while draining the asynchronous manager during closing operation for database \
+                '%s'""", e, name);
+      }
+    }
+
+    // #5105 review: the DURABLE part of the close (async force-shutdown + the page flush in
+    // executeInWriteLock) uses INTERRUPTIBLE steps - the bounded FORCE_EXIT offer/join, and PageManager
+    // throws InterruptedIOException on a set flag. A set interrupt would therefore skip interrupting a
+    // wedged worker AND truncate the flush into a needless crash-equivalent close. Run it all with the
+    // flag CLEARED (unconditionally, so async == null is covered too) and restore it for the caller after.
+    final boolean callerWasInterrupted = Thread.interrupted();
+    try {
+      closeDurableParts(drop);
+    } finally {
+      if (callerWasInterrupted)
+        Thread.currentThread().interrupt();
+    }
+  }
+
+  private void closeDurableParts(final boolean drop) {
+    if (async != null) {
+      try {
         async.close();
       } catch (final Throwable e) {
         LogManager.instance()
@@ -2202,7 +2254,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
     // Unconditional on purpose: a KILLED database (crash simulation) reaches close() with open == false and
     // must still unregister - removeActiveDatabaseInstance is naturally idempotent (false on the second
     // call), which is exactly how the pre-#4927 code stayed double-close-safe. The executor teardown stays
-    // on the map-emptiness heuristic DELIBERATELY (#5070 review): unlike the flush thread, a shutdown
+    // on the map-emptiness heuristic DELIBERATELY (#5070): unlike the flush thread, a shutdown
     // executor lazily re-creates itself on the next getExecutor(), so the mid-flight-open race self-heals.
     // A redundant double-close of the LAST database calls it twice (the empty map returns true again):
     // harmless, closeExecutor() is idempotent (early-returns on null/isShutdown under its class lock).
@@ -2212,7 +2264,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
     // #4927: paired with the acquire in DatabaseFactory.open/create - the flush machinery is torn down by
     // the refcount reaching zero, never by the racy "was this the last registered instance" check (an open
     // in flight on another thread holds a reference before it registers, so it can no longer be pulled out
-    // from under). The atomic flag makes the release EXACTLY ONCE per database instance (#5070 review): a
+    // from under). The atomic flag makes the release EXACTLY ONCE per database instance (#5070): a
     // redundant double-close cannot steal another database's reference, and when registerActiveInstance
     // closes a same-path open race loser, the factory's catch sees the flag and does not release again.
     if (pageManagerReferenceReleased.compareAndSet(false, true))
@@ -2360,7 +2412,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
   }
 
   /**
-   * #5053 review: set when a commit fails AFTER its transaction was appended to the WAL (the point of no
+   * #5053: set when a commit fails AFTER its transaction was appended to the WAL (the point of no
    * return) but BEFORE its pages were published. From that moment the WAL and the live state diverge: the
    * transaction is durable (recovery will replay it) but invisible, and letting new transactions run would
    * let them bump the same page versions and append conflicting WAL records for the same target versions.
@@ -2394,7 +2446,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
     if (!open)
       throw new DatabaseIsClosedException(name);
     if (fenceReason != null)
-      // #5053 review: a commit failed AFTER its WAL append - the WAL holds a record whose pages were never
+      // #5053: a commit failed AFTER its WAL append - the WAL holds a record whose pages were never
       // published, so the live in-memory state diverges from what recovery will reconstruct. Every further
       // operation is fenced until the database is closed (the close-time ack gate preserves the WAL, since
       // the orphaned record's pages were never flush-acked) and reopened, which replays the record.

@@ -405,6 +405,12 @@ public class MatchNodeStep extends AbstractExecutionStep {
 
         final DocumentType type = context.getDatabase().getSchema().getType(label);
 
+        // A non-vertex type with the same name (edge/document type) matches no node pattern: labels
+        // and relationship types are separate namespaces in Cypher, so yield 0 rows instead of
+        // failing with a ClassCastException while casting edges to vertices (issue #5194)
+        if (!(type instanceof VertexType))
+          return Collections.emptyIterator();
+
         // OPTIMIZATION: Check if we can use an index for property lookup
         if (type != null && pattern.hasProperties() && !pattern.getProperties().isEmpty()) {
           // Try to find an index that matches the property constraints
@@ -414,10 +420,15 @@ public class MatchNodeStep extends AbstractExecutionStep {
             return indexedIter;
         }
 
-        // OPTIMIZATION: Check if WHERE clause has equality predicates that can use an index
-        // This is critical for UNWIND...MATCH...WHERE patterns where the predicate references
-        // an UNWIND variable (e.g., WHERE a.id = e.src_id)
-        if (type != null && whereFilter != null && currentInputResult != null) {
+        // OPTIMIZATION: Check if WHERE clause has equality predicates that can use an index.
+        // Runs for both input-driven MATCH (e.g. UNWIND...MATCH...WHERE a.id = e.src_id, where the
+        // predicate references an UNWIND variable) and a leading/seed MATCH with a constant or
+        // parameter predicate (WHERE p.id = 42), which has no input row. Without this, a write
+        // statement whose leading MATCH is routed to the legacy path (e.g. MATCH...CREATE...CREATE)
+        // would full-scan the type instead of using the unique index (issue #5107). Predicate values
+        // that cannot be resolved without an input row are skipped inside extractEqualityPredicates,
+        // falling back to the full scan + row-level whereFilter, so correctness is preserved.
+        if (type != null && whereFilter != null) {
           final Iterator<Identifiable> indexedIter = tryFindAndUseIndexFromWhere(type, label, currentInputResult);
           if (indexedIter != null)
             return indexedIter;
@@ -812,10 +823,17 @@ public class MatchNodeStep extends AbstractExecutionStep {
       }
 
       if (propertyName != null && valueExpr != null) {
-        // Resolve the value expression
-        final Object resolvedValue = evaluator.evaluate(valueExpr, currentInputResult, context);
-        if (resolvedValue != null)
-          predicates.put(propertyName, resolvedValue);
+        // Resolve the value expression. Literals and $parameters resolve without an input row; a
+        // predicate referencing an unbound variable (e.g. a leading MATCH with no input row) cannot
+        // be resolved and is skipped for index selection - the query then falls back to the full
+        // scan + row-level whereFilter, which is always correct (issue #5107).
+        try {
+          final Object resolvedValue = evaluator.evaluate(valueExpr, currentInputResult, context);
+          if (resolvedValue != null)
+            predicates.put(propertyName, resolvedValue);
+        } catch (final Exception e) {
+          // Unresolvable predicate value: skip it for index selection (correctness preserved by whereFilter).
+        }
       }
     } else if (expr instanceof LogicalExpression) {
       final LogicalExpression logical = (LogicalExpression) expr;

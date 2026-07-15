@@ -24,6 +24,7 @@ import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.LocalDatabase;
 import com.arcadedb.database.RID;
+import com.arcadedb.database.Record;
 import com.arcadedb.database.async.DatabaseAsyncExecutor;
 import com.arcadedb.engine.Dictionary;
 import com.arcadedb.engine.LocalBucket;
@@ -1064,6 +1065,10 @@ public class GraphBatch implements AutoCloseable {
       final long vertexKey = packVertexKey(srcBucket, srcPos);
       final EdgeSegment outChunk = getOrCreateOutSegmentDeferred(srcBucket, srcPos, vertexKey, totalBytesNeeded);
 
+      // NOTE (edge-append merge): this bulk path intentionally neither tracks (trackEdgeAppend) nor poisons
+      // its chunk pages. That is safe only because a GraphBatch transaction never also drives
+      // EdgeLinkedList.add on the same page, so a bulk-written page can't coexist with a tracked append in one
+      // tx and be wrongly rebased at commit. If that ever changes, poison these pages. See docs/supernode.md §3.
       if (lastSegmentIsNew) {
         // New segment: fill FIRST, then persist ONCE (no updateRecord needed)
         outChunk.addManyAtEndDirect(tmpEdgeBucketIds, tmpEdgePositions,
@@ -1503,9 +1508,14 @@ public class GraphBatch implements AutoCloseable {
       final VertexInternal vertex = (VertexInternal) database.lookupByRID(new RID(bucketId, position), true);
       final RID headChunk = vertex.getOutEdgesHeadChunk();
       if (headChunk != null) {
+        final Record head = database.lookupByRID(headChunk, true);
+        if (head instanceof StripeDirectory)
+          // The bulk path manipulates the vertex head pointer directly and would corrupt a striped layout.
+          throw new IllegalStateException("Bulk edge import into the super-node promoted vertex " + vertex.getIdentity()
+              + " is not supported: use the standard API or disable promotion (arcadedb.graph.supernodeThreshold=0)");
         outChunkRIDCache.put(vertexKey, headChunk);
         lastSegmentIsNew = false;
-        return (EdgeSegment) database.lookupByRID(headChunk, true);
+        return (EdgeSegment) head;
       }
     }
 
@@ -1532,9 +1542,13 @@ public class GraphBatch implements AutoCloseable {
       final VertexInternal vertex = (VertexInternal) database.lookupByRID(new RID(bucketId, position), true);
       final RID headChunk = vertex.getInEdgesHeadChunk();
       if (headChunk != null) {
+        final Record head = database.lookupByRID(headChunk, true);
+        if (head instanceof StripeDirectory)
+          throw new IllegalStateException("Bulk edge import into the super-node promoted vertex " + vertex.getIdentity()
+              + " is not supported: use the standard API or disable promotion (arcadedb.graph.supernodeThreshold=0)");
         inChunkRIDCache.put(vertexKey, headChunk);
         lastSegmentIsNew = false;
-        return (EdgeSegment) database.lookupByRID(headChunk, true);
+        return (EdgeSegment) head;
       }
     }
 

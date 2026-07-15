@@ -23,10 +23,16 @@ import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.function.StatelessFunction;
 import com.arcadedb.function.graph.IdFunction;
 import com.arcadedb.graph.Vertex;
+import com.arcadedb.query.opencypher.ast.ArithmeticExpression;
+import com.arcadedb.query.opencypher.ast.BooleanCoercionExpression;
 import com.arcadedb.query.opencypher.ast.BooleanExpression;
+import com.arcadedb.query.opencypher.ast.BooleanWrapperExpression;
 import com.arcadedb.query.opencypher.ast.CallClause;
+import com.arcadedb.query.opencypher.ast.CaseAlternative;
+import com.arcadedb.query.opencypher.ast.CaseExpression;
 import com.arcadedb.query.opencypher.ast.ClauseEntry;
 import com.arcadedb.query.opencypher.ast.ComparisonExpression;
+import com.arcadedb.query.opencypher.ast.ComparisonExpressionWrapper;
 import com.arcadedb.query.opencypher.ast.CreateClause;
 import com.arcadedb.query.opencypher.ast.CypherStatement;
 import com.arcadedb.query.opencypher.ast.DeleteClause;
@@ -34,9 +40,16 @@ import com.arcadedb.query.opencypher.ast.Direction;
 import com.arcadedb.query.opencypher.ast.Expression;
 import com.arcadedb.query.opencypher.ast.ForeachClause;
 import com.arcadedb.query.opencypher.ast.FunctionCallExpression;
+import com.arcadedb.query.opencypher.ast.InExpression;
+import com.arcadedb.query.opencypher.ast.IsNullExpression;
+import com.arcadedb.query.opencypher.ast.LabelCheckExpression;
+import com.arcadedb.query.opencypher.ast.ListExpression;
+import com.arcadedb.query.opencypher.ast.ListIndexExpression;
+import com.arcadedb.query.opencypher.ast.ListSliceExpression;
 import com.arcadedb.query.opencypher.ast.LiteralExpression;
 import com.arcadedb.query.opencypher.ast.LoadCSVClause;
 import com.arcadedb.query.opencypher.ast.LogicalExpression;
+import com.arcadedb.query.opencypher.ast.MapExpression;
 import com.arcadedb.query.opencypher.ast.MatchClause;
 import com.arcadedb.query.opencypher.ast.MergeClause;
 import com.arcadedb.query.opencypher.ast.OrderByClause;
@@ -51,7 +64,10 @@ import com.arcadedb.query.opencypher.ast.ReturnClause;
 import com.arcadedb.query.opencypher.ast.SetClause;
 import com.arcadedb.query.opencypher.ast.ShortestPathPattern;
 import com.arcadedb.query.opencypher.ast.StarExpression;
+import com.arcadedb.query.opencypher.ast.RegexExpression;
+import com.arcadedb.query.opencypher.ast.StringMatchExpression;
 import com.arcadedb.query.opencypher.ast.SubqueryClause;
+import com.arcadedb.query.opencypher.ast.TernaryLogicalExpression;
 import com.arcadedb.query.opencypher.ast.UnwindClause;
 import com.arcadedb.query.opencypher.ast.VariableExpression;
 import com.arcadedb.query.opencypher.ast.WhereClause;
@@ -99,6 +115,7 @@ import com.arcadedb.query.opencypher.executor.steps.ZeroLengthPathStep;
 import com.arcadedb.query.opencypher.optimizer.plan.PhysicalPlan;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.EdgeType;
+import com.arcadedb.schema.VertexType;
 import com.arcadedb.query.sql.executor.AbstractExecutionStep;
 import com.arcadedb.query.sql.executor.BasicCommandContext;
 import com.arcadedb.query.sql.executor.CommandContext;
@@ -304,15 +321,14 @@ public class CypherExecutionPlan {
    * Used by CALL subqueries to inject outer scope variables into the inner query.
    * The seed row provides variables that the inner query's WITH clause can import.
    *
-   * @param seedRow the initial row providing outer scope variables
+   * @param seedRow      the initial row providing outer scope variables
+   * @param outerContext the outer command context whose QueryStatistics accumulator is shared
+   *                     with the inner query's context, so writes performed inside the CALL
+   *                     subquery are folded into the outer plan's statistics. May be {@code null}.
    *
    * @return result set from the inner query execution
    */
-  public ResultSet executeWithSeedRow(final Result seedRow) {
-    // Limitation: each branch/inner plan runs with its own BasicCommandContext, so QueryStatistics
-    // from writes performed inside this CALL subquery are not aggregated into the outer plan's
-    // statistics. The ResultSet returned to the caller only reflects top-level mutation steps.
-
+  public ResultSet executeWithSeedRow(final Result seedRow, final CommandContext outerContext) {
     // Handle UNION inside CALL subqueries: execute each branch with the seed row
     if (statement instanceof UnionStatement unionStmt) {
       final List<CypherExecutionPlan> branchPlans = new ArrayList<>();
@@ -329,7 +345,7 @@ public class CypherExecutionPlan {
       final List<ResultInternal> allResults = new ArrayList<>();
       final Set<String> seen = removeDuplicates ? new HashSet<>() : null;
       for (final CypherExecutionPlan branchPlan : branchPlans) {
-        final ResultSet rs = branchPlan.executeWithSeedRow(seedRow);
+        final ResultSet rs = branchPlan.executeWithSeedRow(seedRow, outerContext);
         while (rs.hasNext()) {
           final Result row = rs.next();
           if (removeDuplicates) {
@@ -350,6 +366,11 @@ public class CypherExecutionPlan {
     context.setDatabase(database);
     context.setInputParameters(parameters);
     setupFunctionResolver(context);
+    // Only share the outer statistics accumulator for a write CALL body: getStatistics() lazily
+    // allocates, so sharing it unconditionally would allocate a QueryStatistics even for a
+    // fully read-only CALL, violating the "read queries allocate nothing" constraint.
+    if (outerContext != null && !statement.isReadOnly())
+      context.setStatistics(outerContext.getStatistics());
 
     // Create a seed step that returns the seed row
     final AbstractExecutionStep seedStep = new AbstractExecutionStep(context) {
@@ -404,10 +425,6 @@ public class CypherExecutionPlan {
    * @return combined result set
    */
   private ResultSet executeUnion() {
-    // Limitation: each UNION branch executes as its own sub-plan with its own QueryStatistics, so
-    // write statistics from inside a branch are not aggregated into the combined ResultSet's
-    // statistics; only top-level mutation steps outside the UNION are reflected there.
-
     // Use UnionStep to combine results from all subqueries
     final BasicCommandContext context = new BasicCommandContext();
     context.setDatabase(database);
@@ -417,7 +434,26 @@ public class CypherExecutionPlan {
     final UnionStep unionStep =
         new UnionStep(unionSubqueryPlans, unionRemoveDuplicates, context);
 
-    return unionStep.syncPull(context, 100);
+    // Read UNION: stay lazy/streaming, no statistics to surface.
+    if (statement.isReadOnly())
+      return unionStep.syncPull(context, 100);
+
+    // Write UNION: materialize to force each branch's mutation steps to execute (mirroring the
+    // non-union write path), then surface the summed per-branch statistics.
+    final ResultSet rs = unionStep.syncPull(context, 100);
+    final List<Result> rows = new ArrayList<>();
+    try {
+      while (rs.hasNext())
+        rows.add(rs.next());
+    } finally {
+      rs.close();
+    }
+    final IteratorResultSet out = new IteratorResultSet(rows.iterator());
+    // Always attach the accumulator for a write UNION, even when no branch actually mutated
+    // anything (aggregated.containsUpdates() false then): presence signals "this was a write",
+    // mirroring the non-union write path above.
+    out.setStatistics(unionStep.getAggregatedStatistics());
+    return out;
   }
 
   /**
@@ -577,6 +613,11 @@ public class CypherExecutionPlan {
     }
 
     results.setPlan(new OpenCypherExplainExecutionPlan(profileOutput.toString(), executionSteps, endTime - startTime));
+    // Surface the CRUD-count accumulator built up by the mutation steps during the profiled run,
+    // mirroring execute()'s write path so a profiled write still reports its counters. Read-only
+    // statements never attach a statistics accumulator, matching execute()'s read path.
+    if (!statement.isReadOnly())
+      results.setStatistics(context.getStatistics());
     return results;
   }
 
@@ -669,7 +710,7 @@ public class CypherExecutionPlan {
         case REMOVE: {
           final RemoveClause removeClause = entry.getTypedClause();
           if (!removeClause.isEmpty()) {
-            final RemoveStep removeStep = new RemoveStep(removeClause, context);
+            final RemoveStep removeStep = new RemoveStep(removeClause, context, functionFactory);
             removeStep.setPrevious(currentStep);
             currentStep = removeStep;
           }
@@ -1089,7 +1130,7 @@ public class CypherExecutionPlan {
         final RemoveClause removeClause = entry.getTypedClause();
         if (!removeClause.isEmpty() && currentStep != null) {
           final RemoveStep removeStep =
-              new RemoveStep(removeClause, context);
+              new RemoveStep(removeClause, context, functionFactory);
           removeStep.setPrevious(currentStep);
           currentStep = removeStep;
         }
@@ -1428,10 +1469,21 @@ public class CypherExecutionPlan {
       return currentStep;
     }
 
-    final List<PathPattern> pathPatterns = matchClause.getPathPatterns();
     final AbstractExecutionStep stepBeforeMatch = currentStep;
     final Set<String> matchVariables = new HashSet<>();
     final boolean isOptional = matchClause.isOptional();
+
+    // Reorder independent (disconnected) comma-separated pattern parts so the expensive edge-bearing
+    // component drives the Cartesian product as the outer loop regardless of the written order
+    // (issue #5117). The legacy path chains parts left-deep and re-executes every later part once per
+    // outer row; writing a cheap standalone node first would otherwise re-run an expensive traversal
+    // once per node. Scoped to a leading, non-optional MATCH (no prior input row) so it never
+    // interacts with input-driven reverse-traversal or OPTIONAL null semantics. Cartesian product is
+    // commutative, so the result set is unchanged.
+    final List<PathPattern> pathPatterns = (!isOptional && stepBeforeMatch == null
+        && matchClause.getPathPatterns().size() > 1)
+        ? reorderIndependentComponents(matchClause.getPathPatterns())
+        : matchClause.getPathPatterns();
 
     // Extract ID filters from WHERE clause (if present) for pushdown optimization
     final WhereClause whereClause = matchClause.hasWhereClause() ? matchClause.getWhereClause() :
@@ -1792,6 +1844,182 @@ public class CypherExecutionPlan {
     boundVariables.addAll(matchVariables);
 
     return currentStep;
+  }
+
+  /**
+   * Reorders the comma-separated pattern parts of a MATCH so that independent (disconnected)
+   * components are evaluated cheapest-to-recompute last (issue #5117).
+   * <p>
+   * Parts that share at least one node variable belong to the same connected component and keep
+   * their written order (intra-component order drives the reverse-traversal / bound-variable
+   * optimizations and must be preserved). Independent components are stable-sorted by descending
+   * relationship count: an edge-bearing component is more expensive to re-execute and typically more
+   * selective, so it must drive the left-deep nested-loop Cartesian product as the outer loop, while
+   * cheap standalone-node components become the inner loop that is re-scanned per outer row.
+   * <p>
+   * The Cartesian product of disconnected parts is commutative, so the returned order yields the same
+   * result set. When there is a single connected component the input list is returned unchanged.
+   * <p>
+   * Safety gate: reordering is only attempted when every part is <i>structurally pure</i> - it has no
+   * inline node/relationship properties, no dynamic labels, and no inline relationship WHERE. Those
+   * are the only places one part can reference a variable defined by another part (e.g. the
+   * correlated {@code MATCH (person), (p:Person {name: person.name})...} rewrite emitted by
+   * {@code COUNT { ... }}). Such a reference is a data dependency that forbids moving the referencing
+   * part ahead of its producer; when any part is impure we conservatively keep the written order. The
+   * top-level WHERE is intentionally ignored here because it is re-applied by a filter step after the
+   * whole match chain, so it never constrains the safe ordering.
+   */
+  private static List<PathPattern> reorderIndependentComponents(final List<PathPattern> pathPatterns) {
+    final int n = pathPatterns.size();
+
+    // Node variables per pattern part (anonymous nodes never bridge two parts). Bail out entirely if
+    // any part is impure, since an inline expression could reference another part's variable.
+    final List<Set<String>> partVars = new ArrayList<>(n);
+    for (final PathPattern part : pathPatterns) {
+      if (!isStructurallyPure(part))
+        return pathPatterns;
+      final Set<String> vars = new HashSet<>();
+      for (final NodePattern node : part.getNodes())
+        if (node.getVariable() != null)
+          vars.add(node.getVariable());
+      partVars.add(vars);
+    }
+
+    // Union-find: connect parts sharing at least one node variable.
+    final int[] parent = new int[n];
+    for (int i = 0; i < n; i++)
+      parent[i] = i;
+    for (int i = 0; i < n; i++)
+      for (int j = i + 1; j < n; j++)
+        if (!Collections.disjoint(partVars.get(i), partVars.get(j)))
+          parent[find(parent, i)] = find(parent, j);
+
+    // Group parts by component root, preserving first-appearance order within each component.
+    final LinkedHashMap<Integer, List<Integer>> components = new LinkedHashMap<>();
+    for (int i = 0; i < n; i++)
+      components.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(i);
+
+    // Order the parts inside every component so the most selective occurrence of a shared variable
+    // binds first (issue #5116). A node variable may repeat across single-node parts with different
+    // label constraints (e.g. (n0), (n0:L1:L5)); chaining the bare occurrence first would bind n0 to
+    // every node (full scan) and only afterwards filter by the labels. Stable-sorting the single-node
+    // parts by descending label count lifts the labeled occurrence ahead of the bare one, so the
+    // variable is bound to the small label class and the bare occurrence is then skipped. Relationship
+    // parts (the traversal spine) keep their absolute positions, so this never reorders a traversal.
+    for (final List<Integer> component : components.values())
+      reorderSingleNodePartsBySelectivity(pathPatterns, component);
+
+    if (components.size() < 2)
+      return rebuild(pathPatterns, components.values()); // single component: only within-part order changed
+
+    // Stable sort components by descending relationship count, then by descending label count so the
+    // more selective component drives the Cartesian product as the outer loop. The label-count
+    // tie-break makes the chosen order independent of the textual order (issue #5116): two disconnected
+    // node components (0 relationships each) that differ only in their label constraints would otherwise
+    // be left in written order, so swapping them changed which one re-scanned per outer row. Only when
+    // both counts tie do we fall back to the earliest original index.
+    final List<List<Integer>> ordered = new ArrayList<>(components.values());
+    ordered.sort((a, b) -> {
+      final int wa = componentRelationshipCount(pathPatterns, a);
+      final int wb = componentRelationshipCount(pathPatterns, b);
+      if (wa != wb)
+        return Integer.compare(wb, wa);
+      final int la = componentLabelCount(pathPatterns, a);
+      final int lb = componentLabelCount(pathPatterns, b);
+      if (la != lb)
+        return Integer.compare(lb, la);
+      return Integer.compare(a.get(0), b.get(0));
+    });
+
+    return rebuild(pathPatterns, ordered);
+  }
+
+  private static List<PathPattern> rebuild(final List<PathPattern> pathPatterns,
+      final Iterable<List<Integer>> ordered) {
+    final List<PathPattern> result = new ArrayList<>(pathPatterns.size());
+    for (final List<Integer> component : ordered)
+      for (final int idx : component)
+        result.add(pathPatterns.get(idx));
+    return result;
+  }
+
+  /**
+   * Reorders the single-node parts of a component in place so the ones carrying more labels come
+   * first, while relationship-bearing parts keep their absolute positions. Stable within equal label
+   * counts, so the outcome is independent of the textual order of otherwise-equivalent occurrences.
+   */
+  private static void reorderSingleNodePartsBySelectivity(final List<PathPattern> pathPatterns,
+      final List<Integer> component) {
+    // Collect the positions occupied by single-node parts and the part indices sitting in them.
+    final List<Integer> slots = new ArrayList<>();
+    final List<Integer> singleNodeParts = new ArrayList<>();
+    for (int pos = 0; pos < component.size(); pos++) {
+      final int partIndex = component.get(pos);
+      if (pathPatterns.get(partIndex).isSingleNode()) {
+        slots.add(pos);
+        singleNodeParts.add(partIndex);
+      }
+    }
+    if (singleNodeParts.size() < 2)
+      return; // nothing to reorder
+
+    // Stable sort the single-node parts by descending label count (most selective first).
+    singleNodeParts.sort((a, b) -> Integer.compare(
+        pathPatterns.get(b).getFirstNode().getLabels().size(),
+        pathPatterns.get(a).getFirstNode().getLabels().size()));
+
+    // Refill the single-node slots in the new order; relationship parts stay where they were.
+    for (int i = 0; i < slots.size(); i++)
+      component.set(slots.get(i), singleNodeParts.get(i));
+  }
+
+  private static int componentLabelCount(final List<PathPattern> pathPatterns, final List<Integer> component) {
+    int count = 0;
+    for (final int idx : component)
+      for (final NodePattern node : pathPatterns.get(idx).getNodes())
+        count += node.getLabels().size();
+    return count;
+  }
+
+  /**
+   * A pattern part is <i>structurally pure</i> when it carries no inline node/relationship properties,
+   * no dynamic labels, and no inline relationship WHERE. Only these constructs can embed an expression
+   * that references another part's variable, so a pure part can never depend on a sibling part and is
+   * always safe to reorder. Static labels, relationship types, direction and variable-length bounds do
+   * not reference row variables and are ignored.
+   */
+  private static boolean isStructurallyPure(final PathPattern part) {
+    for (final NodePattern node : part.getNodes()) {
+      if (node.hasProperties() || node.getPropertiesParameterName() != null || node.hasDynamicLabels())
+        return false;
+    }
+    for (int i = 0; i < part.getRelationshipCount(); i++) {
+      final RelationshipPattern rel = part.getRelationship(i);
+      if (rel.hasProperties() || rel.getPropertiesParameterName() != null || rel.hasWhereExpression())
+        return false;
+    }
+    return true;
+  }
+
+  private static int componentRelationshipCount(final List<PathPattern> pathPatterns, final List<Integer> component) {
+    int count = 0;
+    for (final int idx : component)
+      count += pathPatterns.get(idx).getRelationshipCount();
+    return count;
+  }
+
+  private static int find(final int[] parent, final int x) {
+    int root = x;
+    while (parent[root] != root)
+      root = parent[root];
+    // Path compression.
+    int node = x;
+    while (parent[node] != root) {
+      final int next = parent[node];
+      parent[node] = root;
+      node = next;
+    }
+    return root;
   }
 
   /**
@@ -2303,7 +2531,7 @@ public class CypherExecutionPlan {
     // Step 6a: REMOVE clauses - remove properties
     for (final RemoveClause removeClause : statement.getRemoveClauses()) {
       if (!removeClause.isEmpty() && currentStep != null) {
-        final RemoveStep removeStep = new RemoveStep(removeClause, context);
+        final RemoveStep removeStep = new RemoveStep(removeClause, context, functionFactory);
         removeStep.setPrevious(currentStep);
         currentStep = removeStep;
       }
@@ -3113,15 +3341,12 @@ public class CypherExecutionPlan {
     } else
       return null;
 
-    // Grouping expressions must not reference the counted variable
-    if (countArgVar != null) {
-      for (final ReturnClause.ReturnItem item : groupingItems) {
-        final String text = item.getExpression().getText();
-        // Check for exact variable reference or property access (e.g., "a" or "a.name")
-        if (text.equals(countArgVar) || text.startsWith(countArgVar + "."))
-          return null;
-      }
-    }
+    // Grouping expressions are evaluated on the anchor row only, so they must not reference
+    // any other variable (the counted node, a named relationship, etc.). Anything else must
+    // fall back to the general GroupByAggregationStep that sees the fully expanded rows (#5206).
+    for (final ReturnClause.ReturnItem item : groupingItems)
+      if (!referencesOnlyVariable(item.getExpression(), anchorVar))
+        return null;
 
     // Edge types
     final List<String> relTypes = relPattern.getTypes();
@@ -3164,6 +3389,100 @@ public class CypherExecutionPlan {
         expressionEvaluator != null ? expressionEvaluator.getFunctionFactory() : null);
     countStep.setPrevious(nodeStep);
     return countStep;
+  }
+
+  /**
+   * Returns true only if the expression is guaranteed to reference no variable other than
+   * {@code allowedVar}. Used to validate the count-edges fast path (#5206): grouping
+   * expressions are evaluated on the anchor row alone, so a reference to any other pattern
+   * variable (counted node, named relationship) would silently evaluate to null. Unknown
+   * expression types are conservatively treated as referencing other variables.
+   */
+  private static boolean referencesOnlyVariable(final Expression expr, final String allowedVar) {
+    if (expr == null)
+      return true;
+    if (expr instanceof LiteralExpression || expr instanceof ParameterExpression || expr instanceof StarExpression)
+      return true;
+    if (expr instanceof VariableExpression varExpr)
+      return varExpr.getVariableName().equals(allowedVar);
+    if (expr instanceof PropertyAccessExpression propAccess)
+      return propAccess.getVariableName().equals(allowedVar);
+    if (expr instanceof FunctionCallExpression funcExpr) {
+      for (final Expression arg : funcExpr.getArguments())
+        if (!referencesOnlyVariable(arg, allowedVar))
+          return false;
+      return true;
+    }
+    if (expr instanceof ArithmeticExpression arith)
+      return referencesOnlyVariable(arith.getLeft(), allowedVar) && referencesOnlyVariable(arith.getRight(), allowedVar);
+    if (expr instanceof CaseExpression caseExpr) {
+      if (!referencesOnlyVariable(caseExpr.getCaseExpression(), allowedVar))
+        return false;
+      for (final CaseAlternative alternative : caseExpr.getAlternatives())
+        if (!referencesOnlyVariable(alternative.getWhenExpression(), allowedVar)
+            || !referencesOnlyVariable(alternative.getThenExpression(), allowedVar))
+          return false;
+      return referencesOnlyVariable(caseExpr.getElseExpression(), allowedVar);
+    }
+    if (expr instanceof ListExpression listExpr) {
+      for (final Expression element : listExpr.getElements())
+        if (!referencesOnlyVariable(element, allowedVar))
+          return false;
+      return true;
+    }
+    if (expr instanceof ListIndexExpression listIndex)
+      return referencesOnlyVariable(listIndex.getListExpression(), allowedVar)
+          && referencesOnlyVariable(listIndex.getIndexExpression(), allowedVar);
+    if (expr instanceof ListSliceExpression listSlice)
+      return referencesOnlyVariable(listSlice.getListExpression(), allowedVar)
+          && referencesOnlyVariable(listSlice.getFromExpression(), allowedVar)
+          && referencesOnlyVariable(listSlice.getToExpression(), allowedVar);
+    if (expr instanceof MapExpression mapExpr) {
+      for (final Expression value : mapExpr.getEntries().values())
+        if (!referencesOnlyVariable(value, allowedVar))
+          return false;
+      return true;
+    }
+    if (expr instanceof TernaryLogicalExpression ternary)
+      return referencesOnlyVariable(ternary.getLeft(), allowedVar) && referencesOnlyVariable(ternary.getRight(), allowedVar);
+    if (expr instanceof BooleanWrapperExpression boolWrapper)
+      return booleanReferencesOnlyVariable(boolWrapper.getBooleanExpression(), allowedVar);
+    if (expr instanceof ComparisonExpressionWrapper compWrapper)
+      return booleanReferencesOnlyVariable(compWrapper.getComparison(), allowedVar);
+    // Unknown expression type: assume it may reference other variables
+    return false;
+  }
+
+  private static boolean booleanReferencesOnlyVariable(final BooleanExpression expr, final String allowedVar) {
+    if (expr == null)
+      return true;
+    if (expr instanceof ComparisonExpression comp)
+      return referencesOnlyVariable(comp.getLeft(), allowedVar) && referencesOnlyVariable(comp.getRight(), allowedVar);
+    if (expr instanceof LogicalExpression logical)
+      return booleanReferencesOnlyVariable(logical.getLeft(), allowedVar)
+          && booleanReferencesOnlyVariable(logical.getRight(), allowedVar);
+    if (expr instanceof IsNullExpression isNull)
+      return referencesOnlyVariable(isNull.getExpression(), allowedVar);
+    if (expr instanceof BooleanCoercionExpression coercion)
+      return referencesOnlyVariable(coercion.getExpression(), allowedVar);
+    if (expr instanceof InExpression inExpr) {
+      if (!referencesOnlyVariable(inExpr.getExpression(), allowedVar))
+        return false;
+      for (final Expression element : inExpr.getList())
+        if (!referencesOnlyVariable(element, allowedVar))
+          return false;
+      return true;
+    }
+    if (expr instanceof StringMatchExpression strMatch)
+      return referencesOnlyVariable(strMatch.getExpression(), allowedVar)
+          && referencesOnlyVariable(strMatch.getPattern(), allowedVar);
+    if (expr instanceof RegexExpression regex)
+      return referencesOnlyVariable(regex.getExpression(), allowedVar)
+          && referencesOnlyVariable(regex.getPattern(), allowedVar);
+    if (expr instanceof LabelCheckExpression labelCheck)
+      return referencesOnlyVariable(labelCheck.getVariableExpression(), allowedVar);
+    // Unknown boolean expression type: assume it may reference other variables
+    return false;
   }
 
   /**
@@ -3215,6 +3534,15 @@ public class CypherExecutionPlan {
     if (!nodePattern.hasLabels())
       return null;
 
+    // Only a single label can be counted with the O(1) countType() shortcut. A multi-label
+    // conjunction pattern (n:A:B) has no single type representing "instanceOf A AND instanceOf B"
+    // (each label maps to its own supertype, and the composite type also carries any other
+    // labels the node was created with), so counting by the first label alone would over-count
+    // (issue #5084). Multi-label (and label-disjunction) patterns fall back to the regular
+    // materialization path, which filters on every label correctly.
+    if (nodePattern.getLabels().size() != 1 || nodePattern.isLabelDisjunction())
+      return null;
+
     // Node must not have property constraints
     if (nodePattern.hasProperties())
       return null;
@@ -3223,8 +3551,16 @@ public class CypherExecutionPlan {
     if (variable == null)
       return null;
 
-    // Get the first label (for simplicity, use the first one if multiple labels exist)
     final String typeName = nodePattern.getLabels().get(0);
+
+    // MATCH (n:Label) matches only vertices. If the label collides with an existing edge or
+    // document type (labels and relationship types are separate namespaces in Cypher), the O(1)
+    // countType() shortcut would wrongly count those edges/documents. Fall back to the regular
+    // path (MatchNodeStep), which yields 0 rows for a non-vertex label. A non-existent type is
+    // left to TypeCountStep, which already returns 0 for it (issue #5226, consistent with #5194).
+    if (context.getDatabase().getSchema().existsType(typeName)
+        && !(context.getDatabase().getSchema().getType(typeName) instanceof VertexType))
+      return null;
 
     // Must have RETURN clause
     if (statement.getReturnClause() == null)
@@ -3295,6 +3631,18 @@ public class CypherExecutionPlan {
 
     if (statement.getMergeClause() != null)
       return null;
+
+    // Reject any remaining clause type that the typed accessors above do not cover (FOREACH,
+    // CALL, SUBQUERY, LOAD_CSV, FINISH, ...). These can carry write side effects (e.g. a
+    // FOREACH ... CREATE) or alter the result set, and short-circuiting to a bare TypeCountStep
+    // would silently discard them (issue #5166: FOREACH CREATE nodes were never persisted).
+    // The optimization is only valid for a query made of exactly the single MATCH and the RETURN.
+    if (statement.getClausesInOrder() != null)
+      for (final ClauseEntry clause : statement.getClausesInOrder()) {
+        final ClauseEntry.ClauseType type = clause.getType();
+        if (type != ClauseEntry.ClauseType.MATCH && type != ClauseEntry.ClauseType.RETURN)
+          return null;
+      }
 
     // All conditions met - create optimized TypeCountStep
     final String outputAlias = returnItem.getOutputName();
@@ -3472,10 +3820,20 @@ public class CypherExecutionPlan {
           break;
         }
         case SET: {
+          // The edge variable can be the assignment target (SET r.prop = ...) or appear inside the
+          // value/target expression (SET u.x = CASE WHEN r IS NOT NULL ...). Checking only the target
+          // variable dropped the edge binding when it was used solely on the right-hand side (issue #5137).
           final SetClause sc = entry.getTypedClause();
-          for (final SetClause.SetItem item : sc.getItems())
+          for (final SetClause.SetItem item : sc.getItems()) {
             if (variable.equals(item.getVariable()))
               return true;
+            if (item.getValueExpression() != null
+                && expressionReferencesVariable(item.getValueExpression().getText(), variable))
+              return true;
+            if (item.getTargetExpression() != null
+                && expressionReferencesVariable(item.getTargetExpression().getText(), variable))
+              return true;
+          }
           break;
         }
         case REMOVE: {

@@ -45,6 +45,7 @@ import com.arcadedb.exception.NeedRetryException;
 import com.arcadedb.exception.SchemaException;
 import com.arcadedb.function.FunctionDefinition;
 import com.arcadedb.function.FunctionLibraryDefinition;
+import com.arcadedb.function.FunctionLibraryFactory;
 import com.arcadedb.index.Index;
 import com.arcadedb.index.IndexException;
 import com.arcadedb.index.IndexFactory;
@@ -189,6 +190,8 @@ public class LocalSchema implements Schema {
     indexMap.clear();
     dictionary = null;
 
+    SortedIndexBuildRecoveryMarker.recoverInterruptedBuilds(database, mode);
+
     final Collection<ComponentFile> filesToOpen = database.getFileManager().getFiles();
 
     // REGISTER THE DICTIONARY FIRST
@@ -263,6 +266,7 @@ public class LocalSchema implements Schema {
 
   @Override
   public void setDateFormat(final String dateFormat) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_DATABASE_SETTINGS);
     this.dateFormat = dateFormat;
   }
 
@@ -273,6 +277,7 @@ public class LocalSchema implements Schema {
 
   @Override
   public void setDateTimeFormat(final String dateTimeFormat) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_DATABASE_SETTINGS);
     this.dateTimeFormat = dateTimeFormat;
   }
 
@@ -284,6 +289,7 @@ public class LocalSchema implements Schema {
 
   @Override
   public void setExtension(final String name, final JSONObject value) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
     if (value == null)
       extensions.remove(name);
     else
@@ -330,6 +336,15 @@ public class LocalSchema implements Schema {
 
       files.set(fileId, null);
     }
+
+    final Integer replacementFileId = migratedFileIds.get(fileId);
+    for (final Map.Entry<Integer, Integer> migration : migratedFileIds.entrySet())
+      if (migration.getValue() == fileId) {
+        if (replacementFileId != null)
+          migratedFileIds.replace(migration.getKey(), fileId, replacementFileId);
+        else
+          migratedFileIds.remove(migration.getKey(), fileId);
+      }
 
     database.getTransaction().removeFile(fileId);
   }
@@ -698,6 +713,8 @@ public class LocalSchema implements Schema {
 
   @Override
   public synchronized void dropMaterializedView(final String viewName) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
+
     final MaterializedViewImpl view = materializedViews.get(viewName);
     if (view == null)
       throw new SchemaException("Materialized view '" + viewName + "' not found");
@@ -728,6 +745,8 @@ public class LocalSchema implements Schema {
   @Override
   public synchronized void alterMaterializedView(final String viewName, final MaterializedViewRefreshMode newMode,
       final long newIntervalMs) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
+
     final MaterializedViewImpl oldView = materializedViews.get(viewName);
     if (oldView == null)
       throw new SchemaException("Materialized view '" + viewName + "' not found");
@@ -781,6 +800,8 @@ public class LocalSchema implements Schema {
 
   @Override
   public synchronized void dropContinuousAggregate(final String name) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
+
     final ContinuousAggregateImpl ca = continuousAggregates.get(name);
     if (ca == null)
       throw new SchemaException("Continuous aggregate '" + name + "' not found");
@@ -1845,6 +1866,34 @@ public class LocalSchema implements Schema {
         }
       }
 
+      // Load user-defined function libraries (DEFINE FUNCTION, issue #5121). Only persistable libraries (js/sql/cypher)
+      // are stored, so drop any previously loaded persistable library and rebuild from the schema file, while keeping
+      // libraries registered programmatically from native Java code (getLanguage() == null).
+      functionLibraries.values().removeIf(l -> l.getLanguage() != null);
+      if (root.has("functions")) {
+        final JSONObject functionsJSON = root.getJSONObject("functions");
+        for (final String libraryName : functionsJSON.keySet()) {
+          try {
+            final JSONObject libraryJSON = functionsJSON.getJSONObject(libraryName);
+            final String language = libraryJSON.getString("language");
+            final FunctionLibraryDefinition library = FunctionLibraryFactory.createLibrary(database, libraryName, language);
+
+            final JSONObject funcsJSON = libraryJSON.getJSONObject("functions");
+            for (final String funcName : funcsJSON.keySet()) {
+              final JSONObject funcJSON = funcsJSON.getJSONObject(funcName);
+              final String[] params = funcJSON.getJSONArray("parameters").toListOfStrings().toArray(new String[0]);
+              library.registerFunction(FunctionLibraryFactory.createFunction(database, language, funcName,
+                  funcJSON.getString("code"), params));
+            }
+
+            functionLibraries.put(libraryName, library);
+          } catch (final Exception e) {
+            LogManager.instance().log(this, Level.SEVERE, "Error loading function library '%s': %s", e, libraryName,
+                e.getMessage());
+          }
+        }
+      }
+
       // Load extensions (module-specific configuration)
       extensions.clear();
       if (root.has("extensions")) {
@@ -1901,6 +1950,11 @@ public class LocalSchema implements Schema {
       LogManager.instance().log(this, Level.SEVERE, "Error on saving schema configuration to file: %s", e,
           databasePath + File.separator + SCHEMA_FILE_NAME);
     }
+
+    // #5269: the schema reached a stable state (buckets/indexes just created are now registered). Refresh the per-user
+    // security file-access map so runtime-created files are covered immediately, instead of chronically falling through
+    // the "allow by default" path in ServerSecurityDatabaseUser.requestAccessOnFile() (which also floods the logs).
+    updateSecurity();
   }
 
   public synchronized JSONObject toJSON() {
@@ -1939,6 +1993,16 @@ public class LocalSchema implements Schema {
     for (final Map.Entry<String, ContinuousAggregateImpl> entry : continuousAggregates.entrySet())
       caJSON.put(entry.getKey(), entry.getValue().toJSON());
     root.put("continuousAggregates", caJSON);
+
+    // Serialize user-defined function libraries (DEFINE FUNCTION) so they survive a restart (issue #5121). Libraries
+    // backed by native Java code are not persistable and return null from toJSON(): they are skipped here.
+    final JSONObject functionsJSON = new JSONObject();
+    for (final FunctionLibraryDefinition library : functionLibraries.values()) {
+      final JSONObject libraryJSON = library.toJSON();
+      if (libraryJSON != null)
+        functionsJSON.put(library.getName(), libraryJSON);
+    }
+    root.put("functions", functionsJSON);
 
     // Serialize extensions (module-specific configuration)
     if (!extensions.isEmpty()) {
@@ -1991,6 +2055,7 @@ public class LocalSchema implements Schema {
 
   @Override
   public Schema registerFunctionLibrary(final FunctionLibraryDefinition library) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
     if (functionLibraries.putIfAbsent(library.getName(), library) != null)
       throw new IllegalArgumentException("Function library '" + library.getName() + "' already registered");
     return this;
@@ -1998,6 +2063,7 @@ public class LocalSchema implements Schema {
 
   @Override
   public Schema unregisterFunctionLibrary(final String name) {
+    database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
     functionLibraries.remove(name);
     return this;
   }
@@ -2025,9 +2091,14 @@ public class LocalSchema implements Schema {
   }
 
   public void setMigratedFileId(final int oldFileId, final int newFileId) {
+    setMigratedFileId(oldFileId, newFileId, true);
+  }
+
+  public void setMigratedFileId(final int oldFileId, final int newFileId, final boolean saveConfiguration) {
     LogManager.instance().log(this, Level.FINE, "Migrating file id %d to %d", null, oldFileId, newFileId);
     migratedFileIds.put(oldFileId, newFileId);
-    saveConfiguration();
+    if (saveConfiguration)
+      saveConfiguration();
   }
 
   public Integer getMigratedFileId(final int oldFileId) {
@@ -2067,9 +2138,19 @@ public class LocalSchema implements Schema {
     }
 
     database.getExecutionPlanCache().invalidate();
+    // The OpenCypher plan cache embeds schema-derived physical operators (index-seek vs scan, bucket
+    // sets, cost estimates), so a schema change - including one received from the HA leader via this
+    // update() path - must flush it too. The Cypher statement cache holds only the syntactic AST and
+    // is schema-independent, so it is intentionally left untouched (same as SQL's statement cache).
+    database.getCypherPlanCache().invalidate();
   }
 
   protected <RET> RET recordFileChanges(final Callable<Object> callback) {
+    return recordFileChanges(callback, false);
+  }
+
+  protected <RET> RET recordFileChanges(final Callable<Object> callback,
+      final boolean deferIntermediateSchemaSaves) {
     if (readingFromFile || !loadInRamCompleted) {
       try {
         return (RET) callback.call();
@@ -2081,18 +2162,32 @@ public class LocalSchema implements Schema {
     final long prevGeneration = dirtyGeneration.get();
     dirtyGeneration.updateAndGet(cur -> Math.max(cur, savedGeneration + 1));
 
+    final boolean suspendIntermediateSaves = deferIntermediateSchemaSaves && !multipleUpdate;
+    if (suspendIntermediateSaves)
+      multipleUpdate = true;
+
     boolean executed = false;
     try {
       final RET result = database.getWrappedDatabaseInstance().recordFileChanges(callback);
       executed = true;
+
+      if (suspendIntermediateSaves)
+        multipleUpdate = false;
       saveConfiguration();
 
       // INVALIDATE EXECUTION PLAN IN CASE TYPE OR INDEX CONCUR IN THE GENERATED PLANS
       database.getExecutionPlanCache().invalidate();
+      // Same reasoning for the OpenCypher plan cache: a cached PhysicalPlan can reference an index or
+      // type that this schema mutation just added or dropped (e.g. a NodeIndexSeek over an index that
+      // no longer exists), so flush it on every local schema change. The Cypher statement (AST) cache
+      // is syntactic and schema-independent, so it is deliberately not flushed here.
+      database.getCypherPlanCache().invalidate();
 
       return result;
 
     } finally {
+      if (suspendIntermediateSaves)
+        multipleUpdate = false;
       if (!executed && prevGeneration <= savedGeneration)
         // ROLLBACK THE DIRTY STATUS - restore only if we were the ones who made it dirty
         savedGeneration = dirtyGeneration.get();
@@ -2112,6 +2207,24 @@ public class LocalSchema implements Schema {
       final TypeIndex propIndex,
       final int batchSize,
       final IndexMetadata metadata) {
+    return createBucketIndex(type, keyTypes, bucket, typeName, indexType, unique, pageSize, nullStrategy, callback,
+        propertyNames, propIndex, batchSize, metadata, true);
+  }
+
+  protected Index createBucketIndex(final LocalDocumentType type,
+      final Type[] keyTypes,
+      final Bucket bucket,
+      final String typeName,
+      final INDEX_TYPE indexType,
+      final boolean unique,
+      final int pageSize,
+      final NULL_STRATEGY nullStrategy,
+      final Index.BuildIndexCallback callback,
+      final String[] propertyNames,
+      final TypeIndex propIndex,
+      final int batchSize,
+      final IndexMetadata metadata,
+      final boolean build) {
     database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
 
     if (bucket == null)
@@ -2149,13 +2262,18 @@ public class LocalSchema implements Schema {
 
       indexMap.put(indexName, index);
 
+      if (!build && !index.setStatus(new IndexInternal.INDEX_STATUS[] { IndexInternal.INDEX_STATUS.AVAILABLE },
+          IndexInternal.INDEX_STATUS.UNAVAILABLE))
+        throw new IndexException("Cannot prepare empty index '" + indexName + "' for sorted population");
+
       type.addIndexInternal(index, bucket.getFileId(), propertyNames, propIndex);
 
       // Re-set metadata after addIndexInternal populated propertyNames, to propagate
       // caseInsensitiveKeys to the underlying mutable/compacted indexes.
       index.setMetadata(index.getMetadata());
 
-      index.build(batchSize, callback);
+      if (build)
+        index.build(batchSize, callback);
 
       return index;
 

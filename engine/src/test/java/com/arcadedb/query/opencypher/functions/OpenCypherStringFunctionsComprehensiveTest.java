@@ -18,11 +18,8 @@
  */
 package com.arcadedb.query.opencypher.functions;
 
-import com.arcadedb.database.Database;
-import com.arcadedb.database.DatabaseFactory;
+import com.arcadedb.TestHelper;
 import com.arcadedb.query.sql.executor.ResultSet;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -35,22 +32,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Comprehensive tests for OpenCypher String functions based on Neo4j Cypher documentation.
  * Tests cover all 18 string functions with their various parameters and edge cases.
  */
-class OpenCypherStringFunctionsComprehensiveTest {
-  private Database database;
-
-  @BeforeEach
-  void setUp() {
-    final DatabaseFactory factory = new DatabaseFactory("./databases/test-cypher-string-functions");
-    if (factory.exists())
-      factory.open().drop();
-    database = factory.create();
-  }
-
-  @AfterEach
-  void tearDown() {
-    if (database != null)
-      database.drop();
-  }
+class OpenCypherStringFunctionsComprehensiveTest extends TestHelper {
 
   // ==================== btrim() Tests ====================
 
@@ -504,6 +486,15 @@ class OpenCypherStringFunctionsComprehensiveTest {
     final ResultSet result = database.command("opencypher", "RETURN substring('hello', null, 2) AS result");
     Assertions.assertThat(result.hasNext() != false).isTrue();
     Assertions.assertThat(result.next().getProperty("result") == null).isTrue();
+  }
+
+  @Test
+  void substringNullLengthReturnsNull() {
+    // Issue #5193: an explicitly supplied null length must propagate null (as Neo4j does),
+    // not be treated as an omitted argument (which would return 'ello').
+    final ResultSet result = database.command("opencypher", "RETURN substring('hello', 1, null) AS result");
+    Assertions.assertThat(result.hasNext()).isTrue();
+    Assertions.assertThat(result.next().<Object>getProperty("result")).isNull();
   }
 
   @Test
