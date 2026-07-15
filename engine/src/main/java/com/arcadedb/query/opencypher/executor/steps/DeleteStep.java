@@ -59,6 +59,15 @@ import java.util.Set;
 public class DeleteStep extends AbstractExecutionStep {
   private final DeleteClause deleteClause;
 
+  /**
+   * Elements already deleted (and counted) by this DELETE, shared across all input rows of the
+   * statement. A single DeleteStep is built per statement execution, so this de-dups an element
+   * bound by more than one row - e.g. an undirected relationship matched from both endpoints
+   * ({@code MATCH (u)-[r]-() DELETE r}) - so it is removed once and counted once, matching Neo4j.
+   * Records equal by RID (see BaseRecord.equals), so different instances of the same edge collapse.
+   */
+  private final Set<Object> deleted = new HashSet<>();
+
   public DeleteStep(final DeleteClause deleteClause, final CommandContext context) {
     super(context);
     this.deleteClause = deleteClause;
@@ -214,8 +223,8 @@ public class DeleteStep extends AbstractExecutionStep {
         return;
       }
 
-      // Delete all edges first, then all other objects (vertices, documents)
-      final Set<Object> deleted = new HashSet<>();
+      // Delete all edges first, then all other objects (vertices, documents). The `deleted` set is
+      // a step-instance field shared across rows so an element bound by multiple rows is deleted once.
       for (final Object edge : allEdges)
         deleteObject(edge, deleted);
       for (final Object other : allOther)
@@ -430,14 +439,14 @@ public class DeleteStep extends AbstractExecutionStep {
     if (obj instanceof Vertex) {
       deleted.add(obj);
       try {
-        deleteVertex((Vertex) obj);
+        deleteVertex((Vertex) obj, deleted);
       } catch (final RecordNotFoundException e) {
         // Already deleted - skip
       }
     } else if (obj instanceof Edge) {
       deleted.add(obj);
       try {
-        deleteEdge((Edge) obj);
+        deleteEdge((Edge) obj, deleted);
       } catch (final RecordNotFoundException e) {
         // Already deleted - skip
       }
@@ -474,12 +483,14 @@ public class DeleteStep extends AbstractExecutionStep {
    * Deletes a vertex from the graph.
    * If detach is true, deletes all connected relationships first.
    *
-   * @param vertex vertex to delete
+   * @param vertex  vertex to delete
+   * @param deleted shared set of already-deleted objects, so a relationship removed both by DETACH
+   *                and by an explicit edge delete in the same statement is counted only once
    */
-  private void deleteVertex(final Vertex vertex) {
+  private void deleteVertex(final Vertex vertex, final Set<Object> deleted) {
     if (deleteClause.isDetach()) {
       // DETACH DELETE: Remove all connected relationships first
-      deleteAllEdges(vertex);
+      deleteAllEdges(vertex, deleted);
     } else {
       // Non-DETACH DELETE: check for connected edges
       if (vertex.getEdges(Vertex.DIRECTION.OUT).iterator().hasNext() ||
@@ -495,9 +506,12 @@ public class DeleteStep extends AbstractExecutionStep {
   /**
    * Deletes all edges connected to a vertex.
    *
-   * @param vertex vertex whose edges should be deleted
+   * @param vertex  vertex whose edges should be deleted
+   * @param deleted shared set of already-deleted objects; edges already removed and counted earlier
+   *                in the same statement (by an explicit DELETE or another vertex's DETACH pass) are
+   *                skipped here
    */
-  private void deleteAllEdges(final Vertex vertex) {
+  private void deleteAllEdges(final Vertex vertex, final Set<Object> deleted) {
     // Collect connected edges in both directions, de-duplicating self-loops (which appear in both
     // OUT and IN) so a self-loop relationship is deleted and counted exactly once.
     final List<Edge> edgesToDelete = new ArrayList<>();
@@ -511,11 +525,16 @@ public class DeleteStep extends AbstractExecutionStep {
 
     final QueryStatistics stats = context.getStatistics();
     for (final Edge edge : edgesToDelete) {
+      // Skip any relationship already removed and counted by an explicit DELETE in the same statement.
+      if (deleted.contains(edge))
+        continue;
       try {
         edge.delete();
         stats.incRelationshipsDeleted();
+        deleted.add(edge);
       } catch (final RecordNotFoundException ignored) {
         // already removed (e.g. a shared edge deleted when the other endpoint was detached) - do not count again
+        deleted.add(edge);
       }
     }
   }
@@ -523,11 +542,14 @@ public class DeleteStep extends AbstractExecutionStep {
   /**
    * Deletes an edge from the graph.
    *
-   * @param edge edge to delete
+   * @param edge    edge to delete
+   * @param deleted shared set of already-deleted objects, updated so a later DETACH pass does not
+   *                recount this edge
    */
-  private void deleteEdge(final Edge edge) {
+  private void deleteEdge(final Edge edge, final Set<Object> deleted) {
     edge.delete();
     context.getStatistics().incRelationshipsDeleted();
+    deleted.add(edge);
   }
 
   @Override

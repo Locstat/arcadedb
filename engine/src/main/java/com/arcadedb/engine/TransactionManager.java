@@ -46,12 +46,14 @@ public class TransactionManager {
   private static final long MAX_LOG_FILE_SIZE = 64 * 1024 * 1024;
   private static final int  WRITE_WAL_TIMEOUT = 30_000;
   /**
-   * On-disk record of the highest assigned transaction id, written on close and read on open. Lets
-   * {@link #getLastTransactionId()} return a meaningful value even after a clean shutdown wiped the
-   * WAL. Used by the HA bootstrap path (issue #4147) so a peer staged from a clean backup can
-   * report its database recency without having to scan WAL files.
+   * On-disk record of the highest assigned transaction id, written on close and whenever a runtime
+   * WAL rotation drops log files (issue #5277), read on open. Lets {@link #getLastTransactionId()}
+   * return a meaningful value even after the WAL is gone - on a clean shutdown (which purges it) or
+   * on a force-kill after the rotation dropped it. Used by the HA bootstrap path (issue #4147) so a
+   * peer can report its database recency without having to scan WAL files. Public because the HA
+   * snapshot transfer ships this marker alongside the data files (issue #5277).
    */
-  static final  String LAST_TX_ID_FILE_NAME = "last-tx-id.bin";
+  public static final String LAST_TX_ID_FILE_NAME = "last-tx-id.bin";
 
   private final DatabaseInternal             database;
   private       WALFile[]                    activeWALFilePool;
@@ -256,7 +258,7 @@ public class TransactionManager {
 
   public void notifyPageFlushed(final MutablePage page) {
     // takeWALFile (not get) so the ack is released exactly once even when this races the file-dropped
-    // flush branch or the dropped-file batch purge on the same page (#4928 review).
+    // flush branch or the dropped-file batch purge on the same page (#4928).
     final WALFile walFile = page.takeWALFile();
     if (walFile != null)
       walFile.notifyPageFlushed();
@@ -396,7 +398,7 @@ public class TransactionManager {
               try {
                 // Files.move (vs File.renameTo, which just returns false) fails with a cause and performs an
                 // atomic rename where the filesystem supports it. Best-effort semantics preserved: log and continue.
-                // REPLACE_EXISTING (#5063 review round 4): a prior ABORTED recovery can leave a same-named
+                // REPLACE_EXISTING (#5063): a prior ABORTED recovery can leave a same-named
                 // .corrupt file behind; without it the move throws FileAlreadyExistsException and the original
                 // .wal stays in place, re-scanned and re-aborted on every restart - the exact loop this breaks.
                 // The stale .corrupt it replaces is evidence from the SAME file's earlier failed attempt.
@@ -917,6 +919,7 @@ public class TransactionManager {
    */
   private boolean cleanWALFiles(final boolean dropFiles, final boolean force, final boolean syncDataOnDrop) {
     boolean dataSynced = false;
+    boolean droppedAny = false;
     for (final Iterator<WALFile> it = inactiveWALFilePool.iterator(); it.hasNext(); ) {
       final WALFile file = it.next();
 
@@ -939,6 +942,7 @@ public class TransactionManager {
               dataSynced = true;
             }
             file.drop();
+            droppedAny = true;
           } else
             file.close();
 
@@ -949,7 +953,35 @@ public class TransactionManager {
       }
     }
 
+    // Runtime WAL rotation (uniquely identified by syncDataOnDrop; the clean-close path persists the
+    // marker itself): the dropped WAL was the only recovery source for the transaction counter, so a
+    // later force-kill (no clean close) would make an intact database report lastTxId=-1 to the HA
+    // bootstrap protocol and be needlessly re-installed from a full leader snapshot (issue #5277).
+    // Persist the marker the moment that recovery source disappears.
+    if (dropFiles && syncDataOnDrop && droppedAny)
+      writePersistedLastTransactionId();
+
     return inactiveWALFilePool.isEmpty();
+  }
+
+  /**
+   * Package-private test hook: runs one runtime WAL-rotation pass exactly as the background timer
+   * does - retires every active WAL file (ignoring the size threshold) and drops the inactive ones,
+   * fsyncing data first. Lets tests exercise the rotation persistence (issue #5277) without writing
+   * 64MB of log to cross {@link #MAX_LOG_FILE_SIZE}.
+   */
+  void rotateAndDropWALForTesting() throws IOException {
+    if (activeWALFilePool != null)
+      for (int i = 0; i < activeWALFilePool.length; ++i) {
+        final WALFile file = activeWALFilePool[i];
+        if (file != null && file.isOpen()) {
+          activeWALFilePool[i] = database.getWALFileFactory()
+              .newInstance(database.getDatabasePath() + "/txlog_" + logFileCounter.getAndIncrement() + ".wal");
+          file.setActive(false);
+          inactiveWALFilePool.add(file);
+        }
+      }
+    cleanWALFiles(true, true, true);
   }
 
   @Override

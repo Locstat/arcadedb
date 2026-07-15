@@ -73,6 +73,7 @@ import com.arcadedb.query.opencypher.rewriter.ComparisonNormalizer;
 import com.arcadedb.query.opencypher.rewriter.CompositeRewriter;
 import com.arcadedb.query.opencypher.rewriter.ConstantFolder;
 import com.arcadedb.query.opencypher.rewriter.ExpressionRewriter;
+import com.arcadedb.query.opencypher.rewriter.ProjectedOrderByNormalizer;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.Result;
 import org.antlr.v4.runtime.ParserRuleContext;
@@ -681,6 +682,20 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
           final Expression targetExpr = expressionBuilder.parseExpressionFromText(baseExpr1);
           items.add(new SetClause.SetItem(targetExpr, propertyName.toString(), valueExpr));
         }
+      } else if (itemCtx instanceof Cypher25Parser.SetDynamicPropContext dynCtx) {
+        // SET n[keyExpr] = value — dynamic property assignment (issue #5141)
+        if (findPatternExpressionRecursive(dynCtx.expression()) != null)
+          throw new CommandParsingException("UnexpectedSyntax: Pattern expressions are not allowed in SET values");
+        final Cypher25Parser.DynamicPropertyExpressionContext dynPropExpr = dynCtx.dynamicPropertyExpression();
+        final Expression keyExpr = expressionBuilder.parseExpression(dynPropExpr.dynamicProperty().expression());
+        final Expression valueExpr = expressionBuilder.parseExpression(dynCtx.expression());
+        final Cypher25Parser.Expression1Context baseExpr1 = dynPropExpr.expression1();
+        if (baseExpr1.variable() != null) {
+          items.add(new SetClause.SetItem(baseExpr1.variable().getText(), null, keyExpr, valueExpr));
+        } else {
+          final Expression targetExpr = expressionBuilder.parseExpressionFromText(baseExpr1);
+          items.add(new SetClause.SetItem(null, targetExpr, keyExpr, valueExpr));
+        }
       } else if (itemCtx instanceof Cypher25Parser.SetPropsContext propsCtx) {
         // SET n = {map} — replace all properties
         final String variable = propsCtx.variable().getText();
@@ -746,6 +761,12 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
           final String[] parts = propExpr.split("\\.", 2);
           items.add(new RemoveClause.RemoveItem(parts[0], parts[1]));
         }
+      } else if (itemCtx instanceof Cypher25Parser.RemoveDynamicPropContext dynCtx) {
+        // REMOVE n[keyExpr] — dynamic property removal (issue #5141)
+        final Cypher25Parser.DynamicPropertyExpressionContext dynPropExpr = dynCtx.dynamicPropertyExpression();
+        final String variable = dynPropExpr.expression1().getText();
+        final Expression keyExpr = expressionBuilder.parseExpression(dynPropExpr.dynamicProperty().expression());
+        items.add(new RemoveClause.RemoveItem(variable, keyExpr));
       } else if (itemCtx instanceof Cypher25Parser.RemoveLabelsContext) {
         final Cypher25Parser.RemoveLabelsContext labelsCtx = (Cypher25Parser.RemoveLabelsContext) itemCtx;
         final String variable = stripBackticks(labelsCtx.variable().getText());
@@ -754,7 +775,7 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
           labels.add(stripBackticks(lt.symbolicNameString().getText()));
         items.add(new RemoveClause.RemoveItem(variable, labels));
       }
-      // TODO: Handle RemoveDynamicProp and RemoveLabelsIs
+      // TODO: Handle RemoveLabelsIs
     }
 
     return new RemoveClause(items);
@@ -889,6 +910,9 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
       final ReturnClause.ReturnItem item = new ReturnClause.ReturnItem(expr, alias);
       if (alias == null)
         item.setOriginalText(getOriginalText(itemCtx.expression()));
+      // Canonical text, recorded for aliased items too, so ORDER BY can tell whether it repeats
+      // this projected expression (issue #5283)
+      item.setExpressionText(itemCtx.expression().getText());
       items.add(item);
     }
 
@@ -904,7 +928,8 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     // Parse ORDER BY, SKIP, LIMIT from returnBody
     OrderByClause orderByClause = null;
     if (body.orderBy() != null) {
-      orderByClause = visitOrderBy(body.orderBy());
+      // An ORDER BY item that repeats a projected expression sorts on the projected column (#5283)
+      orderByClause = ProjectedOrderByNormalizer.normalize(visitOrderBy(body.orderBy()), items, distinct);
     }
 
     Expression skip = null;
@@ -1018,6 +1043,9 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
         // When no alias, preserve original text from the query (whitespace and case)
         if (alias == null)
           item.setOriginalText(getOriginalText(itemCtx.expression()));
+        // Canonical text, recorded for aliased items too, so ORDER BY can tell whether it repeats
+        // this projected expression (issue #5283)
+        item.setExpressionText(itemCtx.expression().getText());
         items.add(item);
       }
     }
@@ -1323,10 +1351,24 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     // IMPORTANT: Check parentheses BEFORE patterns to handle cases like (NOT (pattern))
     // where the NOT operator should be preserved during recursive parsing
     final Cypher25Parser.ParenthesizedExpressionContext parenExpr = findParenthesizedExpressionRecursive(expr6);
-    if (parenExpr != null && compCtx == null) {
+    // Only treat this as a parenthesized boolean predicate when the parentheses wrap the WHOLE
+    // expression (e.g. "(a = 1 OR b = 2)"). The recursive finder also matches parentheses nested
+    // deep inside a larger expression - notably the inner predicate of a list quantifier such as
+    // all(a IN list WHERE (a = false)) - and returning parseBooleanExpression on that inner node
+    // would silently discard the enclosing all()/any()/none()/single() and evaluate the bare inner
+    // predicate against unbound iteration variables, filtering out every row (issue #5145). The span
+    // check mirrors the EXISTS guard above (issue #4126): parenExpr is a descendant of expr6, so its
+    // original text length equals expr6's only when it spans the entire expression.
+    final boolean parenSpansWholeExpression = parenExpr != null
+        && getOriginalText(parenExpr).trim().length() >= getOriginalText(expr6).trim().length();
+    if (parenExpr != null && compCtx == null && parenSpansWholeExpression) {
       // Check if the parenthesized expression contains just a bare variable (e.g., WHERE (n)).
       // A single-node pattern without relationships is invalid as a boolean predicate.
-      final String innerText = parenExpr.expression().getText().trim();
+      // Use getOriginalText (whitespace-preserving) rather than getText(): getText() strips all
+      // whitespace, so a genuine predicate such as (friend IN inactive_nodes) collapses to
+      // "friendINinactive_nodes" and spuriously matches the bare-identifier regex, getting
+      // misparsed as an invalid single-node pattern (issue #5138).
+      final String innerText = getOriginalText(parenExpr.expression()).trim();
       if (innerText.matches("^[a-zA-Z_`][a-zA-Z0-9_`]*$")) {
         final NodePattern nodePattern = new NodePattern(innerText, null, null);
         final PathPattern singleNodePath = new PathPattern(List.of(nodePattern), List.of(), null);
@@ -1418,28 +1460,10 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     final Cypher25Parser.ListItemsPredicateContext listPredCtx = expressionBuilder.findListItemsPredicateRecursive(expr6);
     if (listPredCtx != null) {
       final Expression listPredExpr = expressionBuilder.parseListItemsPredicate(listPredCtx);
-      return new BooleanExpression() {
-        @Override
-        public boolean evaluate(final Result result, final CommandContext context) {
-          final Object value = listPredExpr.evaluate(result, context);
-          return value instanceof Boolean && (Boolean) value;
-        }
-
-        @Override
-        public Object evaluateTernary(final Result result, final CommandContext context) {
-          final Object value = listPredExpr.evaluate(result, context);
-          if (value == null)
-            return null;
-          if (value instanceof Boolean)
-            return value;
-          return Boolean.TRUE;
-        }
-
-        @Override
-        public String getText() {
-          return listPredExpr.getText();
-        }
-      };
+      // Wrap via BooleanCoercionExpression (rather than an anonymous adapter) so the semantic
+      // validator can reach the underlying predicate and scope-check its WHERE body. This catches
+      // variables that leak out of a pattern/list comprehension into the outer predicate (issue #5179).
+      return new BooleanCoercionExpression(listPredExpr);
     }
 
     // Check if the expression is a function call used as a predicate (e.g., isEmpty(x), exists(x))

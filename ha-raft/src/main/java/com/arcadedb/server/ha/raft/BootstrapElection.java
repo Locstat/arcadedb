@@ -42,6 +42,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -49,6 +50,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 
 /**
@@ -70,22 +72,27 @@ import java.util.logging.Level;
  *   <li>If the elected source is the local peer, commit one
  *       {@link RaftLogEntryType#BOOTSTRAP_FINGERPRINT_ENTRY} per database via the existing
  *       transaction broker, all from the local copies. If the elected source is a different peer,
- *       transfer Raft leadership to that peer <em>without committing anything</em> (so the cluster
- *       commit index stays 0); the new leader re-enters this protocol on its own
- *       {@code notifyLeaderChanged} callback, elects itself, and commits every database then.</li>
+ *       transfer Raft leadership to that peer <em>without committing anything</em>; the new leader
+ *       re-enters this protocol on its own {@code notifyLeaderChanged} callback, elects itself, and
+ *       commits every database then.</li>
  * </ol>
  * <p>
- * Because the protocol never commits a baseline before transferring leadership, the single
- * transfer-then-commit-all sequence keeps the {@code commitIndex == 0} first-formation gate valid
- * and converges in at most one leadership move. A database whose freshest copy happens to live on a
+ * The protocol never commits a baseline before transferring leadership, so no <em>application</em>
+ * entry is committed until the elected source commits the whole cluster's fingerprints. The
+ * leadership transfer itself, however, makes Ratis append internal no-op / configuration entries, so
+ * the new leader's raw commit index is <em>not</em> 0 by the time it re-runs (issue #5099). The
+ * first-formation gate therefore keys on "the state machine has never applied an application entry"
+ * rather than an exact {@code commitIndex == 0}: that signal survives the transfer's internal term
+ * bump yet still closes the instant any real data commits, converging in at most one leadership
+ * move. See {@link #isFirstFormation(long)}. A database whose freshest copy happens to live on a
  * node <em>other</em> than the elected source (only reachable by an operator manually staging
  * mismatched backups, never by normal single-leader replication) is protected by the
  * {@code localLastTxId > baseline} "refusing to overwrite" guard in
  * {@code ArcadeStateMachine.applyBootstrapFingerprintEntry}, which surfaces a SEVERE for the
  * operator instead of silently discarding the fresher data.
  * <p>
- * The protocol is idempotent across leader changes: each newly-elected leader checks whether the
- * cluster's commit index is still 0 and, if so, re-runs. A leader transfer triggered by a previous
+ * The protocol is idempotent across leader changes: each newly-elected leader re-checks the
+ * first-formation gate and, if it still holds, re-runs. A leader transfer triggered by a previous
  * bootstrap pass is therefore safe even if the new leader doesn't know it was selected as the
  * source - it picks itself again from its own state.
  * <p>
@@ -101,7 +108,7 @@ class BootstrapElection {
    */
   enum Outcome {
     SKIPPED_DISABLED,           // bootstrapFromLocalDatabase=false
-    SKIPPED_NOT_FIRST_FORMATION,// commit index not a confirmed 0 (cluster running, or index unknown)
+    SKIPPED_NOT_FIRST_FORMATION,// not first formation (application data already committed, or index unknown)
     SKIPPED_NO_DATABASES,       // nothing to bootstrap
     NOT_LEADER,                 // we're not the leader anymore by the time we ran
     TRANSFERRED,                // leadership transferred to the source peer; new leader will retry
@@ -118,6 +125,28 @@ class BootstrapElection {
   // Tracks per-database whether the bootstrap protocol has been attempted in this leader's
   // lifetime. Used to short-circuit on repeated notifyLeaderChanged callbacks for the same term.
   private final Set<String>             attemptedThisTerm = ConcurrentHashMap.newKeySet();
+  // Maximum time to wait for getCommitIndex() to return a definitive (non-negative) value right after
+  // this node becomes leader. The notifyLeaderChanged callback fires before the Raft division's log is
+  // queryable, so the very first read returns the -1 UNKNOWN sentinel for a brief window (~100 ms in
+  // practice); without waiting, the once-per-term bootstrap pass would skip on that transient -1 and
+  // never re-run. 10 s is deliberately generous versus the observed ~100 ms readiness gap: the wait
+  // ends as soon as the index resolves (or leadership is lost), so the full budget is only ever spent
+  // on a genuinely broken read - a rare case that does not warrant an operator-facing config knob.
+  // Package-private and non-final so tests can shorten it. See awaitReadableCommitIndex.
+  long                                  commitIndexReadinessTimeoutMs = 10_000L;
+  // Poll interval while waiting for the division to become readable. Package-private and non-final so
+  // tests can set it to 0 and spin without sleeping.
+  long                                  commitIndexReadinessPollMs    = 100L;
+  // Backoff between bootstrap-state probe rounds. A peer whose HTTP/security stack is still
+  // initializing when the probe arrives (common in a parallel cold boot where every pod starts at
+  // once) answers 401/403/5xx; treating that as a definitive "no state" could elect a stale baseline
+  // (issue #5273). We retry such probes within the overall bootstrap-timeout budget instead. Package-
+  // private and non-final so tests can shorten them.
+  long                                  probeRetryBackoffMs           = 500L;
+  // Per-attempt HTTP timeout ceiling for a single bootstrap-state probe. The overall budget is
+  // HA_BOOTSTRAP_TIMEOUT_MS (default 120s); capping each attempt lets an unreachable/slow peer be
+  // retried rather than consuming the whole budget in one hung attempt.
+  long                                  probeAttemptTimeoutMs         = 5_000L;
 
   BootstrapElection(final RaftHAServer haServer, final ArcadeDBServer server) {
     this.haServer = haServer;
@@ -145,14 +174,24 @@ class BootstrapElection {
     if (!haServer.isLeader())
       return Outcome.NOT_LEADER;
 
-    // The bootstrap path is gated on first cluster formation: every peer's Raft log empty, i.e. a
-    // commit index of exactly 0. The leader's commit index is the only piece of cluster-wide state
-    // we have to check; once any entry has been committed, we never re-engage. See section 8
-    // ("Gating") in #4147. A negative value means the index is UNKNOWN (the Raft division is not
-    // ready, or getCommitIndex() hit a transient IOException) and must NOT be mistaken for an empty
-    // log - see isConfirmedFirstFormation and issue #4800.
-    final long commitIndex = haServer.getCommitIndex();
-    if (!isConfirmedFirstFormation(commitIndex))
+    // The bootstrap path is gated on first cluster formation: the cluster has never committed any
+    // application data. See section 8 ("Gating") in #4147. A commit index of exactly 0 is the fast,
+    // unambiguous case (empty Raft log, no leadership transfer). But a bootstrap that transfers
+    // leadership to the elected source makes Ratis append internal no-op / configuration entries, so
+    // the new leader's commit index is above 0 even though no application entry has committed (issue
+    // #5099); the exact-0 test alone would wrongly reject it. isFirstFormation therefore also accepts
+    // a positive commit index when the state machine has never applied an application entry - a signal
+    // that survives the internal term bump yet still closes the instant any real data commits, keeping
+    // the issue #4800 guarantee that bootstrap never re-engages on a running cluster.
+    //
+    // The notifyLeaderChanged callback that drives this runs before the freshly-elected leader's Raft
+    // division exposes its committed index, so the very first read returns the -1 UNKNOWN sentinel for
+    // a brief window. Since bootstrap runs at most once per term, skipping on that transient -1 would
+    // leave the baseline uncommitted forever. Wait a bounded time for a definitive reading: a negative
+    // value never opens the gate (division not ready / transient IOException, exactly as #4800
+    // requires); a non-negative value is then judged by isFirstFormation.
+    final long commitIndex = awaitReadableCommitIndex();
+    if (!isFirstFormation(commitIndex))
       return Outcome.SKIPPED_NOT_FIRST_FORMATION;
 
     final List<String> dbNames = collectLocalDatabaseNames();
@@ -180,16 +219,81 @@ class BootstrapElection {
   }
 
   /**
-   * The first-formation gate. Bootstrap may only engage on a positively-confirmed empty cluster,
-   * i.e. a commit index of exactly {@code 0}. A negative value means the commit index is UNKNOWN -
-   * {@link RaftHAServer#getCommitIndex()} returns {@code -1} when the Raft division is not ready yet
-   * or a transient {@code IOException} is thrown while reading it - and MUST be treated as "skip" so
-   * a transient read failure during a leader-change callback can never re-trigger bootstrap on a
-   * live cluster (issue #4800). Any positive value means the cluster has already committed entries
-   * and the first-formation window is long past.
+   * The first-formation gate. Bootstrap may only engage on a cluster that has never committed any
+   * application data, evaluated in two steps:
+   * <ol>
+   *   <li>A commit index of exactly {@code 0} - a positively-confirmed empty Raft log - opens the
+   *       gate immediately. This is the no-transfer path and is unchanged from #4800
+   *       (see {@link #isConfirmedFirstFormation}).</li>
+   *   <li>A positive commit index opens the gate only when the state machine reports it has never
+   *       applied an application entry ({@link ArcadeStateMachine#hasNeverAppliedApplicationEntry()}).
+   *       This is the leadership-transfer path (issue #5099): the transfer appends internal
+   *       no-op / configuration entries that raise the commit index above {@code 0} without
+   *       committing any application data. The durable no-application-entry signal survives that
+   *       internal term bump yet still closes the instant any real mutation commits, so #4800's
+   *       "never re-engage on a running cluster" guarantee is preserved.</li>
+   * </ol>
+   * A negative commit index means the index is UNKNOWN - {@link RaftHAServer#getCommitIndex()}
+   * returns {@code -1} when the Raft division is not ready yet or a transient {@code IOException} is
+   * thrown while reading it - and MUST be treated as "skip" so a transient read failure during a
+   * leader-change callback can never re-trigger bootstrap on a live cluster (issue #4800).
+   * <p>
+   * <b>Residual window (do not weaken the backstops without accounting for it):</b> the
+   * no-application-entry signal is strictly weaker than the exact-{@code 0} test in one narrow case -
+   * a node whose Raft log holds application entries that are committed but not yet run through
+   * {@code applyTransaction} reads no applied index and no persisted file, so it reports first
+   * formation. That state is essentially unreachable after normal operation (any prior apply writes
+   * the {@code .raft/applied-index} file, and Raft's election restriction stops a node from winning
+   * leadership until its log is up to date), and if it were ever hit, the elected source's commit is
+   * still refused by the {@code localLastTxId > baseline} overwrite guard in
+   * {@code ArcadeStateMachine.applyBootstrapFingerprintEntry} - so the worst case is a spurious,
+   * refused bootstrap attempt, never data loss.
+   */
+  private boolean isFirstFormation(final long commitIndex) {
+    if (isConfirmedFirstFormation(commitIndex))
+      return true;
+    if (commitIndex < 0L)
+      return false; // division not ready / transient read failure: never treat as an empty log (#4800)
+    final ArcadeStateMachine stateMachine = haServer.getStateMachine();
+    return stateMachine != null && stateMachine.hasNeverAppliedApplicationEntry();
+  }
+
+  /**
+   * The exact-{@code 0} empty-log test: {@code true} only for a positively-confirmed empty Raft log.
+   * Kept as a distinct static helper (issue #4800) that {@link #isFirstFormation(long)} layers the
+   * leadership-transfer signal on top of; a negative or positive commit index both return
+   * {@code false} here.
    */
   static boolean isConfirmedFirstFormation(final long commitIndex) {
     return commitIndex == 0L;
+  }
+
+  /**
+   * Poll {@link RaftHAServer#getCommitIndex()} until it returns a definitive (non-negative) value or
+   * {@link #commitIndexReadinessTimeoutMs} elapses, then return the last reading. Right after a leader
+   * change the division briefly reports -1 (log not yet queryable); this absorbs that startup window
+   * so the gate sees the real first-formation index (0) instead of the transient -1. A non-negative
+   * reading is returned immediately (no wait for a running cluster or a confirmed empty log). If this
+   * node stops being the leader while waiting, we stop early and return the last reading so the gate
+   * can skip. A persistent -1 (genuine read failure) is returned unchanged after the budget, keeping
+   * the issue #4800 "never bootstrap on an unconfirmed index" guarantee.
+   */
+  private long awaitReadableCommitIndex() {
+    // Monotonic deadline: nanoTime is immune to wall-clock steps/NTP adjustments and the
+    // (now - start) form is overflow-safe, unlike a currentTimeMillis-based absolute deadline.
+    final long start = System.nanoTime();
+    final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(commitIndexReadinessTimeoutMs);
+    long commitIndex = haServer.getCommitIndex();
+    while (commitIndex < 0 && (System.nanoTime() - start) < timeoutNanos && haServer.isLeader()) {
+      try {
+        Thread.sleep(commitIndexReadinessPollMs);
+      } catch (final InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+      commitIndex = haServer.getCommitIndex();
+    }
+    return commitIndex;
   }
 
   /**
@@ -209,49 +313,39 @@ class BootstrapElection {
     // Self state computed locally to avoid a self-loop HTTP call.
     final Map<String, PeerState> selfStates = computeLocalStates(localId, dbFilter);
 
-    // Fan out to other peers in parallel; bounded by timeoutMs.
-    final List<CompletableFuture<Map<RaftPeerId, Map<String, PeerState>>>> futures = new ArrayList<>();
+    // Collect every other peer's state, retrying transient probe failures (401/403/5xx/unreachable)
+    // within the overall bootstrap-timeout budget instead of treating the first failure as a
+    // definitive "no state" (issue #5273).
+    final Map<RaftPeerId, String> peerAddresses = new LinkedHashMap<>();
     for (final RaftPeer peer : peers) {
       if (peer.getId().equals(localId))
         continue;
       final String httpAddr = httpAddresses.get(peer.getId());
       if (httpAddr == null) {
         LogManager.instance().log(this, Level.WARNING,
-            "Bootstrap: peer %s has no known HTTP address; skipping", peer.getId());
+            "Bootstrap: peer %s has no known HTTP address; the election assumes it holds NO local data", peer.getId());
         continue;
       }
-      futures.add(queryPeer(peer.getId(), httpAddr, dbFilter, timeoutMs));
+      peerAddresses.put(peer.getId(), httpAddr);
     }
 
-    final Map<RaftPeerId, Map<String, PeerState>> remoteStates = new HashMap<>();
-    final long deadline = System.currentTimeMillis() + timeoutMs;
-    for (final CompletableFuture<Map<RaftPeerId, Map<String, PeerState>>> f : futures) {
-      final long remaining = Math.max(0, deadline - System.currentTimeMillis());
-      try {
-        final Map<RaftPeerId, Map<String, PeerState>> result = f.get(remaining, TimeUnit.MILLISECONDS);
-        if (result != null)
-          remoteStates.putAll(result);
-      } catch (final TimeoutException te) {
-        // Pending peer didn't respond by deadline; logged below.
-        f.cancel(true);
-      } catch (final Exception e) {
-        // Individual peer error; logged below.
-      }
-    }
+    final List<RaftPeerId> assumedEmpty = new ArrayList<>();
+    final Map<RaftPeerId, Map<String, PeerState>> remoteStates = collectRemoteStatesWithRetry(
+        peerAddresses, (pid, addr, attemptMs) -> queryPeer(pid, addr, dbFilter, attemptMs),
+        timeoutMs, Math.min(timeoutMs, probeAttemptTimeoutMs), probeRetryBackoffMs,
+        haServer::isLeader, assumedEmpty);
 
-    // Identify any configured peer that didn't report and warn loudly.
-    final Set<RaftPeerId> heard = new HashSet<>(remoteStates.keySet());
-    heard.add(localId);
-    final List<String> missing = new ArrayList<>();
-    for (final RaftPeer peer : peers)
-      if (!heard.contains(peer.getId()))
-        missing.add(peer.getId().toString());
-    if (!missing.isEmpty())
+    // Any configured peer that never returned a usable state after retries: warn loudly and state
+    // exactly what the election assumes for it (empty baseline) so the operator can reason about
+    // whether a stale baseline could have been chosen (issue #5273).
+    if (!assumedEmpty.isEmpty())
       LogManager.instance().log(this, Level.SEVERE,
           """
-          Bootstrap timeout: peers %s did not report state within %dms; proceeding with majority. \
-          Unreachable peers will catch up via leader-shipped snapshot when they reconnect.""",
-          missing, timeoutMs);
+          Bootstrap: peers %s did not return a usable state within %dms (after retries); the election \
+          ASSUMES they hold no local data (empty baseline) and proceeds with the peers that responded. \
+          If one of these peers actually holds the freshest copy it will resync from the elected leader \
+          when it reconnects.""",
+          assumedEmpty, timeoutMs);
 
     // Pivot: from peer→db→state to db→list of (peer, state).
     final Map<String, List<PeerState>> byDb = new HashMap<>();
@@ -263,12 +357,98 @@ class BootstrapElection {
     return byDb;
   }
 
-  private CompletableFuture<Map<RaftPeerId, Map<String, PeerState>>> queryPeer(final RaftPeerId peerId,
-      final String httpAddr, final Set<String> dbFilter, final long timeoutMs) {
+  /**
+   * Round-based, retrying collection of remote peer states. Each round probes every still-unresolved
+   * peer in parallel (via {@code prober}); peers that answer with data are resolved, peers that answer
+   * with a retryable failure (401/403/5xx/unreachable - typically a peer whose HTTP/security stack is
+   * still initializing during a parallel cold boot, issue #5273) are re-probed on the next round after
+   * {@code backoffMs}. The loop stops when every peer is resolved, the {@code overallTimeoutMs} budget
+   * is exhausted, or {@code keepGoing} reports this node is no longer the leader. Peers still
+   * unresolved at the end are added to {@code assumedEmptyOut} so the caller can log what the election
+   * assumes for them. Package-private and static so the retry/backoff/deadline logic is unit-testable
+   * with an injected {@code prober} and no real HTTP.
+   */
+  static Map<RaftPeerId, Map<String, PeerState>> collectRemoteStatesWithRetry(
+      final Map<RaftPeerId, String> peerAddresses, final ProbeFunction prober,
+      final long overallTimeoutMs, final long attemptTimeoutMs, final long backoffMs,
+      final BooleanSupplier keepGoing, final List<RaftPeerId> assumedEmptyOut) {
+    final Map<RaftPeerId, Map<String, PeerState>> results = new HashMap<>();
+    // Peers still needing a definitive answer; the address is kept so we can re-probe.
+    final Map<RaftPeerId, String> pending = new LinkedHashMap<>(peerAddresses);
+    // Monotonic deadline: nanoTime is immune to wall-clock steps and the (now - start) form is
+    // overflow-safe.
+    final long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(overallTimeoutMs);
+    while (!pending.isEmpty() && System.nanoTime() < deadlineNanos && keepGoing.getAsBoolean()) {
+      final long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+      final long perAttemptMs = Math.max(1, Math.min(remainingMs, attemptTimeoutMs));
+
+      // Fan out this round in parallel.
+      final Map<RaftPeerId, CompletableFuture<ProbeOutcome>> round = new LinkedHashMap<>();
+      for (final Map.Entry<RaftPeerId, String> e : pending.entrySet())
+        round.put(e.getKey(), prober.probe(e.getKey(), e.getValue(), perAttemptMs));
+
+      boolean anyRetryable = false;
+      for (final Map.Entry<RaftPeerId, CompletableFuture<ProbeOutcome>> e : round.entrySet()) {
+        final RaftPeerId peerId = e.getKey();
+        ProbeOutcome outcome;
+        try {
+          outcome = e.getValue().get(perAttemptMs, TimeUnit.MILLISECONDS);
+        } catch (final TimeoutException te) {
+          e.getValue().cancel(true);
+          outcome = ProbeOutcome.retryable("probe timed out");
+        } catch (final Exception ex) {
+          outcome = ProbeOutcome.retryable(ex.getMessage());
+        }
+        switch (outcome.result()) {
+        case OK -> {
+          results.put(peerId, outcome.states());
+          pending.remove(peerId);
+        }
+        case FATAL ->
+          // Definitive answer that isn't going to change on retry (e.g. Raft HA not enabled on the
+          // peer): stop probing it. It ends up in assumedEmptyOut below.
+          pending.remove(peerId);
+        case RETRYABLE -> anyRetryable = true;
+        }
+      }
+
+      if (!pending.isEmpty() && anyRetryable && System.nanoTime() < deadlineNanos && keepGoing.getAsBoolean()) {
+        try {
+          Thread.sleep(backoffMs);
+        } catch (final InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
+    }
+
+    if (assumedEmptyOut != null)
+      for (final RaftPeerId peerId : peerAddresses.keySet())
+        if (!results.containsKey(peerId))
+          assumedEmptyOut.add(peerId);
+    return results;
+  }
+
+  /**
+   * Whether an HTTP status returned by a peer's {@code /bootstrap-state} probe should be retried
+   * (rather than concluded as "no state"). {@code 401}/{@code 403} are the common case during a
+   * parallel cold boot: the probed peer's HTTP server is up but its security stack is still
+   * initializing so the shared cluster credentials are momentarily rejected (issue #5273).
+   * {@code 408}/{@code 425}/{@code 429} and any {@code 5xx} are likewise transient "not ready yet"
+   * answers. Everything else (notably {@code 200} success and {@code 400}/{@code 404} "Raft HA not
+   * enabled / no such endpoint") is definitive.
+   */
+  static boolean isRetryableProbeStatus(final int statusCode) {
+    return statusCode == 401 || statusCode == 403 || statusCode == 408 || statusCode == 425
+        || statusCode == 429 || statusCode >= 500;
+  }
+
+  private CompletableFuture<ProbeOutcome> queryPeer(final RaftPeerId peerId,
+      final String httpAddr, final Set<String> dbFilter, final long attemptTimeoutMs) {
     final String url = "http://" + httpAddr + "/api/v1/cluster/bootstrap-state";
     final HttpRequest.Builder builder = HttpRequest.newBuilder()
         .uri(URI.create(url))
-        .timeout(Duration.ofMillis(timeoutMs))
+        .timeout(Duration.ofMillis(attemptTimeoutMs))
         .header("Content-Type", "application/json")
         .POST(HttpRequest.BodyPublishers.ofString("{}"));
     final String token = haServer.getClusterToken();
@@ -278,10 +458,15 @@ class BootstrapElection {
 
     return HTTP.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
         .thenApply(resp -> {
-          if (resp.statusCode() != 200) {
-            LogManager.instance().log(this, Level.WARNING,
-                "Bootstrap: peer %s responded with HTTP %d to /bootstrap-state", peerId, resp.statusCode());
-            return null;
+          final int status = resp.statusCode();
+          if (status != 200) {
+            final boolean retryable = isRetryableProbeStatus(status);
+            // Transient failures are expected during a parallel cold boot and are retried below, so
+            // log them at INFO (not WARNING) to avoid alarming operators mid-recovery (issue #5273).
+            LogManager.instance().log(this, retryable ? Level.INFO : Level.WARNING,
+                "Bootstrap: peer %s responded with HTTP %d to /bootstrap-state%s", peerId, status,
+                retryable ? " (transient; retrying within the bootstrap budget)" : "");
+            return retryable ? ProbeOutcome.retryable("HTTP " + status) : ProbeOutcome.fatal("HTTP " + status);
           }
           try {
             final JSONObject json = new JSONObject(resp.body());
@@ -295,17 +480,18 @@ class BootstrapElection {
               result.put(name, new PeerState(peerId, name, db.getString("fingerprint"),
                   db.getLong("lastTxId")));
             }
-            return Map.of(peerId, result);
+            return ProbeOutcome.ok(result);
           } catch (final Exception e) {
             LogManager.instance().log(this, Level.WARNING,
                 "Bootstrap: peer %s returned malformed JSON: %s", peerId, e.getMessage());
-            return null;
+            return ProbeOutcome.retryable("malformed JSON: " + e.getMessage());
           }
         })
         .exceptionally(t -> {
-          LogManager.instance().log(this, Level.WARNING,
-              "Bootstrap: failed to query peer %s: %s", peerId, t.getMessage());
-          return null;
+          LogManager.instance().log(this, Level.INFO,
+              "Bootstrap: failed to query peer %s (transient; retrying within the bootstrap budget): %s",
+              peerId, t.getMessage());
+          return ProbeOutcome.retryable(t.getMessage());
         });
   }
 
@@ -379,12 +565,23 @@ class BootstrapElection {
     for (final String dbName : dbNames) {
       final PeerState local = localStateFor(states.get(dbName), localId);
       if (local == null || local.lastTxId < 0) {
-        // The elected source does not hold this database (or holds no data for it). This is only
-        // reachable when an operator staged a database onto a different node outside Raft; warn so
-        // the misconfiguration is visible. The node that does hold it keeps its copy; the overwrite
-        // guard handles reconciliation if a baseline is ever committed for it later.
-        LogManager.instance().log(this, Level.WARNING,
-            "Bootstrap: elected source %s has no local data for '%s'; skipping its baseline", localId, dbName);
+        // The elected source contributes no usable bootstrap state for this database, so there is
+        // nothing to seed from it and its baseline is skipped. This is only reachable when an operator
+        // staged a database onto a different node outside Raft, OR when this database was not part of
+        // the elected source's own reported state at election time. Distinguish the two so the message
+        // is not misleading during an outage recovery (issue #5273): "no local data" here means "no
+        // bootstrap state / no committed transaction id", NOT "the database files are missing" - any
+        // on-disk copy is left untouched and reconciled by the overwrite guard if a baseline is
+        // committed for it later.
+        if (local == null)
+          LogManager.instance().log(this, Level.WARNING,
+              "Bootstrap: elected source %s did not report bootstrap state for '%s' (database not present or not yet "
+                  + "open on this node at election time); skipping its baseline. Any on-disk copy is left untouched.",
+              localId, dbName);
+        else
+          LogManager.instance().log(this, Level.WARNING,
+              "Bootstrap: elected source %s holds '%s' but it reports no committed transaction id (lastTxId=-1); "
+                  + "nothing to seed, skipping its baseline. The on-disk copy is left untouched.", localId, dbName);
         continue;
       }
 
@@ -479,5 +676,33 @@ class BootstrapElection {
 
   /** Per-peer per-database state collected during bootstrap. */
   record PeerState(RaftPeerId peerId, String dbName, String fingerprint, long lastTxId) {
+  }
+
+  /** A single peer probe, injected so {@link #collectRemoteStatesWithRetry} is testable without HTTP. */
+  @FunctionalInterface
+  interface ProbeFunction {
+    CompletableFuture<ProbeOutcome> probe(RaftPeerId peerId, String httpAddr, long attemptTimeoutMs);
+  }
+
+  /** Classification of one {@code /bootstrap-state} probe attempt. */
+  enum ProbeResult {
+    OK,        // peer answered 200 with its state
+    RETRYABLE, // transient failure (401/403/5xx/unreachable): re-probe within the budget
+    FATAL      // definitive non-answer that won't change on retry (e.g. Raft HA not enabled)
+  }
+
+  /** Outcome of one {@code /bootstrap-state} probe attempt. {@code states} is non-null only for {@link ProbeResult#OK}. */
+  record ProbeOutcome(ProbeResult result, Map<String, PeerState> states, String detail) {
+    static ProbeOutcome ok(final Map<String, PeerState> states) {
+      return new ProbeOutcome(ProbeResult.OK, states, null);
+    }
+
+    static ProbeOutcome retryable(final String detail) {
+      return new ProbeOutcome(ProbeResult.RETRYABLE, null, detail);
+    }
+
+    static ProbeOutcome fatal(final String detail) {
+      return new ProbeOutcome(ProbeResult.FATAL, null, detail);
+    }
   }
 }

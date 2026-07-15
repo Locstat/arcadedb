@@ -218,6 +218,17 @@ public class CypherExecutionPlanner {
           if (path.hasPathVariable())
             return false;
 
+          // Inline relationship property filters (e.g., [r:LINK {w: 1}]) and inline relationship
+          // WHERE predicates (e.g., [r:LINK WHERE r.w = 1]) are not applied by the optimizer's
+          // ExpandAll/ExpandInto operators (and the GAV/CSR fast paths never load edge objects,
+          // so they cannot evaluate edge predicates at all). Fall back to the legacy path, whose
+          // MatchRelationshipStep applies both filters correctly. See issue #5093.
+          for (int ri = 0; ri < path.getRelationshipCount(); ri++) {
+            final RelationshipPattern relP = path.getRelationship(ri);
+            if (relP.hasProperties() || relP.hasWhereExpression())
+              return false;
+          }
+
           for (final NodePattern node : path.getNodes()) {
             // Anonymous nodes (no variable) with unidirectional edges can't be handled
             // by the optimizer's expansion chain - anchor validation can't re-anchor
@@ -268,7 +279,6 @@ public class CypherExecutionPlanner {
     // Fall back to ordered execution when write/mutating clauses are interleaved with WITH/UNWIND,
     // or when MATCH appears after WITH (MATCH-WITH-MATCH pattern).
     if (statement.getClausesInOrder() != null) {
-      int createCount = 0;
       int mergeCount = 0;
       int deleteCount = 0;
       boolean seenWith = false;
@@ -292,9 +302,6 @@ public class CypherExecutionPlanner {
         case UNWIND:
           seenUnwind = true;
           break;
-        case CREATE:
-          createCount++;
-          break;
         case MERGE:
           mergeCount++;
           break;
@@ -305,8 +312,14 @@ public class CypherExecutionPlanner {
           break;
         }
       }
-      // Multiple CREATE/MERGE/DELETE clauses not handled by optimizer path
-      if (createCount > 1 || mergeCount > 1 || (deleteCount > 0 && mergeCount > 0))
+      // Multiple CREATE clauses ARE handled by the optimizer path: buildExecutionStepsWithOptimizer
+      // iterates clausesInOrder and chains a CreateStep per CREATE clause. Variables created by an
+      // earlier CREATE are threaded forward because each CreateStep copies its input row's properties
+      // (including freshly created vertices/edges) into the new row, and createPath reuses any node
+      // variable already bound in the row instead of re-creating it. So a chain like
+      // CREATE (q:Person {...}) CREATE (p)-[:R]->(q) correctly links the matched p to the new q. See #5136.
+      // MERGE, however, is still limited to one clause, and DELETE+MERGE mixing is unsupported.
+      if (mergeCount > 1 || (deleteCount > 0 && mergeCount > 0))
         return false;
     }
 

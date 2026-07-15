@@ -31,15 +31,18 @@ import com.arcadedb.engine.PaginatedComponentFile;
 import com.arcadedb.engine.WALFile;
 import com.arcadedb.exception.ConcurrentModificationException;
 import com.arcadedb.exception.DuplicatedKeyException;
+import com.arcadedb.exception.NeedRetryException;
 import com.arcadedb.exception.RecordNotFoundException;
 import com.arcadedb.exception.SchemaException;
 import com.arcadedb.exception.TransactionException;
+import com.arcadedb.graph.MutableEdgeSegment;
 import com.arcadedb.index.IndexInternal;
 import com.arcadedb.index.lsm.LSMTreeIndexAbstract;
 import com.arcadedb.log.LogManager;
 import com.arcadedb.schema.LocalSchema;
 import com.arcadedb.utility.IntHashSet;
 import com.arcadedb.utility.IntIntHashMap;
+import com.arcadedb.utility.LongHashSet;
 import com.arcadedb.utility.RidHashSet;
 
 import java.io.IOException;
@@ -81,7 +84,26 @@ public class TransactionContext implements Transaction {
   private final RidHashSet                            deletedRecordsInTx    = new RidHashSet();
   private       Map<PageId, MutablePage>             modifiedPages;
   private       Map<PageId, MutablePage>             newPages;
+  // GRAPH_EDGE_APPEND_MERGE (super-node write contention): appends to an edge-list chunk commute, so a
+  // commit-time page-version conflict whose ONLY cause is concurrent in-chunk edge appends can be resolved by
+  // re-applying THIS transaction's appends on top of the newer committed page, instead of failing the whole
+  // transaction with a ConcurrentModificationException and retrying. Tracked per SEGMENT rid with the appended
+  // pairs packed into primitive arrays (see EdgeAppendBuffer) so the append hot path allocates nothing per
+  // edge; segment page ids are resolved lazily only on the rare commit conflict. A page stays eligible only
+  // while EVERY modification this transaction made to it is a tracked append; the first non-append write to it
+  // (edge removal, new-chunk allocation, bulk addAll) poisons its page so it can never be rebased.
+  private       Map<RID, EdgeAppendBuffer>           edgeAppendsBySegment;
+  // Poisoned edge-list pages, keyed by a packed (fileId, pageNumber) long so poisoning and the hot-path skip
+  // check allocate nothing (no PageId objects).
+  private       LongHashSet                          edgeAppendPoisonedPages;
+  private       boolean                              edgeAppendMerge;
   private       boolean                              useWAL;
+  // #5064: set by the HA layer AFTER the replication quorum durably committed this transaction and BEFORE
+  // the local phase-2 apply. Shifts the durability boundary for the failure regimes in commit2ndPhase's
+  // finally: a local failure past this point must never roll back user-held record identities (the cluster
+  // committed them - a retry would duplicate) nor fence the database (no orphaned local WAL record exists;
+  // the Raft layer reconciles pages from the replicated payload).
+  private       boolean                              remotelyCommitted;
   private       boolean                              asyncFlush            = true;
   private       WALFile.FlushType                    walFlush;
   private       List<Integer>                        lockedFiles;
@@ -139,12 +161,20 @@ public class TransactionContext implements Transaction {
 
   @Override
   public void begin(final Database.TRANSACTION_ISOLATION_LEVEL isolationLevel) {
+    // #5064: the base context is REUSED across transactions on this thread - the regime flag must never
+    // leak from a previous (Raft-committed) transaction into a fresh one, or a plain local failure would
+    // silently skip the #4940 rollback. Cleared here AND in reset() (belt and braces).
+    remotelyCommitted = false;
     this.isolationLevel = isolationLevel;
 
     if (status != STATUS.INACTIVE)
       throw new TransactionException("Transaction already begun");
 
     status = STATUS.BEGUN;
+
+    // Read once per transaction (DATABASE-scope, constant for the DB lifetime): keeps the per-append hot path
+    // to a plain field read instead of a configuration lookup.
+    edgeAppendMerge = database.getConfiguration().getValueAsBoolean(GlobalConfiguration.GRAPH_EDGE_APPEND_MERGE);
 
     // Optimized: initial capacity 32 for typical transaction page count
     modifiedPages = new HashMap<>(32);
@@ -185,8 +215,27 @@ public class TransactionContext implements Transaction {
     return isolationLevel;
   }
 
+  /** #5064: see the {@code remotelyCommitted} field - HA-layer only, call after quorum commit, before phase 2. */
+  public void setRemotelyCommitted(final boolean remotelyCommitted) {
+    this.remotelyCommitted = remotelyCommitted;
+  }
+
   public void setRequester(final Object requester) {
     this.requester = requester;
+  }
+
+  /**
+   * Returns the transaction's own WRITTEN copy of a record - a deferred update ({@code updatedRecords}) or the
+   * mutable working copy ({@code modifiedRecordsCache}) - or null when this transaction has not written it.
+   * Unlike {@link #getRecordFromCache(RID)} it NEVER returns a read-only cached record: callers that need to
+   * re-read their own deferred writes (updates are applied to pages only at commit) use this so a stale
+   * read-only copy can never masquerade as the current state and silently roll back a concurrent change.
+   */
+  public Record getWrittenRecord(final RID rid) {
+    Record rec = updatedRecords != null ? updatedRecords.get(rid) : null;
+    if (rec == null)
+      rec = modifiedRecordsCache.get(rid);
+    return rec;
   }
 
   public Record getRecordFromCache(final RID rid) {
@@ -509,6 +558,174 @@ public class TransactionContext implements Transaction {
     return newPageCounters.get(indexFileId);
   }
 
+  /**
+   * Allocation-light store of the in-chunk appends made to ONE edge segment in this transaction: the (edge,
+   * vertex) RID pairs are packed into growable primitive arrays instead of one object per appended edge, so a
+   * hot vertex receiving thousands of edges costs a handful of array growths, not thousands of allocations.
+   * The RID objects are rebuilt only at rebase time (on the rare commit conflict). See {@link
+   * #edgeAppendsBySegment}.
+   */
+  private static final class EdgeAppendBuffer {
+    private int[]  edgeBucket   = new int[8];
+    private long[] edgePosition = new long[8];
+    private int[]  vertexBucket = new int[8];
+    private long[] vertexPosition = new long[8];
+    private int    size;
+
+    void add(final RID edge, final RID vertex) {
+      if (size == edgeBucket.length) {
+        final int n = size << 1;
+        edgeBucket = Arrays.copyOf(edgeBucket, n);
+        edgePosition = Arrays.copyOf(edgePosition, n);
+        vertexBucket = Arrays.copyOf(vertexBucket, n);
+        vertexPosition = Arrays.copyOf(vertexPosition, n);
+      }
+      edgeBucket[size] = edge.getBucketId();
+      edgePosition[size] = edge.getPosition();
+      vertexBucket[size] = vertex.getBucketId();
+      vertexPosition[size] = vertex.getPosition();
+      ++size;
+    }
+  }
+
+  /**
+   * Tells whether the commutative edge-append merge is enabled for this transaction.
+   */
+  public boolean isEdgeAppendMergeEnabled() {
+    return edgeAppendMerge;
+  }
+
+  /**
+   * Records an in-place edge append (from {@link com.arcadedb.graph.EdgeLinkedList#add}) as rebasable: if the
+   * segment's page loses the commit-time version check because another transaction appended to the same head
+   * chunk, the append can be replayed on top of the newer page instead of failing the whole transaction.
+   * <p>
+   * Hot path: keyed by SEGMENT rid (a super-node is one segment no matter how many edges land on it), the pair
+   * is packed into primitive arrays, and the segment's {@link PageId} is NOT computed here - it is resolved
+   * lazily only when a page actually conflicts at commit (rare). So the common no-contention append costs a
+   * map lookup on an existing key, nothing allocated per edge. No-op when the feature is off.
+   */
+  public void trackEdgeAppend(final RID segmentRID, final RID edgeRID, final RID vertexRID) {
+    if (!edgeAppendMerge)
+      return;
+
+    // Skip pages already poisoned (a brand-new chunk - e.g. a just-created source vertex's edge list - poisons
+    // its own page at createRecord). Those can never be rebased, so tracking them would only waste a buffer.
+    // The page key is packed arithmetic, no allocation.
+    if (edgeAppendPoisonedPages != null && edgeAppendPoisonedPages.contains(edgeSegmentPageKey(segmentRID)))
+      return;
+
+    if (edgeAppendsBySegment == null)
+      edgeAppendsBySegment = new HashMap<>();
+
+    EdgeAppendBuffer buffer = edgeAppendsBySegment.get(segmentRID);
+    if (buffer == null)
+      edgeAppendsBySegment.put(segmentRID, buffer = new EdgeAppendBuffer());
+    buffer.add(edgeRID, vertexRID);
+  }
+
+  /**
+   * Marks the edge-segment page holding {@code segmentRID} as NOT rebasable: this transaction changed it in a
+   * way that does not commute with a concurrent append (edge removal, new-chunk allocation, bulk load). Tracked
+   * appends on that page are ignored at commit (the conflict check below excludes poisoned pages), so a rebase
+   * can never silently re-derive the page from committed-state + appends. No-op when the feature is off.
+   */
+  public void poisonEdgeAppendPage(final RID segmentRID) {
+    if (!edgeAppendMerge)
+      return;
+
+    if (edgeAppendPoisonedPages == null)
+      edgeAppendPoisonedPages = new LongHashSet();
+    edgeAppendPoisonedPages.add(edgeSegmentPageKey(segmentRID));
+  }
+
+  /** Packs the (fileId, pageNumber) of the page holding {@code segmentRID} into a long key (no allocation). */
+  private long edgeSegmentPageKey(final RID segmentRID) {
+    final LocalBucket bucket = (LocalBucket) database.getSchema().getBucketById(segmentRID.getBucketId());
+    if (bucket == null)
+      // The edge bucket cannot vanish under the held commit lock; treat a missing one as a retryable conflict
+      // rather than NPE.
+      throw new ConcurrentModificationException("Edge-append: bucket " + segmentRID.getBucketId()
+          + " for segment " + segmentRID + " not found. Please retry the operation");
+    final int pageNumber = (int) (segmentRID.getPosition() / bucket.getMaxRecordsInPage());
+    return packPageKey(segmentRID.getBucketId(), pageNumber);
+  }
+
+  private static long packPageKey(final int fileId, final int pageNumber) {
+    return ((long) fileId << 32) | (pageNumber & 0xFFFFFFFFL);
+  }
+
+  private boolean isRebasableEdgeAppendPage(final PageId pageId) {
+    if (!edgeAppendMerge || edgeAppendsBySegment == null)
+      return false;
+    final long key = packPageKey(pageId.getFileId(), pageId.getPageNumber());
+    if (edgeAppendPoisonedPages != null && edgeAppendPoisonedPages.contains(key))
+      return false;
+    // Is at least one tracked segment on this (conflicting) page? Computing the segment page keys here, on the
+    // rare conflict path, is what keeps the append hot path free of allocation.
+    for (final RID segmentRID : edgeAppendsBySegment.keySet())
+      if (edgeSegmentPageKey(segmentRID) == key)
+        return true;
+    return false;
+  }
+
+  /**
+   * Replays this transaction's tracked in-chunk appends for {@code pageId} on top of the current committed
+   * version of that page, resolving a version conflict that was caused solely by concurrent appends to the
+   * same edge-list chunk(s). Runs only on the leader/embedded commit, while the edge file's commit lock is
+   * held (so the current version is stable), and only for pages whose every modification was a tracked append.
+   *
+   * @return the freshly rebased page, ready to be version-checked and committed.
+   *
+   * @throws ConcurrentModificationException if a targeted chunk filled up in the meantime (a pure in-chunk
+   *                                         rebase is no longer possible): the caller falls back to a normal
+   *                                         full-transaction retry.
+   */
+  private MutablePage rebaseEdgeAppends(final PageId pageId) throws IOException {
+    // Drop the stale copies so the reload observes the current committed version of the page.
+    modifiedPages.remove(pageId);
+    immutablePages.remove(pageId);
+
+    final long pageKey = packPageKey(pageId.getFileId(), pageId.getPageNumber());
+
+    // Re-apply every tracked segment that lives on this page (usually one: the hot vertex's head chunk).
+    for (final Map.Entry<RID, EdgeAppendBuffer> entry : edgeAppendsBySegment.entrySet()) {
+      final RID segmentRID = entry.getKey();
+      if (edgeSegmentPageKey(segmentRID) != pageKey)
+        continue;
+
+      final LocalBucket bucket = (LocalBucket) database.getSchema().getBucketById(segmentRID.getBucketId());
+
+      // Load the chunk fresh from the (now current) page, bypassing the tx record cache which still holds the
+      // stale, already-appended instance. A concurrently-vanished chunk (RecordNotFoundException) cannot happen
+      // under the held commit lock; if it ever did, fall back to a full retry rather than aborting the tx.
+      final MutableEdgeSegment segment;
+      try {
+        segment = new MutableEdgeSegment(database, segmentRID, bucket.getRecord(segmentRID).copyOfContent());
+      } catch (final RecordNotFoundException e) {
+        throw new ConcurrentModificationException(
+            "Edge-append rebase not possible: chunk " + segmentRID + " no longer exists. Please retry the operation");
+      }
+
+      final EdgeAppendBuffer buffer = entry.getValue();
+      for (int i = 0; i < buffer.size; ++i)
+        if (!segment.add(new RID(buffer.edgeBucket[i], buffer.edgePosition[i]),
+            new RID(buffer.vertexBucket[i], buffer.vertexPosition[i])))
+          throw new ConcurrentModificationException(
+              "Edge-append rebase not possible: chunk " + segmentRID + " filled up concurrently. Please retry the operation");
+
+      // Immediate synchronous page write: updatedRecords was already drained earlier in commit1stPhase, so the
+      // deferred updateRecord path would never be flushed.
+      database.updateRecordNoLock(segment, false);
+    }
+
+    final MutablePage rebased = modifiedPages.get(pageId);
+    if (rebased == null)
+      throw new ConcurrentModificationException("Edge-append rebase produced no page for " + pageId + ". Please retry the operation");
+    database.getPageManager().incrementEdgeAppendMerges();
+    return rebased;
+  }
+
   @Override
   public boolean isActive() {
     return status != STATUS.INACTIVE;
@@ -567,6 +784,8 @@ public class TransactionContext implements Transaction {
     }
     modifiedPages = null;
     newPages = null;
+    edgeAppendsBySegment = null;
+    edgeAppendPoisonedPages = null;
     updatedRecords = null;
     updatedRecordsIndexSnapshot = null;
     newPageCounters.clear();
@@ -715,7 +934,7 @@ public class TransactionContext implements Transaction {
     status = STATUS.COMMIT_1ST_PHASE;
 
     try {
-      // #4937 review: explicit-lock mode captured before checkExplicitLocks nulls explicitLockedFiles, so the
+      // #4937: explicit-lock mode captured before checkExplicitLocks nulls explicitLockedFiles, so the
       // late-joiner block below can still tell an explicit-lock transaction from an auto-locked one.
       boolean explicitLockMode = false;
       if (isLeader) {
@@ -729,7 +948,7 @@ public class TransactionContext implements Transaction {
         final IntHashSet modifiedFiles = lockFilesFromChanges();
 
         // checkExplicitLocks nulls explicitLockedFiles on success, so remember the mode now for the
-        // late-joiner check further down (#4937 review): otherwise that check always sees null and would
+        // late-joiner check further down (#4937): otherwise that check always sees null and would
         // silently expand an explicit-lock transaction's lock set, defeating the explicit-locking contract.
         explicitLockMode = explicitLockedFiles != null;
 
@@ -845,17 +1064,45 @@ public class TransactionContext implements Transaction {
           bucket.compressPage(page, false);
       }
 
+      List<PageId> pagesToRebase = null;
       for (final Iterator<MutablePage> it = modifiedPages.values().iterator(); it.hasNext(); ) {
         final MutablePage p = it.next();
 
         final int[] range = p.getModifiedRange();
-        if (range[1] > 0) {
-          pageManager.checkPageVersion(p, false);
-          pages.add(p);
-        } else
+        if (range[1] <= 0) {
           // PAGE NOT MODIFIED, REMOVE IT
           it.remove();
+          continue;
+        }
+
+        try {
+          pageManager.checkPageVersion(p, false);
+          pages.add(p);
+        } catch (final ConcurrentModificationException e) {
+          // Commutative edge-append merge: when the ONLY change this (leader/embedded) transaction made to the
+          // conflicting page was appending edges to their chunk(s), the appends can be replayed on the newer
+          // committed version instead of failing the whole transaction. The edge file's commit lock is held
+          // here, so the current version stays stable across the rebase performed after the loop (rebasing here
+          // would structurally modify modifiedPages while iterating it).
+          if (isLeader && isRebasableEdgeAppendPage(p.getPageId())) {
+            if (pagesToRebase == null)
+              pagesToRebase = new ArrayList<>();
+            pagesToRebase.add(p.getPageId());
+            it.remove();
+          } else
+            throw e;
+        }
       }
+
+      if (pagesToRebase != null)
+        for (final PageId pageId : pagesToRebase) {
+          final MutablePage rebased = rebaseEdgeAppends(pageId);
+          final LocalBucket bucket = localSchema.getBucketById(rebased.getPageId().getFileId(), false);
+          if (bucket != null)
+            bucket.compressPage(rebased, false);
+          pageManager.checkPageVersion(rebased, false);
+          pages.add(rebased);
+        }
 
       if (newPages != null)
         for (final MutablePage p : newPages.values()) {
@@ -876,12 +1123,17 @@ public class TransactionContext implements Transaction {
 
       return new TransactionPhase1(result, pages);
 
-    } catch (final DuplicatedKeyException | ConcurrentModificationException e) {
+    } catch (final DuplicatedKeyException | NeedRetryException e) {
+      // NeedRetryException covers ConcurrentModificationException AND every other retryable conflict, notably
+      // LockTimeoutException from the commit file-lock acquisition: wrapping those in the generic
+      // TransactionException below silently made a retryable contention error NON-retryable, so under heavy
+      // commit-lock pressure (e.g. concurrent super-node writes, #5156) transactions failed to the caller
+      // instead of retrying.
       rollback();
       throw e;
     } catch (final TransactionException e) {
       // Already a first-class transaction error (e.g. the explicit-lock contract violation): rethrow as-is
-      // instead of double-wrapping it in a generic "Transaction error on commit" (#5053 review).
+      // instead of double-wrapping it in a generic "Transaction error on commit" (#5053).
       rollback();
       throw e;
     } catch (final Exception e) {
@@ -920,7 +1172,7 @@ public class TransactionContext implements Transaction {
       // data never committed. The bump below mutates only this transaction's private MutablePage instances,
       // so a WAL-append failure still aborts cleanly with nothing observable. The in-between window is safe
       // because every modified file's lock is held (#4937 guarantees coverage) until reset().
-      // #5053 review: refuse to commit on a fenced database, before doing any work. The file locks this
+      // #5053: refuse to commit on a fenced database, before doing any work. The file locks this
       // transaction acquired in phase 1 give the happens-before edge: for any transaction sharing a page
       // with the failed one, the fence write (made before the failed commit's reset() released those locks)
       // is visible here - it cannot append a WAL record targeting the same page version the orphaned record
@@ -1005,7 +1257,20 @@ public class TransactionContext implements Transaction {
         // The RIDs optimistically assigned to records created in this transaction remain valid (the replay
         // makes them real): release resources WITHOUT touching user-held record state.
         reset();
-      } else if (database.getEmbedded() instanceof LocalDatabase localDatabase && localDatabase.isFencedForRecovery())
+      } else if (remotelyCommitted)
+        // #5064: the replication QUORUM already durably committed this transaction cluster-wide; only the
+        // LOCAL apply failed, before anything local was durable. The records the user holds carry the
+        // identities the cluster committed, so rollback()'s identity reset would invite an application
+        // retry to INSERT DUPLICATES of already-committed records - release resources WITHOUT touching
+        // user-held record state. No fence in THIS branch because it is only reachable pre-append (no
+        // orphaned local WAL record to diverge from; the Raft layer reconciles the pages from the
+        // replicated payload). A failure AFTER the local append takes the walAppended branch above and
+        // still fences, INTENTIONALLY: an orphaned local WAL record exists there regardless of the remote
+        // commit, and that branch also preserves identities via reset(). Unlike the #4940 rollback below,
+        // modified records are intentionally NOT reloaded: their in-memory content is exactly what the
+        // cluster committed, so there is nothing to restore.
+        reset();
+      else if (database.getEmbedded() instanceof LocalDatabase localDatabase && localDatabase.isFencedForRecovery())
         // A fence-REFUSED commit (this tx appended nothing; the fence came from an earlier failure) cannot
         // roll back its record state: rollback()'s record reload would hit the fence choke point itself and
         // replace the fence error with a confusing secondary failure. Release resources only - the database
@@ -1019,7 +1284,7 @@ public class TransactionContext implements Transaction {
         try {
           rollback();
         } catch (final Throwable rollbackError) {
-          // #5061 review: the cleanup must never SUPPRESS the primary commit exception - e.g. a failed
+          // #5061: the cleanup must never SUPPRESS the primary commit exception - e.g. a failed
           // dictionary reload here would surface a retryable ConcurrentModificationException as a
           // non-retryable SchemaException, breaking the caller's retry loop. Log the secondary failure and
           // degrade to reset() so locks and status are still released (reset() is safe after a partial
@@ -1055,6 +1320,7 @@ public class TransactionContext implements Transaction {
   }
 
   public void reset() {
+    remotelyCommitted = false;
     status = STATUS.INACTIVE;
 
     if (explicitLockedFiles != null) {
@@ -1071,6 +1337,8 @@ public class TransactionContext implements Transaction {
 
     modifiedPages = null;
     newPages = null;
+    edgeAppendsBySegment = null;
+    edgeAppendPoisonedPages = null;
     updatedRecords = null;
     updatedRecordsIndexSnapshot = null;
     newPageCounters.clear();
@@ -1229,7 +1497,7 @@ public class TransactionContext implements Transaction {
   }
 
   /**
-   * #4937 review: late-joiner coverage check for an EXPLICIT-lock transaction. By this point the earlier
+   * #4937: late-joiner coverage check for an EXPLICIT-lock transaction. By this point the earlier
    * {@link #checkExplicitLocks} has moved the user's explicit lock set into {@code lockedFiles} (and nulled
    * {@code explicitLockedFiles}), so a file in the transaction's page set that is NOT in {@code lockedFiles}
    * is one the user did not lock. Surface it as the same contract violation a direct modification of an

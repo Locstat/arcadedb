@@ -308,6 +308,37 @@ class CypherQueryStatisticsTest extends TestHelper {
   }
 
   @Test
+  void undirectedDeleteCountsRelationshipOnce() {
+    // Issue #5218: an undirected pattern binds the same relationship twice when both endpoints
+    // satisfy the match (u=a and u=b), producing two rows that each carry the same edge. The graph
+    // state must remain correct (1 relationship removed) and relationshipsDeleted must be 1, not 2,
+    // matching Neo4j.
+    database.transaction(() -> {
+      database.command("opencypher", "CREATE (a:X {remove:true})-[:R]->(b:X {remove:true})");
+      final QueryStatistics s = statsOf(database,
+          "MATCH (u:X {remove:true}) MATCH (u)-[r]-() DELETE r");
+      assertThat(s.getRelationshipsDeleted()).isEqualTo(1);
+
+      // Graph state: no relationship left
+      final ResultSet check = database.query("opencypher", "MATCH ()-[r:R]->() RETURN count(r) AS c");
+      assertThat(check.next().<Number>getProperty("c").intValue()).isEqualTo(0);
+    });
+  }
+
+  @Test
+  void undirectedDetachDeleteCountsSharedRelationshipOnce() {
+    // Companion to #5218: an undirected DETACH DELETE where both endpoints match binds the shared
+    // relationship in two rows. Both nodes are deleted (2) but the single relationship connecting
+    // them must be counted once (1), not once per endpoint, matching Neo4j.
+    database.transaction(() -> {
+      database.command("opencypher", "CREATE (a:Y {remove:true})-[:R]->(b:Y {remove:true})");
+      final QueryStatistics s = statsOf(database, "MATCH (u:Y {remove:true}) DETACH DELETE u");
+      assertThat(s.getNodesDeleted()).isEqualTo(2);
+      assertThat(s.getRelationshipsDeleted()).isEqualTo(1);
+    });
+  }
+
+  @Test
   void mergeOnMatchSetUnchangedValueStillCountsPropertySet() {
     database.transaction(() -> {
       database.command("opencypher", "CREATE (:MM {k:'x', p:1})");
@@ -328,5 +359,91 @@ class CypherQueryStatisticsTest extends TestHelper {
       assertThat(s.getNodesDeleted()).isEqualTo(1);
       assertThat(s.getRelationshipsDeleted()).isEqualTo(1);
     });
+  }
+
+  @Test
+  void detachDeleteWithExplicitEdgeCountsRelationshipOnce() {
+    database.transaction(() -> {
+      database.command("opencypher",
+          "CREATE (a:Dd {n:'a'})-[:LINK]->(b:Dd {n:'b'})");
+      final QueryStatistics s = statsOf(database,
+          "MATCH (a:Dd {n:'a'})-[r:LINK]->(b:Dd {n:'b'}) DETACH DELETE r, a, b");
+      assertThat(s.getRelationshipsDeleted()).isEqualTo(1);
+      assertThat(s.getNodesDeleted()).isEqualTo(2);
+    });
+  }
+
+  @Test
+  void callSubqueryWriteCountsPropagateToOuter() {
+    database.transaction(() -> {
+      final QueryStatistics s = statsOf(database,
+          "UNWIND [1,2] AS x CALL { WITH x CREATE (:CallNode {v:x}) } RETURN x");
+      assertThat(s.getNodesCreated()).isEqualTo(2);
+      assertThat(s.getPropertiesSet()).isEqualTo(2);
+      assertThat(s.getLabelsAdded()).isEqualTo(2);
+      assertThat(s.containsUpdates()).isTrue();
+    });
+  }
+
+  @Test
+  void topLevelUnionWriteCountsAreSummed() {
+    database.transaction(() -> {
+      final QueryStatistics s = statsOf(database,
+          "CREATE (:UnionA {n:1}) RETURN 1 AS r UNION ALL CREATE (:UnionB {n:2}) RETURN 2 AS r");
+      assertThat(s.getNodesCreated()).isEqualTo(2);
+      assertThat(s.getPropertiesSet()).isEqualTo(2);
+      assertThat(s.getLabelsAdded()).isEqualTo(2);
+      assertThat(s.containsUpdates()).isTrue();
+    });
+  }
+
+  @Test
+  void zeroNetEffectWriteUnionStillReportsStatisticsPresent() {
+    // Presence of statistics on the result set signals "this was a write statement", independent
+    // of whether the write actually mutated anything. Both UNION branches are MERGE clauses that
+    // match the pre-existing node, so containsUpdates() is false, but getStatistics() must still
+    // be present.
+    database.transaction(() -> {
+      database.command("opencypher", "CREATE (:UnionMergeTarget {id:1})");
+      final ResultSet rs = database.command("opencypher",
+          "MERGE (n:UnionMergeTarget {id:1}) RETURN n.id AS r UNION ALL "
+              + "MERGE (n:UnionMergeTarget {id:1}) RETURN n.id AS r");
+      while (rs.hasNext())
+        rs.next();
+      assertThat(rs.getStatistics()).isPresent();
+      assertThat(rs.getStatistics().get().containsUpdates()).isFalse();
+    });
+  }
+
+  @Test
+  void notNullConstraintCountsAsConstraintAdded() {
+    database.command("opencypher", "CREATE (:NnLabel {p:1})");
+    final QueryStatistics s = statsOf(database, "CREATE CONSTRAINT FOR (n:NnLabel) REQUIRE n.p IS NOT NULL");
+    assertThat(s.getConstraintsAdded()).isEqualTo(1);
+  }
+
+  @Test
+  void nodeKeyConstraintCountsAsConstraintAdded() {
+    final QueryStatistics s = statsOf(database, "CREATE CONSTRAINT FOR (n:KeyLabel) REQUIRE n.k IS NODE KEY");
+    assertThat(s.getConstraintsAdded()).isEqualTo(1);
+  }
+
+  @Test
+  void typedConstraintCountsAsConstraintAdded() {
+    final QueryStatistics s = statsOf(database, "CREATE CONSTRAINT FOR (n:TypedLabel) REQUIRE n.age IS TYPED INTEGER");
+    assertThat(s.getConstraintsAdded()).isEqualTo(1);
+  }
+
+  @Test
+  void uniqueConstraintOverPlainIndexStillCountsAsConstraintAdded() {
+    // A non-unique index already covers the property. TypeIndexBuilder.create() only tolerates a
+    // pre-existing index with a different uniqueness when IF NOT EXISTS is used - it then drops the
+    // plain index and creates the unique one. That is a genuine schema change and must be counted
+    // even though indexExistsOnProperties(...) sees an index there both before and after.
+    database.command("sql", "CREATE VERTEX TYPE CoveredLabel");
+    database.command("sql", "CREATE PROPERTY CoveredLabel.email STRING");
+    database.command("sql", "CREATE INDEX ON CoveredLabel (email) NOTUNIQUE");
+    final QueryStatistics s = statsOf(database, "CREATE CONSTRAINT IF NOT EXISTS FOR (n:CoveredLabel) REQUIRE n.email IS UNIQUE");
+    assertThat(s.getConstraintsAdded()).isEqualTo(1);
   }
 }

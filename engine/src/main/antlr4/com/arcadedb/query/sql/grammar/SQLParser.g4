@@ -138,6 +138,7 @@ statement
 
     // Index Management
     | rebuildIndexStatement                          # rebuildIndexStmt
+    | compactIndexStatement                          # compactIndexStmt
 
     // Type Re-serialisation (e.g. relocate property values after toggling EXTERNAL flag)
     | REBUILD TYPE rebuildTypeBody                   # rebuildTypeStmt
@@ -339,7 +340,7 @@ insertStatement
     ;
 
 insertBody
-    : LPAREN identifier (COMMA identifier)* RPAREN
+    : LPAREN propertyName (COMMA propertyName)* RPAREN
       VALUES LPAREN expression (COMMA expression)* RPAREN
       (COMMA LPAREN expression (COMMA expression)* RPAREN)*
     | SET insertSetItem (COMMA insertSetItem)*
@@ -347,7 +348,7 @@ insertBody
     ;
 
 insertSetItem
-    : identifier EQ expression
+    : propertyName EQ expression
     ;
 
 jsonArray
@@ -382,11 +383,11 @@ updateOperation
     ;
 
 updateItem
-    : identifier modifier? (EQ | PLUSASSIGN | MINUSASSIGN | STARASSIGN | SLASHASSIGN) expression
+    : propertyName modifier? (EQ | PLUSASSIGN | MINUSASSIGN | STARASSIGN | SLASHASSIGN) expression
     ;
 
 updatePutItem
-    : identifier EQ expression COMMA expression
+    : propertyName EQ expression COMMA expression
     ;
 
 updateRemoveItem
@@ -394,7 +395,7 @@ updateRemoveItem
     ;
 
 updateIncrementItem
-    : identifier modifier? EQ expression
+    : propertyName modifier? EQ expression
     ;
 
 /**
@@ -542,7 +543,7 @@ bucketIdentifier
  * CREATE PROPERTY Type.property [IF NOT EXISTS] propertyType [OF ofType] [(attributes)]
  */
 createPropertyBody
-    : identifier DOT identifier (IF NOT EXISTS)? propertyType (LPAREN propertyAttributes RPAREN)?
+    : identifier DOT propertyName (IF NOT EXISTS)? propertyType (LPAREN propertyAttributes RPAREN)?
     ;
 
 propertyAttributes
@@ -575,7 +576,7 @@ createIndexBody
     ;
 
 indexProperty
-    : identifier (BY (KEY | VALUE | ITEM))? (COLLATE identifier)?
+    : propertyName (BY (KEY | VALUE | ITEM))? (COLLATE identifier)?
     ;
 
 indexType
@@ -643,7 +644,7 @@ alterTypeSetting
     ;
 
 alterPropertyBody
-    : identifier DOT identifier alterPropertyItem (COMMA alterPropertyItem)*
+    : identifier DOT propertyName alterPropertyItem (COMMA alterPropertyItem)*
     ;
 
 alterPropertyItem
@@ -679,7 +680,7 @@ dropTypeBody
     ;
 
 dropPropertyBody
-    : identifier DOT identifier (IF EXISTS)? FORCE?
+    : identifier DOT propertyName (IF EXISTS)? FORCE?
     ;
 
 dropIndexBody
@@ -915,6 +916,16 @@ findReferencesClassItem
 
 rebuildIndexStatement
     : REBUILD INDEX (identifier | STAR) (WITH identifier EQ expression (COMMA identifier EQ expression)*)?
+    ;
+
+/**
+ * COMPACT INDEX statement (issue #5144)
+ * Forces a foreground merge of the index segments (the SQL/HTTP surface for {@code Index.compact()}),
+ * so client-server users can settle an index after a bulk load without a full REBUILD.
+ * Syntax: COMPACT INDEX indexName | *
+ */
+compactIndexStatement
+    : COMPACT INDEX (identifier | STAR)
     ;
 
 /**
@@ -1310,7 +1321,7 @@ baseExpression
     | INTEGER_RANGE                                                     # integerRange
     | ELLIPSIS_INTEGER_RANGE                                            # ellipsisIntegerRange
     | THIS                                                              # thisLiteral
-    | identifier (DOT identifier)* methodCall* arraySelector* modifier* # identifierChain
+    | identifier (DOT propertyName)* methodCall* arraySelector* modifier* # identifierChain
     | functionCall                                                      # functionCallExpr
     | inputParameter modifier*                                          # inputParam
     | LPAREN statement RPAREN modifier*                                 # parenthesizedStmt
@@ -1394,7 +1405,7 @@ arraySelector
  */
 modifier
     : DOT STAR
-    | DOT identifier (LPAREN (expression (COMMA expression)*)? RPAREN)?
+    | DOT propertyName (LPAREN (expression (COMMA expression)*)? RPAREN)?
     | arraySelector
     ;
 
@@ -1480,6 +1491,19 @@ settingList
 
 setting
     : identifier EQ expression
+    ;
+
+/**
+ * Property name - a plain identifier or the reserved keyword FROM (issue #5092).
+ * FROM cannot join the general identifier rule: it would make "SELECT FROM Type" (projection-less
+ * SELECT) ambiguous. In property-name positions it is unambiguous: always after a DOT
+ * (Type.From, chain.From), inside the parenthesized property list of CREATE INDEX, or right
+ * after SET/ADD/PUT/INCREMENT and their commas. Bare references (SELECT From, WHERE From = ...)
+ * still require back-tick quoting, like any other fully reserved keyword.
+ */
+propertyName
+    : identifier
+    | FROM
     ;
 
 /**
@@ -1643,6 +1667,7 @@ identifier
     | AUTO
     | PROPERTIES
     | COMPACTION
+    | COMPACT
     | THRESHOLD
     | OVERWRITE
     ;

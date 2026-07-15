@@ -30,6 +30,7 @@ import com.arcadedb.log.LogManager;
 import com.arcadedb.query.sql.executor.MultiValue;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.serializer.BinaryTypes;
+import com.arcadedb.serializer.json.JSONArray;
 import com.arcadedb.utility.DateUtils;
 import com.arcadedb.utility.FileUtils;
 import com.arcadedb.utility.MultiIterator;
@@ -302,12 +303,68 @@ public enum Type {
     return convert(database, value, targetClass, null);
   }
 
+  /**
+   * When a property is declared as a collection ({@code LIST}/{@code MAP}) with a scalar {@code ofType} (e.g. {@code LIST OF LONG}),
+   * returns a copy of the collection with every plain scalar entry converted to the declared {@code ofType}. Returns {@code null}
+   * when no coercion applies, so the caller falls through to the normal conversion path. Nested documents, collections and links are
+   * left untouched so validation can still report structural mismatches with its specific messages (issue #5261).
+   */
+  private static Object coerceCollectionOfType(final Database database, final Object value, final Class<?> targetClass,
+      final Property property) {
+    if (property == null)
+      return null;
+
+    final String ofTypeName = property.getOfType();
+    if (ofTypeName == null)
+      return null;
+
+    final Type ofType = getTypeByName(ofTypeName);
+    if (ofType == null)
+      // The "ofType" refers to an embedded document type, not a scalar: nothing to coerce here.
+      return null;
+
+    final Class<?> ofClass = ofType.getDefaultJavaType();
+
+    if (value instanceof Map<?, ?> sourceMap && Map.class.isAssignableFrom(targetClass)) {
+      final Map<Object, Object> result = new LinkedHashMap<>(sourceMap.size());
+      for (final Map.Entry<?, ?> entry : sourceMap.entrySet())
+        result.put(entry.getKey(), coerceScalarItem(database, entry.getValue(), ofClass));
+      return result;
+    } else if (value instanceof Collection<?> sourceCollection && List.class.isAssignableFrom(targetClass)) {
+      final List<Object> result = new ArrayList<>(sourceCollection.size());
+      for (final Object item : sourceCollection)
+        result.add(coerceScalarItem(database, item, ofClass));
+      return result;
+    }
+
+    return null;
+  }
+
+  private static Object coerceScalarItem(final Database database, final Object item, final Class<?> ofClass) {
+    if (item == null)
+      return null;
+
+    // Only coerce plain scalar values; leave nested documents/collections/links to the validation layer.
+    if (item instanceof Number || item instanceof Boolean || item instanceof CharSequence || item instanceof Character)
+      return convert(database, item, ofClass, null);
+
+    return item;
+  }
+
   public static Object convert(final Database database, final Object value, Class<?> targetClass, final Property property) {
     if (value == null)
       return null;
 
     if (targetClass == null)
       return value;
+
+    // Coerce the nested scalar values of a collection declared with a scalar "ofType" (e.g. LIST OF LONG, MAP OF LONG) to the
+    // declared type. JSON parsing on the write path (e.g. the remote client re-serializing a full record with UPDATE ... CONTENT)
+    // loses the distinction between Long and Integer for values that fit the 32-bit range, so the container is assignable but its
+    // entries carry the wrong scalar type and would be rejected by validation (issue #5261).
+    final Object coerced = coerceCollectionOfType(database, value, targetClass, property);
+    if (coerced != null)
+      return coerced;
 
     final Class<?> valueClass = value.getClass();
 
@@ -331,6 +388,11 @@ public enum Type {
         return binary.toByteArray();
       else if (byte[].class.isAssignableFrom(valueClass)) {
         return value;
+      } else if (value instanceof JSONArray jsonArray) {
+        // JSONArray is an Iterable but not a java.util.Collection, so without this branch it would fall through to
+        // the `List.of(value)` case below and get wrapped as a single element instead of having its items copied.
+        // Normalize it to a real List and re-enter the conversion so the collection/array branches handle it (issue #5091).
+        return convert(database, jsonArray.toList(), targetClass, property);
       } else if (targetClass.equals(float[].class) && value instanceof Collection<?> collection) {
         // Convert Collection to float[]
         final float[] array = new float[collection.size()];

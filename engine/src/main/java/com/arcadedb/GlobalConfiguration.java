@@ -272,6 +272,15 @@ public enum GlobalConfiguration {
       (pre-26.7.2 behavior)""",
       Long.class, 60_000L),
 
+  ASYNC_CLOSE_TIMEOUT("arcadedb.asyncCloseTimeout", SCOPE.DATABASE,
+      """
+      Milliseconds to wait for in-flight asynchronous tasks to drain when closing or dropping a database \
+      before giving up with a WARNING and forcing the async workers down. Without a bound, a worker wedged \
+      inside a user task or callback made close()/drop() hang forever (#5080). Giving up here is safe: the \
+      forced shutdown interrupts the workers and notifies completion, and any task that never ran is simply \
+      not applied. 0 waits forever (pre-26.7.2 behavior)""",
+      Long.class, 60_000L),
+
   PARALLEL_SCAN_ABANDONED_TIMEOUT("arcadedb.parallelScanAbandonedTimeout", SCOPE.DATABASE,
       """
       Milliseconds a parallel-scan producer keeps waiting on a full result queue with NO consumer \
@@ -386,6 +395,18 @@ public enum GlobalConfiguration {
       "Maximum amount of milliseconds to compute a random number to wait for the next retry. This setting is helpful in case of high concurrency on the same pages (multi-thread insertion over the same bucket)",
       Integer.class, 100),
 
+  GRAPH_EDGE_APPEND_MERGE("arcadedb.graph.edgeAppendMerge", SCOPE.DATABASE,
+      "At commit, when the only conflict on an edge-list page is concurrent in-chunk edge appends (which commute), re-apply the appends on top of the newer page version instead of failing the whole transaction with a ConcurrentModificationException. Removes the retry storm on super-node (hot vertex) edge insertion",
+      Boolean.class, true),
+
+  GRAPH_SUPERNODE_THRESHOLD("arcadedb.graph.supernodeThreshold", SCOPE.DATABASE,
+      "Approximate number of edges (per vertex, per direction) after which the vertex's edge list is promoted to the striped super-node layout, spreading further appends over multiple files so concurrent insertions on the same hot vertex do not contend. FORWARD-INCOMPATIBLE ON FIRST USE: promotion writes a new record type (the stripe directory), so once any vertex promotes, the database can no longer be opened by releases older than 26.8.1; promotion is one-way. Iteration order on promoted vertices is approximate (newest-generation-first) instead of strict reverse-insertion. 0 disables promotion entirely (databases stay fully readable by older versions)",
+      Integer.class, 4096),
+
+  GRAPH_SUPERNODE_STRIPES("arcadedb.graph.supernodeStripes", SCOPE.DATABASE,
+      "Number of stripes (separate edge-list files) a super-node's edge list is spread over at promotion. The stripes are hosted in a per-type bucket pool of this many files, created once per type at its first promotion (types without super-nodes cost no files). Write parallelism saturates at the number of concurrent writers, so values beyond the CPU cores rarely help. Values below 2 disable promotion entirely. Recorded per vertex at promotion time",
+      Integer.class, 16),
+
   BACKUP_ENABLED("arcadedb.backup.enabled", SCOPE.DATABASE,
       "Allow a database to be backup. Disabling backup gives a huge boost in performance because no lock will be used for every operations",
       Boolean.class, true),
@@ -422,6 +443,23 @@ public enum GlobalConfiguration {
       Root directory for LOAD CSV file:/// URLs. When set, file paths are resolved relative to this \
       directory and path traversal (../) is blocked. Empty string means no restriction.""",
       String.class, ""),
+
+  OPENCYPHER_LOAD_CSV_ALLOW_REMOTE_URLS("arcadedb.opencypher.loadCsv.allowRemoteUrls", SCOPE.DATABASE,
+      """
+      Allow LOAD CSV to fetch data from remote http:// and https:// URLs. When enabled (default), remote fetches are still \
+      restricted by arcadedb.opencypher.loadCsv.blockedIpRanges to prevent Server-Side Request Forgery (SSRF) against internal \
+      services. Disable to block all remote URL access in locked-down or multi-tenant deployments.""",
+      Boolean.class, true),
+
+  OPENCYPHER_LOAD_CSV_BLOCKED_IP_RANGES("arcadedb.opencypher.loadCsv.blockedIpRanges", SCOPE.DATABASE,
+      """
+      Comma-separated list of CIDR ranges that LOAD CSV remote http(s) fetches are NOT allowed to reach. Enforced against the \
+      resolved IP address of the target host and re-checked on every redirect hop to prevent Server-Side Request Forgery (SSRF). \
+      Defaults to loopback, private (RFC 1918), link-local (including the cloud metadata address 169.254.169.254), carrier-grade \
+      NAT, multicast and reserved ranges. Set to an empty string to disable IP filtering (not recommended).""",
+      String.class,
+      "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,0.0.0.0/8,100.64.0.0/10,192.0.0.0/24,198.18.0.0/15,"
+          + "224.0.0.0/4,240.0.0.0/4,255.255.255.255/32,::1/128,::/128,fe80::/10,fc00::/7,ff00::/8"),
 
   OPENCYPHER_ID_BUCKET_BITS("arcadedb.opencypher.idBucketBits", SCOPE.JVM,
       """
@@ -466,10 +504,20 @@ public enum GlobalConfiguration {
       Boolean.class, true),
 
   QUERY_MAX_HEAP_ELEMENTS_ALLOWED_PER_OP("arcadedb.queryMaxHeapElementsAllowedPerOp", SCOPE.DATABASE, """
-      Maximum number of elements (records) allowed in a single query for memory-intensive operations (eg. ORDER BY in heap). \
-      If exceeded, the query fails with an OCommandExecutionException. Negative number means no limit.\
-      This setting is intended as a safety measure against excessive resource consumption from a single query (eg. prevent OutOfMemory)""",
-      Long.class, 500_000),
+      Maximum number of elements (records/groups) allowed in a single query for memory-intensive operations (eg. ORDER BY, GROUP BY \
+      and DISTINCT in heap). If exceeded, the query fails with a CommandExecutionException. Negative number means no limit. \
+      This setting is intended as a safety measure against excessive resource consumption from a single query (eg. prevent OutOfMemory). \
+      When left at the default it auto-scales with the JVM max heap (roughly one element every 2KB of heap, never below 500000), so \
+      large-cardinality analytical queries (eg. top-N-by-aggregate over millions of distinct keys) complete out of the box on servers \
+      with a big heap while small footprints stay protected. Set an explicit value to override the auto-scaling.""",
+      Long.class, 500_000L, null, value -> {
+        // Auto-scale the default with the JVM max heap: roughly one element every 2KB, never below the historical 500000 floor.
+        final long maxHeap = Runtime.getRuntime().maxMemory();
+        if (maxHeap == Long.MAX_VALUE)
+          // Heap is unbounded (no -Xmx): keep the conservative floor rather than an effectively unlimited cap.
+          return 500_000L;
+        return Math.max(500_000L, maxHeap / 2048);
+      }),
 
   QUERY_PARALLEL_SCAN("arcadedb.queryParallelScan", SCOPE.DATABASE,
       """
@@ -875,9 +923,15 @@ public enum GlobalConfiguration {
   HA_RAFT_STORAGE_DIRECTORY("arcadedb.ha.raftStorageDirectory", SCOPE.SERVER,
       """
       Parent directory where Raft storage sub-folders (raft-storage-<nodeName>) are created. \
-      When empty (the default), the server root path is used, preserving the previous default layout. \
-      Set to an absolute path (e.g. /var/lib/arcadedb/raft) to decouple Raft persistence from \
-      the server installation directory, which is required for Kubernetes readOnlyRootFilesystem deployments.""",
+      When empty (the default), Raft storage is placed under the database directory \
+      (<databaseDirectory>/.raft-storage), so persisting the database directory - which every durable \
+      deployment already does - persists the Raft log too. This avoids losing all Raft state on pod \
+      recreation in Kubernetes, where only the database directory is on a PersistentVolume while the \
+      server root path is ephemeral. A legacy raft-storage-<nodeName> directory already present under the \
+      server root path (pre-fix layout) is still reused for backward compatibility. \
+      Set to an absolute path (e.g. /var/lib/arcadedb/raft) to decouple Raft persistence from the \
+      database directory, which is required for Kubernetes readOnlyRootFilesystem deployments with a \
+      dedicated Raft volume.""",
       String.class, ""),
 
   HA_SNAPSHOT_THRESHOLD("arcadedb.ha.snapshotThreshold", SCOPE.SERVER,
@@ -1165,6 +1219,14 @@ public enum GlobalConfiguration {
   HA_IDEMPOTENCY_CACHE_MAX_ENTRIES("arcadedb.ha.idempotencyCacheMaxEntries", SCOPE.SERVER,
       "Maximum number of entries in the HTTP idempotency cache. Oldest entry is evicted when full.",
       Integer.class, 10_000),
+
+  HA_IDEMPOTENCY_CACHE_MAX_BYTES("arcadedb.ha.idempotencyCacheMaxBytes", SCOPE.SERVER,
+      "Maximum total size in bytes of the cached response bodies in the HTTP idempotency cache. Oldest entries are evicted when exceeded.",
+      Long.class, 67_108_864L),
+
+  HA_IDEMPOTENCY_CACHE_MAX_BODY_BYTES("arcadedb.ha.idempotencyCacheMaxBodyBytes", SCOPE.SERVER,
+      "Maximum size in bytes of a single response body eligible for caching in the HTTP idempotency cache. Larger responses are not cached.",
+      Long.class, 1_048_576L),
 
   HA_PEER_ALLOWLIST_ENABLED("arcadedb.ha.peerAllowlist.enabled", SCOPE.SERVER,
       """

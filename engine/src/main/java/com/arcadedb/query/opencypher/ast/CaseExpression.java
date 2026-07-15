@@ -46,56 +46,80 @@ public class CaseExpression implements Expression {
   private final Expression caseExpression; // null for simple form
   private final List<CaseAlternative> alternatives;
   private final Expression elseExpression; // null if no ELSE clause
-  private final String text;
+  // Extended form only: reuse the '=' comparison so a WHEN value matches under Cypher equality
+  // (numeric type folding, temporal, list, RID interop) instead of strict Object.equals(). Built once
+  // per CASE AST node, not per evaluated row.
+  private final ComparisonExpression whenEquality;
 
   /**
    * Constructor for simple CASE form (no case expression).
    */
-  public CaseExpression(final List<CaseAlternative> alternatives, final Expression elseExpression, final String text) {
-    this(null, alternatives, elseExpression, text);
+  public CaseExpression(final List<CaseAlternative> alternatives, final Expression elseExpression) {
+    this(null, alternatives, elseExpression);
   }
 
   /**
    * Constructor for extended CASE form (with case expression).
    */
   public CaseExpression(final Expression caseExpression, final List<CaseAlternative> alternatives,
-                        final Expression elseExpression, final String text) {
+                        final Expression elseExpression) {
     this.caseExpression = caseExpression;
     this.alternatives = alternatives;
     this.elseExpression = elseExpression;
-    this.text = text;
+    this.whenEquality = caseExpression != null
+        ? new ComparisonExpression(null, ComparisonExpression.Operator.EQUALS, null)
+        : null;
   }
 
   @Override
   public Object evaluate(final Result result, final CommandContext context) {
+    return evaluateWith(expr -> expr.evaluate(result, context));
+  }
+
+  /**
+   * Functional interface used to evaluate a single sub-expression of the CASE.
+   * Lets callers plug in an override-aware evaluator (e.g. one that resolves pre-computed
+   * aggregation results) while sharing the branch-selection and equality semantics below.
+   */
+  @FunctionalInterface
+  public interface SubExpressionEvaluator {
+    Object evaluate(Expression expression);
+  }
+
+  /**
+   * Evaluate the CASE, delegating every sub-expression evaluation to the supplied evaluator.
+   * The branch-selection logic and Cypher '=' equality semantics live here so both the plain
+   * {@link #evaluate(Result, CommandContext)} path and the aggregation-override path share them.
+   */
+  public Object evaluateWith(final SubExpressionEvaluator subEvaluator) {
     // Extended form: CASE expr WHEN value THEN result
     if (caseExpression != null) {
-      final Object caseValue = caseExpression.evaluate(result, context);
+      final Object caseValue = subEvaluator.evaluate(caseExpression);
 
       for (final CaseAlternative alternative : alternatives) {
-        final Object whenValue = alternative.getWhenExpression().evaluate(result, context);
+        final Object whenValue = subEvaluator.evaluate(alternative.getWhenExpression());
 
-        // Check equality
-        if (valuesEqual(caseValue, whenValue)) {
-          return alternative.getThenExpression().evaluate(result, context);
+        // Check equality using Cypher '=' semantics (numeric folding, temporal, list, RID interop)
+        if (Boolean.TRUE.equals(whenEquality.evaluateWithValues(caseValue, whenValue))) {
+          return subEvaluator.evaluate(alternative.getThenExpression());
         }
       }
     }
     // Simple form: CASE WHEN condition THEN result
     else {
       for (final CaseAlternative alternative : alternatives) {
-        final Object whenResult = alternative.getWhenExpression().evaluate(result, context);
+        final Object whenResult = subEvaluator.evaluate(alternative.getWhenExpression());
 
         // Check if condition is true
         if (isTrue(whenResult)) {
-          return alternative.getThenExpression().evaluate(result, context);
+          return subEvaluator.evaluate(alternative.getThenExpression());
         }
       }
     }
 
     // No match found - use ELSE or return null
     if (elseExpression != null) {
-      return elseExpression.evaluate(result, context);
+      return subEvaluator.evaluate(elseExpression);
     }
 
     return null;
@@ -145,7 +169,21 @@ public class CaseExpression implements Expression {
 
   @Override
   public String getText() {
-    return text;
+    // Reconstruct a properly spaced representation instead of returning the raw ANTLR text, whose
+    // getText() concatenates tokens with no whitespace (e.g. "CASEWHENrISNOTNULLTHEN1ELSE0END").
+    // The glued form hides variable references from downstream word-boundary analysis such as
+    // CypherExecutionPlan.isEdgeVariableReferenced, which then wrongly dropped an OPTIONAL MATCH edge
+    // variable used only inside a CASE (issue #5137).
+    final StringBuilder sb = new StringBuilder("CASE");
+    if (caseExpression != null)
+      sb.append(' ').append(caseExpression.getText());
+    for (final CaseAlternative alternative : alternatives)
+      sb.append(" WHEN ").append(alternative.getWhenExpression().getText())
+          .append(" THEN ").append(alternative.getThenExpression().getText());
+    if (elseExpression != null)
+      sb.append(" ELSE ").append(elseExpression.getText());
+    sb.append(" END");
+    return sb.toString();
   }
 
   public Expression getCaseExpression() {
@@ -158,17 +196,6 @@ public class CaseExpression implements Expression {
 
   public Expression getElseExpression() {
     return elseExpression;
-  }
-
-  /**
-   * Check if two values are equal under Cypher's three-valued logic.
-   * Any comparison involving null yields null (treated as "not equal" here),
-   * so a WHEN branch never fires on a null operand.
-   */
-  private boolean valuesEqual(final Object a, final Object b) {
-    if (a == null || b == null)
-      return false;
-    return a.equals(b);
   }
 
   /**

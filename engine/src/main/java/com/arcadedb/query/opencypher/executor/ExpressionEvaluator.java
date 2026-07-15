@@ -23,6 +23,7 @@ import com.arcadedb.function.StatelessFunction;
 import com.arcadedb.query.opencypher.ast.ArithmeticExpression;
 import com.arcadedb.query.opencypher.ast.BooleanExpression;
 import com.arcadedb.query.opencypher.ast.BooleanWrapperExpression;
+import com.arcadedb.query.opencypher.ast.CaseExpression;
 import com.arcadedb.query.opencypher.ast.Expression;
 import com.arcadedb.query.opencypher.ast.FunctionCallExpression;
 import com.arcadedb.query.opencypher.ast.ComparisonExpression;
@@ -105,6 +106,11 @@ public class ExpressionEvaluator {
       return evaluateListComprehension((ListComprehensionExpression) expression, result, context);
     } else if (aggregationOverrides() != null && expression instanceof ListPredicateExpression) {
       return evaluateListPredicate((ListPredicateExpression) expression, result, context);
+    } else if (aggregationOverrides() != null && expression instanceof CaseExpression ce) {
+      // Route CASE branches through this evaluator so a pre-computed aggregation nested inside a
+      // branch (e.g. CASE WHEN ... THEN sum(v) END) resolves to its accumulated value instead of
+      // being re-evaluated against the single representative row (issue #5220).
+      return ce.evaluateWith(sub -> evaluate(sub, result, context));
     } else if (expression instanceof ListSliceExpression lse) {
       return evaluateListSlice(lse, result, context);
     }
@@ -212,18 +218,8 @@ public class ExpressionEvaluator {
     final boolean useInteger = isInteger(leftNum) && isInteger(rightNum)
         && expression.getOperator() != ArithmeticExpression.Operator.POWER;
 
-    if (useInteger) {
-      final long l = leftNum.longValue();
-      final long r = rightNum.longValue();
-      return switch (expression.getOperator()) {
-        case ADD -> l + r;
-        case SUBTRACT -> l - r;
-        case MULTIPLY -> l * r;
-        case DIVIDE -> r != 0 ? l / r : null;
-        case MODULO -> r != 0 ? l % r : null;
-        default -> null;
-      };
-    }
+    if (useInteger)
+      return ArithmeticExpression.integerArithmetic(expression.getOperator(), leftNum.longValue(), rightNum.longValue());
 
     final double l = leftNum.doubleValue();
     final double r = rightNum.doubleValue();
