@@ -1018,8 +1018,20 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
       case "rid":
         if (valueObj instanceof Rid) {
           item.rid = (Rid) valueObj;
+        } else if (valueObj instanceof final Expression expr) {
+          if (expr.rid != null) {
+            // Literal RID such as #13:32960 - visitRidLiteral wraps the Rid in an Expression
+            item.rid = expr.rid;
+          } else {
+            // Parameterized or computed RID such as :rid - keep the expression and resolve it against
+            // the command context at plan time (Rid.toRecordId)
+            final Rid computed = new Rid(-1);
+            computed.expression = expr;
+            item.rid = computed;
+          }
+        } else {
+          throw new CommandSQLParsingException("MATCH rid filter must be a RID or an expression evaluating to a RID, got: " + valueObj);
         }
-        // RID might be embedded in a complex expression, for now just skip if not direct Rid
         break;
       case "as":
         // Extract identifier name from the expression
@@ -4607,11 +4619,13 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
       if (expr.json != null) {
         // Direct JSON literal from jsonLiteral alternative
         ops.json = expr.json;
-      } else if (expr.mathExpression instanceof final BaseExpression baseExpr) {
+      } else if (expr.mathExpression instanceof final BaseExpression baseExpr && baseExpr.expression != null
+          && baseExpr.expression.json != null) {
         // JSON literal parsed as baseExpression mapLit alternative
-        if (baseExpr.expression != null && baseExpr.expression.json != null) {
-          ops.json = baseExpr.expression.json;
-        }
+        ops.json = baseExpr.expression.json;
+      } else {
+        // Not a JSON literal: keep the expression (input parameter, LET variable, sub-query, ...) and resolve it at execution time
+        ops.expression = expr;
       }
     } else if (ctx.CONTENT() != null) {
       ops.type = UpdateOperations.TYPE_CONTENT;

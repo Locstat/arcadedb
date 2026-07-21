@@ -181,6 +181,10 @@ public class LSMVectorIndex implements Index, IndexInternal {
   // This prevents vectorNeighbors queries from blocking for minutes on large indexes.
   private volatile Thread  asyncRebuildThread     = null;
   private volatile boolean asyncRebuildInProgress = false;
+  // Incremented each time a graph build snapshots its start mutation counter. Lets callers (and tests) observe
+  // that a build has passed the point after which further mutations are preserved rather than folded into the
+  // build's own snapshot (issue #3683).
+  private volatile long    rebuildSnapshotGeneration = 0;
 
   // Dedicated ForkJoinPool for graph building, so we can shut it down on close() to cancel
   // long-running build operations that would otherwise block server shutdown.
@@ -1102,6 +1106,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
     final int deltaSnapshotId = nextId.get();
     // Snapshot mutation counter so we only subtract mutations present at build start (not concurrent ones)
     final int mutationsAtBuildStart = mutationsSinceSerialize.get();
+    // Publish that the snapshot has been taken: mutations recorded after this point survive the build.
+    rebuildSnapshotGeneration++;
 
     // Always have a progress reporter: if caller didn't provide one, log throttled progress every ~5s
     final GraphBuildCallback effectiveGraphCallback;
@@ -3655,9 +3661,11 @@ public class LSMVectorIndex implements Index, IndexInternal {
       // During commit phases, TransactionIndexContext.commit() calls this method directly
       lock.writeLock().lock();
       try {
-        // Find all vectors with matching RID and mark as deleted
+        // Find all vectors with matching RID and mark as deleted. Resolve them in O(k) through the RID reverse index
+        // instead of scanning every vector id in the index (issue #5318): the old full scan made any record update on
+        // a vector-indexed type O(index size), so bulk updates degraded quadratically.
         final List<Integer> deletedIds = new ArrayList<>();
-        for (int vectorId : vectorIndex.getAllVectorIds().toArray()) {
+        for (final int vectorId : vectorIndex.getVectorIdsForRid(rid)) {
           final VectorLocationIndex.VectorLocation loc = vectorIndex.getLocation(vectorId);
           if (loc != null && loc.rid.equals(rid) && !loc.deleted) {
             vectorIndex.markDeleted(vectorId);
@@ -4190,6 +4198,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
     stats.put("graphState", (long) graphState.ordinal()); // LOADING=0, IMMUTABLE=1, MUTABLE=2
     stats.put("graphNodeCount", graphIndex != null ? (long) graphIndex.getIdUpperBound() : 0L);
     stats.put("mutationsSinceRebuild", (long) mutationsSinceSerialize.get());
+    stats.put("asyncRebuildInProgress", asyncRebuildInProgress ? 1L : 0L);
+    stats.put("rebuildSnapshotGeneration", rebuildSnapshotGeneration);
 
     // Calculate mutations threshold (use configured value or default)
     final int defaultMutationsThreshold = getDatabase().getConfiguration()

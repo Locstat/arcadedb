@@ -940,6 +940,35 @@ public enum GlobalConfiguration {
       Lower values cause more frequent snapshots and earlier log compaction.""",
       Long.class, 100_000L),
 
+  HA_SNAPSHOT_INTERVAL("arcadedb.ha.snapshotInterval", SCOPE.SERVER,
+      """
+      Interval in milliseconds between periodic Raft snapshot checkpoints on every node. \
+      HA_SNAPSHOT_THRESHOLD alone counts entries, so a low-write cluster can run for weeks without ever \
+      reaching it: the snapshot index stays frozen, no log segment is ever purged, and the Raft log grows \
+      until the volume is full. This time-based trigger bounds the retained log by wall-clock age instead. \
+      An ArcadeDB snapshot is a zero-byte marker (the database files on disk are the durable state), so a \
+      tick is cheap; it is additionally a no-op when fewer than HA_SNAPSHOT_MIN_ENTRIES entries were \
+      applied since the last snapshot. Set to 0 to disable and rely on HA_SNAPSHOT_THRESHOLD only. \
+      Note this interval also bounds the reaction time to disk pressure, not just steady-state log \
+      retention: the free-space escalation described in HA_RAFT_STORAGE_MIN_FREE_SPACE_PERC fires on the \
+      next tick, so a volume that fills faster than one interval needs a shorter interval.""",
+      Long.class, 300_000L),
+
+  HA_SNAPSHOT_MIN_ENTRIES("arcadedb.ha.snapshotMinEntries", SCOPE.SERVER,
+      """
+      Minimum number of Raft log entries applied since the last snapshot before a periodic \
+      HA_SNAPSHOT_INTERVAL tick actually takes one. Keeps an idle cluster from rewriting a snapshot marker \
+      that would not advance the purge point. Values below 1 are clamped to 1.""",
+      Long.class, 64L),
+
+  HA_RAFT_STORAGE_MIN_FREE_SPACE_PERC("arcadedb.ha.raftStorageMinFreeSpacePerc", SCOPE.SERVER,
+      """
+      Percentage of free space on the volume hosting HA_RAFT_STORAGE_DIRECTORY below which the periodic \
+      snapshot tick escalates: it forces a snapshot and log purge regardless of HA_SNAPSHOT_MIN_ENTRIES and \
+      logs a throttled WARNING. Guards against the Raft log filling the volume, after which Ratis marks the \
+      log permanently failed and the node rejects every append until restarted. Set to 0 to disable the check.""",
+      Integer.class, 20),
+
   HA_LOG_VERBOSE("arcadedb.ha.logVerbose", SCOPE.SERVER,
       "HA verbose logging level: 0=off, 1=basic (elections, leader changes), 2=detailed (replication, forwarding), 3=trace (every state machine apply)",
       Integer.class, 0),
@@ -1016,6 +1045,10 @@ public enum GlobalConfiguration {
   HA_PEER_CHANNEL_RESET_DURATION("arcadedb.ha.peerChannelResetDuration", SCOPE.SERVER,
       "Time in milliseconds a follower must stay continuously unreachable (no successful RPC, beyond HA_PEER_UNREACHABLE_THRESHOLD) before the leader resets that one follower's replication gRPC channel, closing the wedged channel so the next send re-resolves DNS and reconnects. Recovers a leader appender channel stuck on a stale DNS result after a follower restarts with a new address (e.g. a Kubernetes pod-IP change, issue #4696) without a leadership transfer, so there is no flapping risk. Only the unreachable peer's channel is touched. While the follower stays unreachable the reset is retried once per interval, up to a small bounded number of attempts, after which the leader gives up and logs for operator intervention; the counter re-arms when the follower reconnects. Requires HA_PEER_UNREACHABLE_THRESHOLD > 0 (its 'unreachable' signal). Set to 0 to disable the automatic channel reset (the manual leadership transfer remains available).",
       Long.class, 60000L),
+
+  HA_PEER_CHANNEL_RESET_ESCALATION("arcadedb.ha.peerChannelResetEscalation", SCOPE.SERVER,
+      "When the bounded HA_PEER_CHANNEL_RESET_DURATION retry budget is exhausted and a follower's replication channel is still dead, transfer leadership to a healthy peer so the new leader builds a fresh appender to that follower (issue #5346). Without it the leader stays wedged until an operator restarts the process, because the reset streak only re-arms when the follower becomes reachable again. The target is chosen with the same rules as a manual step-down and is never the wedged follower itself; when no healthy target exists the leader keeps the previous behaviour and logs for operator intervention. When the follower is unreachable for a reason a fresh appender cannot fix, each healthy peer escalates it at most once per 30-minute cooldown before the cluster settles on the operator-intervention path, so the leadership churn is bounded rather than perpetual. Set to false to only log.",
+      Boolean.class, true),
 
   HA_RESYNC_CATCHUP_LAG_THRESHOLD("arcadedb.ha.resyncCatchupLagThreshold", SCOPE.SERVER,
       "Minimum apply backlog (Raft log entries a follower has committed/received but not yet applied to its state machine) before the catch-up resync narrative is logged. This is a locally observable signal, not the distance from the leader's commit index. Keeps the small steady-state apply backlog under write load from being narrated; only a genuine post-restart burst crosses this threshold. The narrative finishes once the backlog drains to within a tenth of it.",
@@ -1111,7 +1144,11 @@ public enum GlobalConfiguration {
   HA_RATIS_RESTART_MAX_RETRIES("arcadedb.ha.ratisRestartMaxRetries", SCOPE.SERVER,
       """
       Maximum consecutive Ratis restart attempts by the health monitor before the server shuts down \
-      for cluster-level recovery. Raise when partition-recovery scenarios cause legitimate rapid restarts.""",
+      for cluster-level recovery. Raise when partition-recovery scenarios cause legitimate rapid restarts. \
+      Also bounds the crash-loop escalation: when a RECOVER restart keeps returning to CLOSED (e.g. a \
+      term-inverted persisted Raft log or a poisoned snapshot-install) without the restart itself failing, \
+      the health monitor escalates after this many non-sticking restarts (reformat + rejoin once, then give \
+      up with a SEVERE alert) instead of restarting forever (issue #5291).""",
       Integer.class, 10),
 
   HA_STOP_SERVER_ON_REPLICATION_FAILURE("arcadedb.ha.stopServerOnReplicationFailure", SCOPE.SERVER,
@@ -1204,8 +1241,12 @@ public enum GlobalConfiguration {
       How long in milliseconds a replica must stay continuously STALLED (its matchIndex not advancing while the leader \
       keeps committing - e.g. stuck at -1 after a rolling upgrade) before the LEADER actively forces it to resync from \
       the leader. This is the leader-driven counterpart to HA_STALE_FOLLOWER_LAG_THRESHOLD: it covers the case where the \
-      follower cannot self-detect the stall because its own commit index never advances. Defaults to 60000; set to 0 to \
-      disable leader-driven stalled-replica recovery (the STALLED condition is still detected and logged).""",
+      follower cannot self-detect the stall because its own commit index never advances. A follower still at the \
+      never-appended sentinel (matchIndex = -1 while the leader holds committed entries, issue #5295) is treated as \
+      STALLED regardless of the numeric lag, so it is recovered even when the leader is only a few entries ahead (where \
+      the lag stays below HA_REPLICATION_LAG_WARNING); the same duration doubles as the grace before its status flips \
+      from HEALTHY to STALLED, so a brief join / snapshot-install window is not misreported. Defaults to 60000; set to 0 \
+      to disable leader-driven stalled-replica recovery (the STALLED condition is still detected and logged).""",
       Long.class, 60_000L),
 
   HA_SNAPSHOT_MAX_ENTRY_SIZE("arcadedb.ha.snapshotMaxEntrySize", SCOPE.SERVER,

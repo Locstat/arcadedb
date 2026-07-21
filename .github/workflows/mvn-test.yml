@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -87,6 +87,9 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
     needs: build-and-package
+    # A hung test used to burn the workflow's whole budget in silence (run 29645471373 sat for
+    # 2h15m on a deadlocked shared thread pool). Cap the job so a hang costs minutes, not hours.
+    timeout-minutes: 60
     permissions:
       contents: read
       checks: write
@@ -94,7 +97,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -108,7 +111,28 @@ jobs:
 
       - name: Run Unit Tests with Coverage
         # package phase runs surefire (test) and JaCoCo report (prepare-package) without reaching integration-test phase
-        run: ./mvnw verify -Pcoverage --batch-mode --errors --fail-never --show-version -pl !e2e,!load-tests -DexcludedGroups=slow,benchmark -Dsurefire.includes=**/*Test.java,**/*Suite.java
+        # A watchdog dumps every JVM's stacks before the job timeout fires. Without it a deadlocked
+        # surefire fork produces no output at all, so there is nothing to diagnose after the fact.
+        run: |
+          (
+            sleep 2700
+            # Repeats until killed: a single dump at 45m would show a healthy build and tell us
+            # nothing about a hang that only begins afterwards.
+            while true; do
+              echo "::warning::Unit tests still running - dumping JVM thread stacks"
+              for pid in $(jps -q 2>/dev/null); do
+                echo "===== jstack $pid ====="
+                jstack "$pid" 2>&1 || true
+              done
+              sleep 300
+            done
+          ) &
+          watchdog=$!
+          set +e
+          ./mvnw verify -Pcoverage --batch-mode --errors --fail-never --show-version -pl !e2e,!load-tests -DexcludedGroups=slow,benchmark -Dsurefire.includes=**/*Test.java,**/*Suite.java
+          status=$?
+          kill "$watchdog" 2>/dev/null || true
+          exit $status
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -147,7 +171,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -196,7 +220,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -247,7 +271,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -293,7 +317,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -324,7 +348,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -371,7 +395,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # Node 24.9+ required: testcontainers@12 pulls archiver@8 (pure ESM), and
           # Jest's require(ESM) bridge only works on Node 24.9+ (synchronous vm module APIs).
@@ -425,7 +449,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: "npm"
@@ -543,7 +567,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: "10.0"
           cache: true
@@ -599,7 +623,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Track the module's go directive so the toolchain always matches
           # go.mod instead of a hardcoded version that can drift after dep bumps.

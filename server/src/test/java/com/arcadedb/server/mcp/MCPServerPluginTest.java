@@ -31,6 +31,8 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -119,7 +121,7 @@ class MCPServerPluginTest extends BaseGraphServerTest {
 
     assertThat(response.has("result")).isTrue();
     final JSONArray tools = response.getJSONObject("result").getJSONArray("tools");
-    assertThat(tools.length()).isEqualTo(11);
+    assertThat(tools.length()).isEqualTo(13);
 
     // Verify tool names
     boolean hasListDatabases = false;
@@ -133,6 +135,8 @@ class MCPServerPluginTest extends BaseGraphServerTest {
     boolean hasGetServerSettings = false;
     boolean hasSetServerSetting = false;
     boolean hasFullTextSearch = false;
+    boolean hasUpsertEntity = false;
+    boolean hasUpsertRelationship = false;
 
     for (int i = 0; i < tools.length(); i++) {
       final String name = tools.getJSONObject(i).getString("name");
@@ -148,6 +152,8 @@ class MCPServerPluginTest extends BaseGraphServerTest {
       case "get_server_settings" -> hasGetServerSettings = true;
       case "set_server_setting" -> hasSetServerSetting = true;
       case "full_text_search" -> hasFullTextSearch = true;
+      case "upsert_entity" -> hasUpsertEntity = true;
+      case "upsert_relationship" -> hasUpsertRelationship = true;
       }
     }
     assertThat(hasListDatabases).isTrue();
@@ -161,6 +167,8 @@ class MCPServerPluginTest extends BaseGraphServerTest {
     assertThat(hasGetServerSettings).isTrue();
     assertThat(hasSetServerSetting).isTrue();
     assertThat(hasFullTextSearch).isTrue();
+    assertThat(hasUpsertEntity).isTrue();
+    assertThat(hasUpsertRelationship).isTrue();
   }
 
   @Test
@@ -1127,6 +1135,550 @@ class MCPServerPluginTest extends BaseGraphServerTest {
     final String errorText = response.getJSONArray("content").getJSONObject(0).getString("text");
     assertThat(errorText).contains("indexName");
     assertThat(errorText).contains("typeName");
+  }
+
+  @Test
+  void initializeAdvertisesResourcesCapability() throws Exception {
+    final JSONObject response = mcpRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 400)
+        .put("method", "initialize")
+        .put("params", new JSONObject()));
+
+    final JSONObject capabilities = response.getJSONObject("result").getJSONObject("capabilities");
+    assertThat(capabilities.has("resources")).isTrue();
+    final JSONObject resources = capabilities.getJSONObject("resources");
+    assertThat(resources.getBoolean("listChanged")).isFalse();
+    assertThat(resources.getBoolean("subscribe")).isFalse();
+  }
+
+  @Test
+  void resourcesList() throws Exception {
+    final JSONObject response = mcpRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 401)
+        .put("method", "resources/list")
+        .put("params", new JSONObject()));
+
+    final JSONArray resources = response.getJSONObject("result").getJSONArray("resources");
+
+    JSONObject graphResource = null;
+    for (int i = 0; i < resources.length(); i++)
+      if ("arcadedb://graph/schema".equals(resources.getJSONObject(i).getString("uri")))
+        graphResource = resources.getJSONObject(i);
+
+    assertThat(graphResource).isNotNull();
+    assertThat(graphResource.getString("name")).isEqualTo("graph schema");
+    assertThat(graphResource.getString("mimeType")).isEqualTo("application/json");
+  }
+
+  @Test
+  void resourcesListMatchesListDatabases() throws Exception {
+    final JSONObject listResponse = mcpRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 402)
+        .put("method", "resources/list")
+        .put("params", new JSONObject()));
+
+    final Set<String> fromResources = new HashSet<>();
+    final JSONArray resources = listResponse.getJSONObject("result").getJSONArray("resources");
+    for (int i = 0; i < resources.length(); i++) {
+      final String uri = resources.getJSONObject(i).getString("uri");
+      fromResources.add(uri.substring("arcadedb://".length(), uri.length() - "/schema".length()));
+    }
+
+    final JSONObject toolResponse = callTool("list_databases", new JSONObject());
+    final JSONArray databases = new JSONObject(
+        toolResponse.getJSONArray("content").getJSONObject(0).getString("text")).getJSONArray("databases");
+
+    final Set<String> fromTool = new HashSet<>();
+    for (int i = 0; i < databases.length(); i++)
+      fromTool.add(databases.getString(i));
+
+    assertThat(fromResources).isEqualTo(fromTool);
+  }
+
+  @Test
+  void resourcesReadMatchesGetSchemaTool() throws Exception {
+    final JSONObject readResponse = mcpRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 403)
+        .put("method", "resources/read")
+        .put("params", new JSONObject().put("uri", "arcadedb://graph/schema")));
+
+    final JSONArray contents = readResponse.getJSONObject("result").getJSONArray("contents");
+    assertThat(contents.length()).isEqualTo(1);
+    assertThat(contents.getJSONObject(0).getString("uri")).isEqualTo("arcadedb://graph/schema");
+    assertThat(contents.getJSONObject(0).getString("mimeType")).isEqualTo("application/json");
+
+    final JSONObject toolResponse = callTool("get_schema", new JSONObject().put("database", "graph"));
+    final String toolText = toolResponse.getJSONArray("content").getJSONObject(0).getString("text");
+
+    assertThat(contents.getJSONObject(0).getString("text")).isEqualTo(toolText);
+  }
+
+  @Test
+  void resourcesReadUnknownDatabaseReturnsNotFound() throws Exception {
+    final JSONObject response = mcpRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 404)
+        .put("method", "resources/read")
+        .put("params", new JSONObject().put("uri", "arcadedb://nosuchdb/schema")));
+
+    assertThat(response.has("error")).isTrue();
+    assertThat(response.getJSONObject("error").getInt("code")).isEqualTo(-32002);
+  }
+
+  @Test
+  void resourcesReadMalformedUriReturnsNotFound() throws Exception {
+    final JSONObject response = mcpRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 405)
+        .put("method", "resources/read")
+        .put("params", new JSONObject().put("uri", "arcadedb://graph/tables")));
+
+    assertThat(response.has("error")).isTrue();
+    assertThat(response.getJSONObject("error").getInt("code")).isEqualTo(-32002);
+  }
+
+  @Test
+  void resourcesDeniedWhenReadsDisabled() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", false)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    try {
+      final JSONObject listResponse = mcpRequest(new JSONObject()
+          .put("jsonrpc", "2.0")
+          .put("id", 406)
+          .put("method", "resources/list")
+          .put("params", new JSONObject()));
+
+      // A discovery call stays quiet: nothing is readable, so nothing is listed.
+      assertThat(listResponse.getJSONObject("result").getJSONArray("resources").length()).isZero();
+
+      final JSONObject readResponse = mcpRequest(new JSONObject()
+          .put("jsonrpc", "2.0")
+          .put("id", 407)
+          .put("method", "resources/read")
+          .put("params", new JSONObject().put("uri", "arcadedb://graph/schema")));
+
+      assertThat(readResponse.has("error")).isTrue();
+      assertThat(readResponse.getJSONObject("error").getInt("code")).isEqualTo(-32600);
+      assertThat(readResponse.getJSONObject("error").getString("message")).contains("not allowed");
+    } finally {
+      // Restore for the other tests in this class.
+      saveMCPConfig(new JSONObject()
+          .put("enabled", true)
+          .put("allowReads", true)
+          .put("allowedUsers", new JSONArray().put("root")));
+    }
+  }
+
+  @Test
+  void resourcesListOmitsUnauthorizedDatabases() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowedUsers", new JSONArray().put("root").put("restricteduser")));
+
+    // A user authorized only for a database that does not exist here, so "graph" must not appear in its resource list.
+    if (!getServer(0).getSecurity().existsUser("restricteduser"))
+      getServer(0).getSecurity().createUser(new JSONObject()
+          .put("name", "restricteduser")
+          .put("password", getServer(0).getSecurity().encodePassword("restrictedpass"))
+          .put("databases", new JSONObject()
+              .put("otherdb", new JSONArray().put("admin"))));
+
+    final String restrictedAuth = "Basic " + Base64.getEncoder()
+        .encodeToString("restricteduser:restrictedpass".getBytes(StandardCharsets.UTF_8));
+
+    final HttpURLConnection connection = (HttpURLConnection) new URI(getMcpUrl()).toURL().openConnection();
+    connection.setRequestMethod("POST");
+    connection.setRequestProperty("Authorization", restrictedAuth);
+    connection.setRequestProperty("Content-Type", "application/json");
+    connection.setDoOutput(true);
+
+    final JSONObject request = new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 408)
+        .put("method", "resources/list")
+        .put("params", new JSONObject());
+    try (final DataOutputStream out = new DataOutputStream(connection.getOutputStream())) {
+      out.write(request.toString().getBytes(StandardCharsets.UTF_8));
+    }
+    connection.connect();
+
+    try {
+      assertThat(connection.getResponseCode()).isEqualTo(200);
+      final String body = FileUtils.readStreamAsString(connection.getInputStream(), "utf8");
+      final JSONArray resources = new JSONObject(body).getJSONObject("result").getJSONArray("resources");
+
+      for (int i = 0; i < resources.length(); i++)
+        assertThat(resources.getJSONObject(i).getString("uri")).isNotEqualTo("arcadedb://graph/schema");
+    } finally {
+      connection.disconnect();
+      saveMCPConfig(new JSONObject()
+          .put("enabled", true)
+          .put("allowReads", true)
+          .put("allowedUsers", new JSONArray().put("root")));
+    }
+  }
+
+  @Test
+  void disabledServerErrorEchoesRequestId() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", false)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final HttpURLConnection connection = (HttpURLConnection) new URI(getMcpUrl()).toURL().openConnection();
+    connection.setRequestMethod("POST");
+    connection.setRequestProperty("Authorization", getBasicAuth());
+    connection.setRequestProperty("Content-Type", "application/json");
+    connection.setDoOutput(true);
+
+    final JSONObject request = new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 409)
+        .put("method", "initialize")
+        .put("params", new JSONObject());
+    try (final DataOutputStream out = new DataOutputStream(connection.getOutputStream())) {
+      out.write(request.toString().getBytes(StandardCharsets.UTF_8));
+    }
+    connection.connect();
+
+    try {
+      assertThat(connection.getResponseCode()).isEqualTo(503);
+      // A 503 body arrives on the error stream; it must echo the request id per JSON-RPC 2.0.
+      final String body = FileUtils.readStreamAsString(connection.getErrorStream(), "utf8");
+      final JSONObject response = new JSONObject(body);
+      assertThat(response.getInt("id")).isEqualTo(409);
+      assertThat(response.getJSONObject("error").getInt("code")).isEqualTo(-32600);
+    } finally {
+      connection.disconnect();
+      saveMCPConfig(new JSONObject()
+          .put("enabled", true)
+          .put("allowReads", true)
+          .put("allowedUsers", new JSONArray().put("root")));
+    }
+  }
+
+  @Test
+  void upsertEntityIsIdempotent() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject args = new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "UpsertPerson")
+        .put("matchKeys", new JSONObject().put("email", "ada@x.com"))
+        .put("setProperties", new JSONObject().put("name", "Ada"));
+
+    final JSONObject first = callTool("upsert_entity", args);
+    assertThat(first.getBoolean("isError", true)).isFalse();
+
+    // Second call with identical matchKeys must not create a second node.
+    callTool("upsert_entity", new JSONObject(args.toString())
+        .put("setProperties", new JSONObject().put("name", "Ada Lovelace")));
+
+    final JSONObject countResp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (p:UpsertPerson {email: 'ada@x.com'}) RETURN count(p) AS c"));
+    final JSONObject countPayload = new JSONObject(
+        countResp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(countPayload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+  }
+
+  @Test
+  void upsertEntityWithoutSetPropertiesCreatesNode() throws Exception {
+    // A bare MERGE (no SET) analyzes to {CREATE, UPDATE}, so both flags are required. This test covers the
+    // no-SET execution path: the node is created and a repeated call matches rather than duplicating it.
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject args = new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "NoSetPerson")
+        .put("matchKeys", new JSONObject().put("name", "Solo"));
+
+    final JSONObject first = callTool("upsert_entity", args);
+    assertThat(first.getBoolean("isError", true)).isFalse();
+
+    final JSONObject firstCountResp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (n:NoSetPerson {name:'Solo'}) RETURN count(n) AS c"));
+    final JSONObject firstCountPayload = new JSONObject(
+        firstCountResp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(firstCountPayload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+
+    // Repeat with identical args (still no setProperties): the MERGE must match, not duplicate.
+    callTool("upsert_entity", new JSONObject(args.toString()));
+
+    final JSONObject secondCountResp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (n:NoSetPerson {name:'Solo'}) RETURN count(n) AS c"));
+    final JSONObject secondCountPayload = new JSONObject(
+        secondCountResp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(secondCountPayload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+  }
+
+  @Test
+  void upsertEntityBindsValuesSoInjectionIsInert() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final String malicious = "x'}) DETACH DELETE n //";
+    final JSONObject args = new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "InjTest")
+        .put("matchKeys", new JSONObject().put("k", malicious));
+
+    callTool("upsert_entity", args);
+    callTool("upsert_entity", new JSONObject(args.toString())); // repeat: still one node
+
+    final JSONObject resp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (n:InjTest) RETURN count(n) AS c"));
+    final JSONObject payload = new JSONObject(resp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(payload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+  }
+
+  @Test
+  void upsertEntityRequiresBothInsertAndUpdate() throws Exception {
+    // allowUpdate off: a MERGE...SET needs UPDATE, so it must be denied.
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", false)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject resp = callTool("upsert_entity", new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "UpsertPerson")
+        .put("matchKeys", new JSONObject().put("email", "denied@x.com"))
+        .put("setProperties", new JSONObject().put("name", "Nope")));
+
+    assertThat(resp.getBoolean("isError")).isTrue();
+    final String text = resp.getJSONArray("content").getJSONObject(0).getString("text");
+    assertThat(text).contains("not allowed");
+  }
+
+  @Test
+  void upsertEntityRejectsEmptyMatchKeys() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject resp = callTool("upsert_entity", new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "UpsertPerson")
+        .put("matchKeys", new JSONObject()));
+
+    assertThat(resp.getBoolean("isError")).isTrue();
+    final String text = resp.getJSONArray("content").getJSONObject(0).getString("text");
+    assertThat(text).contains("matchKeys");
+  }
+
+  @Test
+  void upsertRelationshipDoesNotDuplicateEdge() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject args = new JSONObject()
+        .put("database", "graph")
+        .put("fromType", "Author")
+        .put("fromMatchKeys", new JSONObject().put("name", "Ada"))
+        .put("toType", "Book")
+        .put("toMatchKeys", new JSONObject().put("isbn", "111"))
+        .put("relType", "WROTE")
+        .put("relProperties", new JSONObject().put("year", 1843));
+
+    final JSONObject first = callTool("upsert_relationship", args);
+    assertThat(first.getBoolean("isError", true)).isFalse();
+
+    // Repeat with a different property value: the edge must be updated, not duplicated.
+    callTool("upsert_relationship", new JSONObject(args.toString())
+        .put("relProperties", new JSONObject().put("year", 1844)));
+
+    final JSONObject resp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (:Author {name:'Ada'})-[r:WROTE]->(:Book {isbn:'111'}) RETURN count(r) AS c"));
+    final JSONObject payload = new JSONObject(resp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(payload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+
+    // The second upsert_relationship call must have updated the existing edge's property.
+    final JSONObject yearResp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (:Author {name:'Ada'})-[r:WROTE]->(:Book {isbn:'111'}) RETURN r.year AS y"));
+    final JSONObject yearPayload = new JSONObject(yearResp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(yearPayload.getJSONArray("records").getJSONObject(0).getInt("y")).isEqualTo(1844);
+  }
+
+  @Test
+  void upsertRelationshipAutoCreatesEndpoints() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    callTool("upsert_relationship", new JSONObject()
+        .put("database", "graph")
+        .put("fromType", "City")
+        .put("fromMatchKeys", new JSONObject().put("name", "Turin"))
+        .put("toType", "Country")
+        .put("toMatchKeys", new JSONObject().put("name", "Italy"))
+        .put("relType", "IN_COUNTRY"));
+
+    final JSONObject resp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (c:City {name:'Turin'})-[:IN_COUNTRY]->(n:Country {name:'Italy'}) RETURN count(*) AS c"));
+    final JSONObject payload = new JSONObject(resp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(payload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+  }
+
+  @Test
+  void upsertRelationshipDeniedWithoutInsert() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", false)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject resp = callTool("upsert_relationship", new JSONObject()
+        .put("database", "graph")
+        .put("fromType", "Author")
+        .put("fromMatchKeys", new JSONObject().put("name", "X"))
+        .put("toType", "Book")
+        .put("toMatchKeys", new JSONObject().put("isbn", "999"))
+        .put("relType", "WROTE"));
+
+    assertThat(resp.getBoolean("isError")).isTrue();
+    assertThat(resp.getJSONArray("content").getJSONObject(0).getString("text")).contains("not allowed");
+  }
+
+  @Test
+  void upsertRelationshipRejectsEmptyMatchKeys() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject resp = callTool("upsert_relationship", new JSONObject()
+        .put("database", "graph")
+        .put("fromType", "Author")
+        .put("fromMatchKeys", new JSONObject())
+        .put("toType", "Book")
+        .put("toMatchKeys", new JSONObject().put("isbn", "111"))
+        .put("relType", "WROTE"));
+
+    assertThat(resp.getBoolean("isError")).isTrue();
+    assertThat(resp.getJSONArray("content").getJSONObject(0).getString("text")).contains("fromMatchKeys");
+  }
+
+  @Test
+  void upsertEntityRejectsBacktickIdentifier() throws Exception {
+    // The backtick guard lives in quoteIdentifier; this asserts it is actually wired into the tool path.
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject resp = callTool("upsert_entity", new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "Bad`Type")
+        .put("matchKeys", new JSONObject().put("id", "1")));
+
+    assertThat(resp.getBoolean("isError")).isTrue();
+    assertThat(resp.getJSONArray("content").getJSONObject(0).getString("text")).contains("backtick");
+  }
+
+  @Test
+  void upsertEntityCompositeMatchKeysIsIdempotent() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final JSONObject args = new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "CompositePerson")
+        .put("matchKeys", new JSONObject().put("firstName", "Ada").put("lastName", "Lovelace"))
+        .put("setProperties", new JSONObject().put("role", "mathematician"));
+
+    callTool("upsert_entity", args);
+    // Repeat with the same two-key match: must resolve to the same node, not create a second.
+    callTool("upsert_entity", new JSONObject(args.toString())
+        .put("setProperties", new JSONObject().put("role", "pioneer")));
+
+    final JSONObject resp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (p:CompositePerson {firstName:'Ada', lastName:'Lovelace'}) RETURN count(p) AS c"));
+    final JSONObject payload = new JSONObject(resp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(payload.getJSONArray("records").getJSONObject(0).getInt("c")).isEqualTo(1);
+  }
+
+  @Test
+  void upsertEntityBindsSetPropertyValuesSoInjectionIsInert() throws Exception {
+    saveMCPConfig(new JSONObject()
+        .put("enabled", true)
+        .put("allowReads", true)
+        .put("allowInsert", true)
+        .put("allowUpdate", true)
+        .put("allowedUsers", new JSONArray().put("root")));
+
+    final String malicious = "'}) DETACH DELETE n //";
+    callTool("upsert_entity", new JSONObject()
+        .put("database", "graph")
+        .put("typeName", "SetInjTest")
+        .put("matchKeys", new JSONObject().put("id", "1"))
+        .put("setProperties", new JSONObject().put("note", malicious)));
+
+    // The node still exists and stores the payload verbatim, proving the SET value was bound, not executed.
+    final JSONObject resp = callTool("query", new JSONObject()
+        .put("database", "graph")
+        .put("language", "cypher")
+        .put("query", "MATCH (n:SetInjTest {id:'1'}) RETURN n.note AS note"));
+    final JSONObject payload = new JSONObject(resp.getJSONArray("content").getJSONObject(0).getString("text"));
+    assertThat(payload.getJSONArray("records").length()).isEqualTo(1);
+    assertThat(payload.getJSONArray("records").getJSONObject(0).getString("note")).isEqualTo(malicious);
   }
 
   // ---- Helper methods ----
