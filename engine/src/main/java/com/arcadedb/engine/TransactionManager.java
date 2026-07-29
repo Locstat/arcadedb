@@ -83,7 +83,11 @@ public class TransactionManager {
     if (database.getMode() == ComponentFile.MODE.READ_WRITE) {
       createWALFilePool();
 
-      task = new Timer("ArcadeDB TransactionManager " + database.getName());
+      // #5418: DAEMON timer. A leaked (never closed) Database used to keep this non-daemon thread alive and
+      // with it the whole JVM. The WAL housekeeping it drives is best-effort background work; the durable
+      // part of the shutdown runs in TransactionManager.close(), reached through the JVM shutdown hook
+      // installed by DatabaseFactory, which completes before daemon threads are stopped.
+      task = new Timer("ArcadeDB TransactionManager " + database.getName(), true);
       task.schedule(new TimerTask() {
         @Override
         public void run() {
@@ -421,6 +425,26 @@ public class TransactionManager {
     }
   }
 
+  /**
+   * Point-in-time view of every commit-lock currently HELD on this database: the file, its owner, when
+   * it was acquired, how long it has been held and how many transactions are queued behind it.
+   * <p>
+   * Exposed because the lock table is otherwise unreachable from outside this class — {@code toString()}
+   * renders it, but only as a debug string a caller would have to parse. Locks have no lease: a resource
+   * is released by its owner or not at all, and the abandoned-lock sweep reclaims one only after the
+   * owning thread has DIED, so a lock leaked by a live-but-stuck thread is held until the process
+   * restarts. This is what lets an operator see that happening instead of inferring it from a wave of
+   * {@link com.arcadedb.exception.LockTimeoutException}s and restarting blind.
+   * <p>
+   * Returns a snapshot of rendered values, deliberately NOT the {@link LockManager}: diagnostics must be
+   * able to read the lock table without being able to unlock anything.
+   *
+   * @return one entry per held file, empty when nothing is locked (the normal, healthy state)
+   */
+  public List<LockManager.LockStats> getLockStats() {
+    return fileIdsLockManager.statsSnapshot();
+  }
+
   public Map<String, Object> getStats() {
     final Map<String, Object> map = new HashMap<>();
     map.put("logFiles", logFileCounter.get());
@@ -457,7 +481,22 @@ public class TransactionManager {
 
     LogManager.instance().log(this, Level.FINE, "- applying changes from txId=%d", null, tx.txId);
 
-    for (final WALFile.WALPage txPage : tx.pages) {
+    // One page can carry several segments in the same transaction, one per disjoint modified interval (issue #5470).
+    // They are written consecutively, so the run is gathered here and applied to a single page image: the version
+    // checks below then run once per page and the page reaches the disk once, exactly as with a single segment.
+    for (int s = 0; s < tx.pages.length; ) {
+      final WALFile.WALPage txPage = tx.pages[s];
+
+      final int firstSegment = s;
+      int lastSegment = s + 1;
+      while (lastSegment < tx.pages.length && tx.pages[lastSegment].fileId == txPage.fileId
+          && tx.pages[lastSegment].pageNumber == txPage.pageNumber
+          // Same target version: segments of one page always agree on it, while a hand-built entry that replays the
+          // same page at two versions (a partial replay) must keep going through the version checks one by one.
+          && tx.pages[lastSegment].currentPageVersion == txPage.currentPageVersion)
+        ++lastSegment;
+      s = lastSegment;
+
       final PaginatedComponentFile file;
 
       final PageId pageId = new PageId(database, txPage.fileId, txPage.pageNumber);
@@ -553,8 +592,11 @@ public class TransactionManager {
           // entire content region, so it is safe regardless of the gap; a partial one is rejected here
           // so the follower recovers via a full snapshot instead.
           final int deltaSize = txPage.changesTo - txPage.changesFrom + 1;
-          final boolean fullPage =
-              txPage.changesFrom == BasePage.PAGE_HEADER_SIZE && deltaSize == file.getPageSize() - BasePage.PAGE_HEADER_SIZE;
+          // A multi-segment page is by definition a partial delta (the gaps between its intervals were not shipped),
+          // so it never qualifies: forceApply entries are built page-at-a-time by the compaction serializer and
+          // always carry exactly one full-page segment.
+          final boolean fullPage = lastSegment - firstSegment == 1
+              && txPage.changesFrom == BasePage.PAGE_HEADER_SIZE && deltaSize == file.getPageSize() - BasePage.PAGE_HEADER_SIZE;
           if (!fullPage) {
             LogManager.instance().log(this, Level.SEVERE,
                 "Refusing forceApply of partial delta for page %s over a stale baseline (WAL v.%d, db v.%d) fileId=%d: bytes outside the delta range would stay stale while the version is forced forward. A full-page snapshot is required.",
@@ -573,8 +615,11 @@ public class TransactionManager {
 
         // IF VERSION IS THE SAME OR MAJOR, OVERWRITE THE PAGE
         final MutablePage modifiedPage = page.modify();
-        txPage.currentContent.rewind();
-        modifiedPage.writeByteArray(txPage.changesFrom - BasePage.PAGE_HEADER_SIZE, txPage.currentContent.getContent());
+        for (int k = firstSegment; k < lastSegment; ++k) {
+          final WALFile.WALPage segment = tx.pages[k];
+          segment.currentContent.rewind();
+          modifiedPage.writeByteArray(segment.changesFrom - BasePage.PAGE_HEADER_SIZE, segment.currentContent.getContent());
+        }
         modifiedPage.version = txPage.currentPageVersion;
         modifiedPage.setContentSize(txPage.currentPageSize);
         modifiedPage.updateMetadata();
@@ -785,7 +830,8 @@ public class TransactionManager {
         if (attemptFileId != null)
           throw new LockTimeoutException(
               "Timeout on locking file " + attemptFileId + " (" + database.getFileManager().getFile(attemptFileId).getFileName()
-                  + ") during commit (fileIds=" + orderedFilesIds + ", timeout=" + timeout + "ms");
+                  + ") during commit (fileIds=" + orderedFilesIds + ", timeout=" + timeout + "ms" + describeHolder(attemptFileId)
+                  + ")");
 
         throw new LockTimeoutException("Timeout on locking files during commit (fileIds=" + orderedFilesIds + ")");
       }
@@ -822,7 +868,8 @@ public class TransactionManager {
 
         throw new LockTimeoutException(
             "Timeout on locking file " + attemptFileId + " (" + database.getFileManager().getFile(attemptFileId).getFileName()
-                + ") during commit (fileIds=" + Arrays.toString(fileIds) + ", timeout=" + timeout + "ms");
+                + ") during commit (fileIds=" + Arrays.toString(fileIds) + ", timeout=" + timeout + "ms"
+                + describeHolder(attemptFileId) + ")");
       }
     }
 
@@ -831,6 +878,26 @@ public class TransactionManager {
       LogManager.instance().log(this, Level.FINE, "Locked files %s (threadId=%d)", null, Arrays.toString(fileIds),
           Thread.currentThread().threadId());
     return lockedFiles;
+  }
+
+  /**
+   * Renders who holds {@code fileId} right now, as a suffix for a {@link LockTimeoutException} message,
+   * or an empty string when the lock was released in the meantime.
+   * <p>
+   * Without this the exception names only the file that could not be locked, which is the one thing an
+   * operator can already guess. The holder is knowable ONLY while the lock is still held: a lock leaked
+   * by a live thread is never reclaimed (the abandoned-lock sweep requires the owner to have died), so
+   * by the time the log is read the evidence is gone and the usual remedy is a blind restart. Building
+   * the string is safe here because the acquisition has already failed.
+   */
+  private String describeHolder(final int fileId) {
+    try {
+      final String holder = fileIdsLockManager.describeOwner(fileId);
+      return holder != null ? ", " + holder : "";
+    } catch (final Exception e) {
+      // Diagnostics must never replace the real failure with one of their own.
+      return "";
+    }
   }
 
   public void unlockFilesInOrder(final List<Integer> lockedFileIds, final Object requester) {

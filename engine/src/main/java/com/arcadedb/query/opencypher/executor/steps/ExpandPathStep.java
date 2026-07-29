@@ -19,12 +19,16 @@
 package com.arcadedb.query.opencypher.executor.steps;
 
 import com.arcadedb.exception.TimeoutException;
+import com.arcadedb.function.sql.DefaultSQLFunctionFactory;
 import com.arcadedb.graph.Vertex;
+import com.arcadedb.query.opencypher.InlineProperties;
+import com.arcadedb.query.opencypher.Labels;
 import com.arcadedb.query.opencypher.ast.Direction;
 import com.arcadedb.query.opencypher.ast.Expression;
 import com.arcadedb.query.opencypher.ast.NodePattern;
 import com.arcadedb.query.opencypher.ast.RelationshipPattern;
-import com.arcadedb.query.opencypher.parser.CypherASTBuilder;
+import com.arcadedb.query.opencypher.executor.CypherFunctionFactory;
+import com.arcadedb.query.opencypher.executor.ExpressionEvaluator;
 import com.arcadedb.query.opencypher.traversal.TraversalPath;
 import com.arcadedb.query.opencypher.ast.PathMode;
 import com.arcadedb.query.opencypher.traversal.VariableLengthPathTraverser;
@@ -62,6 +66,11 @@ public class ExpandPathStep extends AbstractExecutionStep {
   private final Set<String> previousStepVariables;
   private final Direction directionOverride;
   private final boolean reverseResultPath;
+  /**
+   * Created only when the target node pattern carries Cypher 25 dynamic {@code $(expression)}
+   * labels: every other pattern shape resolves its labels statically and must not pay for it.
+   */
+  private final ExpressionEvaluator dynamicLabelEvaluator;
 
   /**
    * Creates an expand path step.
@@ -131,6 +140,8 @@ public class ExpandPathStep extends AbstractExecutionStep {
     this.previousStepVariables = previousStepVariables;
     this.directionOverride = directionOverride;
     this.reverseResultPath = reverseResultPath;
+    this.dynamicLabelEvaluator = targetNodePattern != null && targetNodePattern.hasDynamicLabels() ?
+        new ExpressionEvaluator(new CypherFunctionFactory(DefaultSQLFunctionFactory.getInstance())) : null;
   }
 
   /**
@@ -204,8 +215,8 @@ public class ExpandPathStep extends AbstractExecutionStep {
               final TraversalPath path = reverseResultPath ? traversedPath.reversed() : traversedPath;
 
               // Filter by target node label if specified
-              if (targetNodePattern != null && targetNodePattern.hasLabels()) {
-                if (!matchesTargetLabel(targetVertex))
+              if (targetNodePattern != null && (targetNodePattern.hasLabels() || targetNodePattern.hasDynamicLabels())) {
+                if (!matchesTargetLabel(targetVertex, lastResult))
                   continue;
               }
 
@@ -275,7 +286,7 @@ public class ExpandPathStep extends AbstractExecutionStep {
 
             if (sourceObj instanceof Vertex) {
               final Vertex sourceVertex = (Vertex) sourceObj;
-              currentPaths = createTraverser().traversePaths(sourceVertex);
+              currentPaths = createTraverser(lastResult).traversePaths(sourceVertex);
             } else {
               currentPaths = null;
             }
@@ -293,25 +304,32 @@ public class ExpandPathStep extends AbstractExecutionStep {
   /**
    * Creates a traverser for this pattern.
    */
-  private VariableLengthPathTraverser createTraverser() {
+  private VariableLengthPathTraverser createTraverser(final Result currentResult) {
     final String[] types = pattern.hasTypes() ?
         pattern.getTypes().toArray(new String[0]) :
         null;
 
-    final Map<String, Object> props = pattern.hasProperties() ? pattern.getProperties() : null;
+    // Resolved against this row before the traversal starts: a traverser cannot resolve a parameter or a
+    // row-dependent value itself, and resolving here also keeps that work out of the per-edge loop.
+    final Map<String, Object> props = InlineProperties.resolveAll(pattern.getProperties(), currentResult, context);
 
     final Direction direction = directionOverride != null ? directionOverride : pattern.getDirection();
 
-    if (pathMode != null)
-      return new VariableLengthPathTraverser(
-          direction, types, props,
-          pattern.getEffectiveMinHops(), pattern.getEffectiveMaxHops(),
-          true, useBFS, pathMode);
+    final VariableLengthPathTraverser traverser = pathMode != null ?
+        new VariableLengthPathTraverser(
+            direction, types, props,
+            pattern.getEffectiveMinHops(), pattern.getEffectiveMaxHops(),
+            true, useBFS, pathMode) :
+        new VariableLengthPathTraverser(
+            direction, types, props,
+            pattern.getEffectiveMinHops(), pattern.getEffectiveMaxHops(),
+            true, useBFS);
 
-    return new VariableLengthPathTraverser(
-        direction, types, props,
-        pattern.getEffectiveMinHops(), pattern.getEffectiveMaxHops(),
-        true, useBFS);
+    // Inline WHERE, e.g. -[r:E*1..2 WHERE r.tag = 'ok']->: every traversed relationship must satisfy
+    // it, matching the inline property map and the clause-level all(e IN r WHERE ...) spelling. Built
+    // per source row so the predicate sees that row's bindings.
+    traverser.withEdgePredicate(pattern.buildInlineWherePredicate(currentResult, context));
+    return traverser;
   }
 
   /**
@@ -352,52 +370,61 @@ public class ExpandPathStep extends AbstractExecutionStep {
     return false;
   }
 
-  private boolean matchesTargetLabel(final Vertex vertex) {
-    for (final String label : targetNodePattern.getLabels())
-      if (!vertex.getType().instanceOf(label))
+  /**
+   * Applies the target node pattern labels to a traversed end vertex, with the same semantics
+   * {@link com.arcadedb.query.opencypher.executor.steps.MatchNodeStep} uses when the node is
+   * reached by a scan: a disjunction {@code (n:A|B)} accepts any of the labels, a conjunction
+   * {@code (n:A:B)} requires all of them, and Cypher 25 dynamic {@code $(expression)} labels are
+   * resolved against the current binding.
+   */
+  private boolean matchesTargetLabel(final Vertex vertex, final Result currentResult) {
+    final List<String> labels = resolveEffectiveLabels(currentResult);
+    if (labels.isEmpty())
+      return true;
+
+    if (targetNodePattern.isLabelDisjunction()) {
+      for (final String label : labels)
+        if (Labels.hasLabel(vertex, label))
+          return true;
+      return false;
+    }
+
+    for (final String label : labels)
+      if (!Labels.hasLabel(vertex, label))
         return false;
     return true;
   }
 
+  /**
+   * Returns the labels the target vertex must satisfy, combining the statically written labels with
+   * the result of evaluating any dynamic label expression against the current binding. A dynamic
+   * expression may yield a single label or a collection of labels, all of which are required.
+   */
+  private List<String> resolveEffectiveLabels(final Result currentResult) {
+    final List<String> staticLabels = targetNodePattern.getLabels();
+    if (dynamicLabelEvaluator == null)
+      return staticLabels;
+
+    final List<String> labels = new ArrayList<>(staticLabels.size() + targetNodePattern.getDynamicLabels().size());
+    labels.addAll(staticLabels);
+    for (final Expression dynamicLabel : targetNodePattern.getDynamicLabels())
+      appendResolvedLabels(labels, dynamicLabelEvaluator.evaluate(dynamicLabel, currentResult, context));
+    return labels;
+  }
+
+  private static void appendResolvedLabels(final List<String> labels, final Object resolved) {
+    if (resolved == null)
+      return;
+    if (resolved instanceof Iterable) {
+      for (final Object item : (Iterable<?>) resolved)
+        if (item != null)
+          labels.add(item.toString());
+    } else
+      labels.add(resolved.toString());
+  }
+
   private boolean matchesTargetProperties(final Vertex vertex, final Result currentResult) {
-    for (final Map.Entry<String, Object> entry : targetNodePattern.getProperties().entrySet()) {
-      final Object actual = vertex.get(entry.getKey());
-      Object expected = entry.getValue();
-
-      // Evaluate Expression-based property values (e.g., variable references from a prior WITH)
-      if (expected instanceof Expression && currentResult != null)
-        expected = ((Expression) expected).evaluate(currentResult, context);
-
-      // Resolve parameter references (e.g., $country -> actual value from context)
-      if (expected instanceof CypherASTBuilder.ParameterReference) {
-        final String paramName = ((CypherASTBuilder.ParameterReference) expected).getName();
-        if (context.getInputParameters() != null)
-          expected = context.getInputParameters().get(paramName);
-      } else if (expected instanceof String) {
-        final String s = (String) expected;
-        // Legacy parameter reference encoded as "$name"
-        if (s.startsWith("$") && s.length() > 1) {
-          final String paramName = s.substring(1);
-          if (context.getInputParameters() != null) {
-            final Object paramValue = context.getInputParameters().get(paramName);
-            if (paramValue != null)
-              expected = paramValue;
-          }
-        }
-      }
-
-      if (actual == null)
-        return false;
-      if (!actual.equals(expected)) {
-        // Numeric type-safe comparison (Integer vs Long, etc.)
-        if (actual instanceof Number && expected instanceof Number) {
-          if (((Number) actual).longValue() != ((Number) expected).longValue())
-            return false;
-        } else
-          return false;
-      }
-    }
-    return true;
+    return InlineProperties.matches(vertex, targetNodePattern.getProperties(), currentResult, context);
   }
 
   @Override
