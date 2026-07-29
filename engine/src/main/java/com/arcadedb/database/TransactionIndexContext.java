@@ -18,6 +18,7 @@
  */
 package com.arcadedb.database;
 
+import com.arcadedb.engine.LocalBucket;
 import com.arcadedb.exception.DuplicatedKeyException;
 import com.arcadedb.exception.RecordNotFoundException;
 import com.arcadedb.index.Index;
@@ -39,6 +40,14 @@ import java.util.logging.Level;
 public class TransactionIndexContext {
   private final DatabaseInternal                                             database;
   private       Map<String, TreeMap<ComparableKey, Map<IndexKey, IndexKey>>> indexEntries = new LinkedHashMap<>(); // MOST COMMON USE CASE INSERTION IS ORDERED, USE AN ORDERED MAP TO OPTIMIZE THE INDEX
+  /**
+   * Append-only lane for indexes that declare {@link IndexInternal#isTransactionKeyOrderRequired()}
+   * {@code false} (issue #5411). Entries replay at commit in the exact order they were queued, so
+   * the last operation on a given key wins with no key-ordered bookkeeping: no {@code ComparableKey}
+   * comparison chain, no per-key value map. Used by {@code LSM_SPARSE_VECTOR}, whose single record
+   * queues one entry per non-zero dimension.
+   */
+  private final Map<String, List<IndexKey>>                                  unorderedEntries = new LinkedHashMap<>();
 
   public static class IndexKey {
     public final boolean           unique;
@@ -186,6 +195,7 @@ public class TransactionIndexContext {
 
   public void removeIndex(final String indexName) {
     indexEntries.remove(indexName);
+    unorderedEntries.remove(indexName);
   }
 
   public int getTotalEntries() {
@@ -193,10 +203,15 @@ public class TransactionIndexContext {
     for (final Map<ComparableKey, Map<IndexKey, IndexKey>> entry : indexEntries.values()) {
       total += entry.values().stream().mapToInt(Map::size).sum();
     }
+    for (final List<IndexKey> entry : unorderedEntries.values())
+      total += entry.size();
     return total;
   }
 
   public int getTotalEntriesByIndex(final String indexName) {
+    final List<IndexKey> unordered = unorderedEntries.get(indexName);
+    if (unordered != null)
+      return unordered.size();
     final Map<ComparableKey, Map<IndexKey, IndexKey>> entries = indexEntries.get(indexName);
     if (entries == null)
       return 0;
@@ -206,8 +221,25 @@ public class TransactionIndexContext {
   public void commit() {
     // REMOVE ENTRIES FOR INDEXES DROPPED DURING THE TRANSACTION (e.g. TYPE DROP)
     indexEntries.keySet().removeIf(indexName -> !database.getSchema().existsIndex(indexName));
+    unorderedEntries.keySet().removeIf(indexName -> !database.getSchema().existsIndex(indexName));
 
     checkUniqueIndexKeys();
+
+    // APPEND-ONLY LANE FIRST: ITS ENTRIES CARRY NO UNIQUENESS CONSTRAINT AND REPLAY STRICTLY IN
+    // INSERTION ORDER, SO A REMOVE FOLLOWED BY AN ADD ON THE SAME KEY ENDS WITH THE ADD (AND VICE
+    // VERSA) WITHOUT THE TWO-PHASE REMOVE-THEN-ADD SPLIT THE ORDERED LANE NEEDS FOR ITS DEDUP MAP.
+    for (final Map.Entry<String, List<IndexKey>> entry : unorderedEntries.entrySet()) {
+      final IndexInternal index = (IndexInternal) database.getSchema().getIndexByName(entry.getKey());
+      final List<IndexKey> keys = entry.getValue();
+      for (int i = 0; i < keys.size(); i++) {
+        final IndexKey key = keys.get(i);
+        if (key.operation == IndexKey.IndexKeyOperation.REMOVE)
+          index.removeReplay(key.keyValues, key.rid);
+        else
+          index.putReplay(key.keyValues, new RID[] { key.rid });
+      }
+    }
+    unorderedEntries.clear();
 
     for (final Map.Entry<String, TreeMap<ComparableKey, Map<IndexKey, IndexKey>>> entry : indexEntries.entrySet()) {
       final IndexInternal index = (IndexInternal) database.getSchema().getIndexByName(entry.getKey());
@@ -286,9 +318,13 @@ public class TransactionIndexContext {
   public void addFilesToLock(final IntHashSet modifiedFiles) {
     final Schema schema = database.getSchema();
 
-    final Set<Index> lockedIndexes = new HashSet<>(indexEntries.size());
+    final Set<Index> lockedIndexes = new HashSet<>(indexEntries.size() + unorderedEntries.size());
 
-    for (final String indexName : indexEntries.keySet()) {
+    final List<String> indexNames = new ArrayList<>(indexEntries.size() + unorderedEntries.size());
+    indexNames.addAll(indexEntries.keySet());
+    indexNames.addAll(unorderedEntries.keySet());
+
+    for (final String indexName : indexNames) {
       if (!schema.existsIndex(indexName))
         // INDEX WAS DROPPED DURING THE TRANSACTION (e.g. TYPE DROP), SKIP IT
         continue;
@@ -314,10 +350,21 @@ public class TransactionIndexContext {
         if (associatedBucketId >= 0)
           modifiedFiles.add(associatedBucketId);
 
+        // Only the UNIQUE indexes of the type need the all-buckets fan-out (#5499). A unique index is
+        // partitioned by the record's bucket, so a colliding key can sit in ANY bucket's sub-index and
+        // checkUniqueIndexKeys has to read the whole polymorphic TypeIndex - exactly the set locked here -
+        // for the check to be atomic against a concurrent inserter. A NOTUNIQUE sibling enforces no such
+        // cross-bucket invariant and is never read by that check; the only sub-index it can WRITE is its
+        // own, and that one is already covered by the getFileIds() call above, which runs for every index
+        // this transaction registered an entry for. Locking the siblings too multiplied the per-commit lock
+        // set by the number of indexes on the type - 6 indexes x 32 buckets = 192 exclusive locks to insert
+        // one edge in the report that surfaced this - and serialised every writer against every other one
+        // regardless of which keys or buckets they touched.
         final DocumentType type = schema.getType(index.getTypeName());
         for (final TypeIndex typeIndex : type.getAllIndexes(true))
-          for (final IndexInternal idx : typeIndex.getIndexesOnBuckets())
-            modifiedFiles.add(idx.getFileId());
+          if (typeIndex.isUnique())
+            for (final IndexInternal idx : typeIndex.getIndexesOnBuckets())
+              modifiedFiles.add(idx.getFileId());
       } else if (associatedBucketId >= 0)
         modifiedFiles.add(associatedBucketId);
     }
@@ -332,7 +379,7 @@ public class TransactionIndexContext {
   }
 
   public boolean isEmpty() {
-    return indexEntries.isEmpty();
+    return indexEntries.isEmpty() && unorderedEntries.isEmpty();
   }
 
   public void addIndexKeyLock(final IndexInternal index, IndexKey.IndexKeyOperation operation, final Object[] keysValues,
@@ -342,6 +389,22 @@ public class TransactionIndexContext {
       return;
 
     final String indexName = index.getName();
+
+    if (!index.isTransactionKeyOrderRequired()) {
+      // APPEND-ONLY LANE: NO KEY ORDERING, NO PER-KEY DEDUP. REPLAY ORDER == INSERTION ORDER.
+      List<IndexKey> lane = unorderedEntries.get(indexName);
+      if (lane == null) {
+        // Checked once per index per transaction, not per entry: duplicated-key detection reads the
+        // key-ordered map back, so an index that skips it cannot enforce uniqueness.
+        if (index.isUnique())
+          throw new IllegalStateException("Unique index '" + indexName
+              + "' cannot opt out of the key-ordered transaction map: duplicated-key detection reads it back");
+        lane = new ArrayList<>();
+        unorderedEntries.put(indexName, lane);
+      }
+      lane.add(new IndexKey(false, operation, keysValues, rid));
+      return;
+    }
 
     TreeMap<ComparableKey, Map<IndexKey, IndexKey>> keys = indexEntries.get(indexName);
 
@@ -411,6 +474,7 @@ public class TransactionIndexContext {
 
   public void reset() {
     indexEntries.clear();
+    unorderedEntries.clear();
   }
 
   public TreeMap<ComparableKey, Map<IndexKey, IndexKey>> getIndexKeys(final String indexName) {
@@ -446,6 +510,15 @@ public class TransactionIndexContext {
             throw new DuplicatedKeyException(idx.getName(), Arrays.toString(key.keyValues), firstEntry.getIdentity());
 
           } catch (final RecordNotFoundException e) {
+            // #5279: "not found" is only evidence of a dirty index when the record is missing from the COMMITTED
+            // state too. This transaction reads through its OWN image of the record's page, which can be older
+            // than the committed one - since concurrent inserts into the same bucket now take different slots of
+            // the same page, a transaction that already modified that page cannot see a record a concurrent
+            // transaction committed into it. Repairing then would silently delete a HEALTHY index entry and let a
+            // duplicate key through: the key is really taken, so fail like any other duplicate.
+            if (existsInCommittedState(firstEntry.getIdentity()))
+              throw new DuplicatedKeyException(idx.getName(), Arrays.toString(key.keyValues), firstEntry.getIdentity());
+
             // INDEX DIRTY: THE RECORD WAS DELETED OR ITS BUCKET IS GONE, REMOVE THE DANGLING ENTRY TO FIX THE INDEX
             LogManager.instance()
                 .log(this, Level.WARNING,
@@ -458,6 +531,16 @@ public class TransactionIndexContext {
       }
     }
 
+  }
+
+  /**
+   * Tells whether a record still lives at {@code rid} in the CURRENT COMMITTED state, ignoring what this
+   * transaction's own (possibly older) image of that page shows. Used to tell a genuinely dangling index entry from
+   * one this transaction simply cannot see yet (#5279).
+   */
+  private boolean existsInCommittedState(final RID rid) {
+    return database.getSchema().getFileByIdIfExists(rid.getBucketId()) instanceof LocalBucket bucket//
+        && bucket.existsRecordInCommittedPage(rid);
   }
 
   /**

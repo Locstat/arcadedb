@@ -29,6 +29,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -42,6 +44,10 @@ class MCPStdioServerTest extends BaseGraphServerTest {
     config = getServer(0).getMCPConfiguration();
     config.setEnabled(true);
     config.setAllowReads(true);
+    config.setToolProfile(MCPConfiguration.ToolProfile.ALL);
+    final JSONObject reset = new JSONObject();
+    reset.put("principalProfiles", (Object) null);
+    config.updateFrom(reset);
     user = getServer(0).getSecurity().authenticate("root", DEFAULT_PASSWORD_FOR_TESTS, null);
   }
 
@@ -73,8 +79,101 @@ class MCPStdioServerTest extends BaseGraphServerTest {
     final JSONObject response = sendSingleRequest(request);
 
     assertThat(response.has("result")).isTrue();
-    final JSONArray tools = response.getJSONObject("result").getJSONArray("tools");
-    assertThat(tools.length()).isEqualTo(13);
+    assertThat(toolNames(response)).contains(
+        "list_databases", "get_schema", "query", "execute_command", "sample_records", "vector_search",
+        "hybrid_search", "full_text_search", "upsert_entity", "upsert_relationship", "server_status");
+  }
+
+  @Test
+  void toolsListReturnsIndependentArrays() throws Exception {
+    final JSONObject request = new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 3)
+        .put("method", "tools/list")
+        .put("params", new JSONObject());
+
+    final JSONArray first = sendSingleRequest(request).getJSONObject("result").getJSONArray("tools");
+    final int registeredToolCount = first.length();
+    first.remove(0);
+
+    final JSONArray second = sendSingleRequest(request).getJSONObject("result").getJSONArray("tools");
+    assertThat(second.length()).isEqualTo(registeredToolCount);
+  }
+
+  @Test
+  void toolProfilesFilterDiscoveryAndExecution() throws Exception {
+    config.setToolProfile(MCPConfiguration.ToolProfile.RAG);
+    JSONObject response = sendSingleRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 20)
+        .put("method", "tools/list")
+        .put("params", new JSONObject()));
+    assertThat(toolNames(response))
+        .contains("list_databases", "get_schema", "query", "sample_records", "vector_search", "hybrid_search",
+            "full_text_search", "upsert_entity", "upsert_relationship")
+        .doesNotContain("server_status", "execute_command");
+
+    JSONObject denied = callTool("server_status", new JSONObject());
+    assertThat(denied.getBoolean("isError", false)).isTrue();
+    assertThat(denied.getJSONArray("content").getJSONObject(0).getString("text"))
+        .contains("server_status").contains("rag");
+
+    config.setToolProfile(MCPConfiguration.ToolProfile.ADMIN);
+    response = sendSingleRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 21)
+        .put("method", "tools/list")
+        .put("params", new JSONObject()));
+    assertThat(toolNames(response)).contains(
+        "list_databases", "get_schema", "query", "execute_command", "server_status",
+        "profiler_start", "profiler_stop", "profiler_status", "get_server_settings", "set_server_setting");
+
+    final JSONObject initialized = sendSingleRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 22)
+        .put("method", "initialize")
+        .put("params", new JSONObject()));
+    assertThat(initialized.getJSONObject("result").getString("instructions"))
+        .contains("multi-model database server")
+        .doesNotContain("retrieval and agent memory", "restricted tool surface");
+
+    denied = callTool("full_text_search", new JSONObject());
+    assertThat(denied.getBoolean("isError", false)).isTrue();
+    assertThat(denied.getJSONArray("content").getJSONObject(0).getString("text"))
+        .contains("full_text_search").contains("admin");
+  }
+
+  @Test
+  void principalProfileAppliesToStdioAndCannotExceedGlobalProfile() throws Exception {
+    config.setToolProfile(MCPConfiguration.ToolProfile.RAG);
+    config.updateFrom(new JSONObject()
+        .put("principalProfiles", new JSONObject().put("root", "admin")));
+
+    final JSONObject response = sendSingleRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 22)
+        .put("method", "tools/list")
+        .put("params", new JSONObject()));
+    assertThat(toolNames(response))
+        .contains("list_databases", "get_schema", "query")
+        .doesNotContain("server_status", "full_text_search", "execute_command");
+
+    JSONObject denied = callTool("server_status", new JSONObject());
+    assertThat(denied.getBoolean("isError", false)).isTrue();
+    assertThat(denied.getJSONArray("content").getJSONObject(0).getString("text"))
+        .contains("global MCP profile 'rag'").contains("principal profile 'admin'");
+
+    denied = callTool("full_text_search", new JSONObject());
+    assertThat(denied.getBoolean("isError", false)).isTrue();
+
+    final JSONObject initialized = sendSingleRequest(new JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", 23)
+        .put("method", "initialize")
+        .put("params", new JSONObject()));
+    assertThat(initialized.getJSONObject("result").getString("instructions"))
+        .contains("restricted tool surface")
+        .doesNotContain("execute_command", "upsert_entity");
   }
 
   @Test
@@ -303,5 +402,13 @@ class MCPStdioServerTest extends BaseGraphServerTest {
     final JSONObject response = sendSingleRequest(request);
     assertThat(response.has("result")).isTrue();
     return response.getJSONObject("result");
+  }
+
+  private static Set<String> toolNames(final JSONObject response) {
+    final Set<String> names = new HashSet<>();
+    final JSONArray tools = response.getJSONObject("result").getJSONArray("tools");
+    for (int i = 0; i < tools.length(); i++)
+      names.add(tools.getJSONObject(i).getString("name"));
+    return names;
   }
 }

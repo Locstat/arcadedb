@@ -28,11 +28,11 @@ import com.arcadedb.graph.GhostEdgeReporter;
 import com.arcadedb.graph.GraphTraversalProvider;
 import com.arcadedb.graph.GraphTraversalProviderRegistry;
 import com.arcadedb.graph.Vertex;
+import com.arcadedb.query.opencypher.InlineProperties;
 import com.arcadedb.query.opencypher.ast.Direction;
-import com.arcadedb.query.opencypher.ast.Expression;
 import com.arcadedb.query.opencypher.ast.NodePattern;
 import com.arcadedb.query.opencypher.ast.RelationshipPattern;
-import com.arcadedb.query.opencypher.parser.CypherASTBuilder;
+import com.arcadedb.query.opencypher.executor.SelfLoops;
 import com.arcadedb.query.opencypher.traversal.TraversalPath;
 import com.arcadedb.query.sql.executor.AbstractExecutionStep;
 import com.arcadedb.query.sql.executor.CommandContext;
@@ -46,7 +46,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 
@@ -316,7 +315,7 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
                     final String[] types = pattern.hasTypes() ? pattern.getTypes().toArray(new String[0]) : null;
                     int[] neighborIds = gavProvider.getNeighborIds(sourceNodeId, dir.toArcadeDirection(), types);
                     if (dir == Direction.BOTH)
-                      neighborIds = deduplicateSelfLoops(neighborIds, sourceNodeId);
+                      neighborIds = SelfLoops.deduplicate(neighborIds, sourceNodeId);
                     currentGavNeighborIds = neighborIds;
                     currentGavNeighborIdx = 0;
                     currentGavProvider = gavProvider;
@@ -500,7 +499,7 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
               continue;
 
             // Filter by inline relationship properties if specified
-            if (pattern.hasProperties() && !matchesEdgeProperties(edge))
+            if (pattern.hasProperties() && !matchesEdgeProperties(edge, lastResult))
               continue;
 
             // Filter by inline WHERE predicate on the relationship (e.g., [r:KNOWS WHERE r.since < 2019])
@@ -748,7 +747,7 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
         // appears once in the forward and once in the backward neighbor list,
         // doubling it in the merged result. Keep only half the self-loop entries.
         if (direction == Direction.BOTH)
-          neighborIds = deduplicateSelfLoops(neighborIds, nodeId);
+          neighborIds = SelfLoops.deduplicate(neighborIds, nodeId);
 
         final int[] neighbors = neighborIds;
         return new Iterator<>() {
@@ -781,7 +780,7 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
     // For BOTH direction, deduplicate self-loop vertices: the OLTP iterator
     // concatenates OUT and IN edge iterators, so self-loops yield the source
     // vertex twice. Skip every other occurrence of the source vertex.
-    // This is semantically equivalent to the CSR path's deduplicateSelfLoops(),
+    // This is semantically equivalent to the CSR path's SelfLoops.deduplicate(),
     // which removes selfLoopCount/2 entries from the neighbor array — both rely
     // on the invariant that each self-loop produces exactly 2 entries.
     //
@@ -891,46 +890,10 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
     return true;
   }
 
-  /** Checks if the target vertex satisfies the inline property map; Expression values are evaluated against currentResult. */
+  /** Checks if the target vertex satisfies the inline property map; dynamic values are resolved against currentResult. */
   private boolean matchesTargetProperties(final Vertex vertex, final Result currentResult) {
-    if (targetNodePattern == null || !targetNodePattern.hasProperties())
-      return true;
-
-    for (final Map.Entry<String, Object> entry : targetNodePattern.getProperties().entrySet()) {
-      final Object actual = vertex.get(entry.getKey());
-      Object expected = entry.getValue();
-
-      // Evaluate Expression-based property values (e.g., variable references from a prior WITH)
-      if (expected instanceof Expression && currentResult != null)
-        expected = ((Expression) expected).evaluate(currentResult, context);
-
-      // Resolve parameter references (e.g., $param -> actual value from context)
-      if (expected instanceof CypherASTBuilder.ParameterReference) {
-        final String paramName = ((CypherASTBuilder.ParameterReference) expected).getName();
-        if (context.getInputParameters() != null)
-          expected = context.getInputParameters().get(paramName);
-      } else if (expected instanceof String) {
-        final String s = (String) expected;
-        // Legacy parameter reference encoded as "$name"
-        if (s.startsWith("$") && s.length() > 1) {
-          final String paramName = s.substring(1);
-          if (context.getInputParameters() != null) {
-            final Object paramValue = context.getInputParameters().get(paramName);
-            if (paramValue != null)
-              expected = paramValue;
-          }
-        }
-      }
-
-      if (actual == null || !actual.equals(expected)) {
-        if (actual instanceof Number && expected instanceof Number) {
-          if (((Number) actual).longValue() != ((Number) expected).longValue())
-            return false;
-        } else
-          return false;
-      }
-    }
-    return true;
+    return targetNodePattern == null
+        || InlineProperties.matches(vertex, targetNodePattern.getProperties(), currentResult, context);
   }
 
   /**
@@ -988,43 +951,13 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
   }
 
   /**
-   * Checks if an edge matches the inline property filters.
+   * Checks if an edge matches the inline property filters, e.g. the {@code {transactionId: row.id}} in
+   * {@code UNWIND $rows AS row MATCH (a)-[t:TRANSFER {transactionId: row.id}]->(b)}. Resolved against the
+   * current row, so a value that is not a literal - a parameter, a variable bound earlier, a property of
+   * an UNWIND row - filters on what it stands for instead of matching nothing (issue #5501).
    */
-  private boolean matchesEdgeProperties(final Edge edge) {
-    if (!pattern.hasProperties())
-      return true;
-
-    for (final Map.Entry<String, Object> entry : pattern.getProperties().entrySet()) {
-      final Object actual = edge.get(entry.getKey());
-      Object expected = entry.getValue();
-
-      // Resolve parameter references (e.g., $param -> actual value from context)
-      if (expected instanceof CypherASTBuilder.ParameterReference) {
-        final String paramName = ((CypherASTBuilder.ParameterReference) expected).getName();
-        if (context.getInputParameters() != null)
-          expected = context.getInputParameters().get(paramName);
-      } else if (expected instanceof String) {
-        final String s = (String) expected;
-        // Legacy parameter reference encoded as "$name"
-        if (s.startsWith("$") && s.length() > 1) {
-          final String paramName = s.substring(1);
-          if (context.getInputParameters() != null) {
-            final Object paramValue = context.getInputParameters().get(paramName);
-            if (paramValue != null)
-              expected = paramValue;
-          }
-        }
-      }
-
-      if (actual == null || !actual.equals(expected)) {
-        if (actual instanceof Number && expected instanceof Number) {
-          if (((Number) actual).longValue() != ((Number) expected).longValue())
-            return false;
-        } else
-          return false;
-      }
-    }
-    return true;
+  private boolean matchesEdgeProperties(final Edge edge, final Result currentResult) {
+    return InlineProperties.matches(edge, pattern.getProperties(), currentResult, context);
   }
 
   /**
@@ -1078,41 +1011,6 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
       builder.append(")");
     }
     return builder.toString();
-  }
-
-  /**
-   * Removes duplicate self-loop entries from a neighbor ID array for BOTH direction.
-   * Each self-loop edge contributes the source node to both the forward and backward
-   * neighbor lists, so it appears twice in the merged array. This method keeps only
-   * half the self-loop entries, preserving correct multiplicity for multi-self-loop cases.
-   * <p>
-   * <b>Invariant:</b> the self-loop count is always even because every self-loop edge
-   * contributes exactly one entry to the forward neighbor list and one to the backward
-   * neighbor list — whether from base CSR or from the delta overlay (which adds to both
-   * ovOut and ovIn). This mirrors the OLTP path's skip-every-other deduplication in
-   * {@link #getVertices(Vertex)}, which also relies on the OUT+IN iterator concatenation
-   * producing exactly 2 entries per self-loop edge. See
-   * {@code GraphEngine.getVertices()} BOTH case for the structural guarantee.
-   */
-  private static int[] deduplicateSelfLoops(final int[] neighborIds, final int sourceNodeId) {
-    int selfLoopCount = 0;
-    for (final int id : neighborIds)
-      if (id == sourceNodeId)
-        selfLoopCount++;
-    if (selfLoopCount <= 1)
-      return neighborIds; // 0 or 1 self-loop entries: no duplicates to remove
-    final int toRemove = selfLoopCount / 2;
-    final int[] result = new int[neighborIds.length - toRemove];
-    int w = 0;
-    int skipped = 0;
-    for (final int id : neighborIds) {
-      if (id == sourceNodeId && skipped < toRemove) {
-        skipped++;
-        continue;
-      }
-      result[w++] = id;
-    }
-    return result;
   }
 
   private static String getIndent(final int depth, final int indent) {
