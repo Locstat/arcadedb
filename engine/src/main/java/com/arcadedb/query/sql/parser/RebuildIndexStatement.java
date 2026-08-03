@@ -43,6 +43,7 @@ import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.FullTextIndexMetadata;
+import com.arcadedb.schema.GeoIndexMetadata;
 import com.arcadedb.schema.IndexBuilder;
 import com.arcadedb.schema.IndexMetadata;
 import com.arcadedb.schema.LocalDocumentType;
@@ -130,10 +131,11 @@ public class RebuildIndexStatement extends DDLStatement {
         }
       }
 
-      if (totalIndexed % 100000 == 0) {
-        System.out.print(".");
-        System.out.flush();
-      }
+      // Progress goes to the log, not to stdout: this runs inside the server process, where a dot written to
+      // System.out reaches nobody while still costing a flush on the build path (issue #5765). The live,
+      // pollable progress is the OperationProgress registered below.
+      if (totalIndexed % 100000 == 0)
+        LogManager.instance().log(this, Level.INFO, "Rebuilding indexes: %d records indexed so far", totalIndexed);
     };
 
     String indexName = null;
@@ -311,7 +313,10 @@ public class RebuildIndexStatement extends DDLStatement {
         final String typeName = idx.getTypeName();
         final boolean unique = idx.isUnique();
         final List<String> propertyNames = idx.getPropertyNames();
-        final int pageSize = ((IndexInternal) idx).getPageSize();
+        // NOT getPageSize(): the index is dropped below before being recreated, so a page size the creation path would
+        // refuse (a HASH index predating #5713) would leave the index deleted and unrebuilt. getPageSizeForNewFile()
+        // answers the current page size unless it is not legal to create with, in which case it repairs it.
+        final int pageSize = ((IndexInternal) idx).getPageSizeForNewFile();
         final LSMTreeIndexAbstract.NULL_STRATEGY nullStrategy = idx.getNullStrategy();
         // Get index metadata (includes vector-specific settings like dimensions, similarity, etc.)
         IndexMetadata indexMetadata = ((IndexInternal) idx).getMetadata();
@@ -326,6 +331,14 @@ public class RebuildIndexStatement extends DDLStatement {
           ftMeta.fromJSON(((IndexInternal) idx).toJSON());
           ftMeta.setCounters(0L, 0L);
           indexMetadata = ftMeta;
+        } else if (type == Schema.INDEX_TYPE.GEOSPATIAL) {
+          // Same defect as #4732 for FULL_TEXT: the generic IndexMetadata carries no `precision`, so a rebuild silently
+          // reset a non-default GeoHash resolution. Rebuilding also re-reads every record, which is the one safe moment
+          // to publish the compact FRONTIER layout on an index created before 26.8.1 (#5478).
+          final GeoIndexMetadata geoMeta = new GeoIndexMetadata(typeName, propertyNames.toArray(new String[0]), -1);
+          geoMeta.fromJSON(((IndexInternal) idx).toJSON());
+          geoMeta.setTokenization(GeoIndexMetadata.DEFAULT_TOKENIZATION);
+          indexMetadata = geoMeta;
         }
         final IndexMetadata rebuildMetadata = indexMetadata;
 

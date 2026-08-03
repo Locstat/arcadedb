@@ -61,6 +61,19 @@ public class MutableDocument extends BaseDocument implements RecordInternal {
     buffer.position(buffer.position() + 1); // SKIP RECORD TYPE
   }
 
+  /**
+   * Builds a document that can never hold properties, skipping the property map the other constructors allocate
+   * eagerly. Used by {@link com.arcadedb.graph.MutableLightEdge}, which is created once per edge on the write path
+   * and would otherwise pay for a 16-entry {@link LinkedHashMap} it can never fill. The immutable empty map is a
+   * second line of defence: a write that slipped past the overridden mutators fails loudly rather than silently
+   * accumulating properties that will never be stored.
+   */
+  protected MutableDocument(final Database database, final DocumentType type, final RID rid,
+                            final boolean withoutProperties) {
+    super(database, type, rid, null);
+    this.map = withoutProperties ? Collections.emptyMap() : new LinkedHashMap<>(16);
+  }
+
   public void merge(final Map<String, Object> other) {
     for (final Map.Entry<String, Object> entry : other.entrySet())
       set(entry.getKey(), entry.getValue());
@@ -467,36 +480,31 @@ public class MutableDocument extends BaseDocument implements RecordInternal {
       try {
         final Type propType = property.getType();
 
-        final Class javaImplementation;
-        if (propType == Type.DATE)
-          javaImplementation = database.getSerializer().getDateImplementation();
-        else if (propType == Type.DATETIME)
-          javaImplementation = database.getSerializer().getDateTimeImplementation();
-        else {
-          javaImplementation = propType.getDefaultJavaType();
+        // The same mapping the partitioned bucket strategy replays to hash a lookup key the way this write path
+        // hashed the stored one (issue #5595), hence the shared helper rather than an inline switch.
+        final Class javaImplementation = propType.getJavaImplementation(database);
 
-          if (javaImplementation.equals(Document.class)) {
-            // EMBEDDED DOCUMENT
-            if (value instanceof Map) {
-              final Map<String, Object> map = (Map<String, Object>) value;
-              final String embType = (String) map.get("@type");
+        if (javaImplementation.equals(Document.class)) {
+          // EMBEDDED DOCUMENT
+          if (value instanceof Map) {
+            final Map<String, Object> map = (Map<String, Object>) value;
+            final String embType = (String) map.get("@type");
 
-              final String ofType = property.getOfType();
-              if (ofType != null) {
-                // VALIDATE CONSTRAINT
-                if (!ofType.equals(embType)) {
-                  // CHECK INHERITANCE
-                  final DocumentType schemaType = database.getSchema().getType(embType);
-                  if (!schemaType.instanceOf(ofType))
-                    throw new ValidationException(
-                        "Embedded type '" + embType + "' is not compatible with the type defined in the schema " +
-                            "constraint '"
-                            + ofType + "'");
-                }
+            final String ofType = property.getOfType();
+            if (ofType != null) {
+              // VALIDATE CONSTRAINT
+              if (!ofType.equals(embType)) {
+                // CHECK INHERITANCE
+                final DocumentType schemaType = database.getSchema().getType(embType);
+                if (!schemaType.instanceOf(ofType))
+                  throw new ValidationException(
+                      "Embedded type '" + embType + "' is not compatible with the type defined in the schema " +
+                          "constraint '"
+                          + ofType + "'");
               }
-
-              return newEmbeddedDocument(embType, name);
             }
+
+            return newEmbeddedDocument(embType, name);
           }
         }
 

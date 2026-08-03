@@ -18,12 +18,14 @@
  */
 package com.arcadedb.index.lsm;
 
+import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.database.Binary;
 import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.RID;
 import com.arcadedb.database.TrackableBinary;
 import com.arcadedb.database.TransactionIndexContext;
 import com.arcadedb.engine.BasePage;
+import com.arcadedb.engine.Component;
 import com.arcadedb.engine.ComponentFile;
 import com.arcadedb.engine.MutablePage;
 import com.arcadedb.engine.PageId;
@@ -35,8 +37,11 @@ import com.arcadedb.schema.Type;
 import com.arcadedb.utility.RidHashSet;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.logging.Level;
 
 import static com.arcadedb.database.Binary.BYTE_SERIALIZED_SIZE;
@@ -56,13 +61,53 @@ public class LSMTreeIndexCompacted extends LSMTreeIndexAbstract {
   private volatile boolean keyOrderCheckedOnLoad = false;
 
   /**
-   * Number of live {@link LSMTreeIndexUnderlyingCompactedSeriesCursor}s over this file. Series cursors load
-   * their pages LAZILY (page by page as the scan advances), so unlike the mutable-page cursors - which grab
-   * every page buffer eagerly at construction - they cannot survive their file being dropped. A full
-   * compaction that replaces this file must therefore defer the physical drop until this count drains to
-   * zero (see LSMTreeIndex's retired-file handling).
+   * The live {@link LSMTreeIndexUnderlyingCompactedSeriesCursor}s over this file, one entry per open cursor. Series
+   * cursors load their pages LAZILY (page by page as the scan advances), so unlike the mutable-page cursors - which
+   * grab every page buffer eagerly at construction - they cannot survive their file being dropped. A full compaction
+   * that replaces this file must therefore defer the physical drop until this set drains (see LSMTreeIndex's
+   * retired-file handling).
+   * <p>
+   * <b>#5662.</b> The entries are WEAK references to a token the cursor owns, not a plain counter, so that a cursor
+   * abandoned without {@code close()} stops pinning the file once the GC collects it. It used to be a counter, which
+   * made every missed {@code close()} permanent: the retired file stayed undroppable for the lifetime of the database
+   * with nothing left that could ever release it, and nothing to say so. {@link #purgeCollectedCursors()} now reports
+   * each one, because a leak that repairs itself is still a leak worth a line in the log.
    */
-  private final AtomicInteger activeCursors = new AtomicInteger();
+  private final Set<WeakReference<Object>> activeCursors = ConcurrentHashMap.newKeySet();
+
+  /**
+   * Per-series bloom filters over this file (#5517), or null when the file has none - because the feature is off, the
+   * file predates it, or a compaction could not write one. Volatile: a compaction publishes it while lookups read it.
+   */
+  private volatile LSMTreeIndexBloomFilter bloomFilter = null;
+
+  /**
+   * Whether lookups CONSULT the filters, captured from the configured rate when the index is loaded. Separate from
+   * {@link #bloomFilter} being present: the component is always adopted so a compaction can publish into the file the
+   * index already owns, even when reads are turned off.
+   */
+  private volatile boolean bloomFilterEnabled = true;
+
+  /**
+   * Scratch buffer for the bloom key hash, one per THREAD and shared by every index - deliberately static.
+   * <p>
+   * A per-instance ThreadLocal would leave one Binary pinned in every worker thread's map for every compacted index
+   * object ever created, and a full compaction creates a new one each time: the classic ThreadLocal residue, unbounded
+   * across indexes and threads. One buffer per thread is enough because it is filled and consumed inside a single
+   * {@link #bloomHashOfKey} call, which calls nothing that could re-enter it.
+   */
+  private static final ThreadLocal<Binary> BLOOM_KEY_BUFFER = ThreadLocal.withInitial(Binary::new);
+
+  /**
+   * Series a bloom filter spared this file from reading - what the feature is worth, in the only unit that matters -
+   * and series still read after a probe, because the key was there or the filter returned a false positive.
+   * <p>
+   * {@link LongAdder} rather than {@code AtomicLong}: these are bumped once per series per lookup, and a bulk load
+   * runs that concurrently across every thread it has. A single contended cache line is not something to add to the
+   * path whose cost this feature exists to remove; reads are diagnostics and can afford the sum.
+   */
+  private final LongAdder bloomSkippedSeries = new LongAdder();
+  private final LongAdder bloomProbedSeries  = new LongAdder();
 
   /**
    * Called at cloning time.
@@ -542,6 +587,28 @@ public class LSMTreeIndexCompacted extends LSMTreeIndexAbstract {
       effectivePageCount = mainPageCount;
     }
 
+    // #5517: hashed ONCE here and probed against every series' filter below. The flag is separate from the hash and is
+    // set ONLY once a hash has actually been produced: every long is a legal hash, so no value of it could stand for
+    // "absent", and probing with a hash that is not the key's would skip series that hold it - a false negative, the
+    // one thing this must never do. Anything that cannot be hashed - a partial key, a null component, a value that
+    // fails to serialize - searches every series exactly as before #5517.
+    final LSMTreeIndexBloomFilter filters = bloomFilter;
+    long keyHash = 0L;
+    boolean useFilters = false;
+    if (filters != null && bloomFilterEnabled && isBloomHashable(convertedKeys)) {
+      try {
+        final Binary serialized = serializeKeyForHashing(BLOOM_KEY_BUFFER.get(), convertedKeys);
+        if (serialized != null) {
+          keyHash = LSMTreeIndexBloomFilter.hashKey(serialized);
+          useFilters = true;
+        }
+      } catch (final Exception e) {
+        LogManager.instance().log(this, Level.FINE,
+            "Cannot hash the lookup key of index '%s' for its bloom filters, searching every series (error=%s)", null,
+            componentName, e.toString());
+      }
+    }
+
     for (int pageNumber = effectivePageCount - 1; pageNumber > 0; ) {
       final BasePage lastPage = database.getTransaction().getPage(new PageId(database, file.getFileId(), pageNumber), pageSize);
 
@@ -554,6 +621,16 @@ public class LSMTreeIndexCompacted extends LSMTreeIndexAbstract {
       }
 
       pageNumber -= rootPageCount;
+
+      if (useFilters) {
+        if (!filters.mightContain(pageNumber, rootPageCount, seriesFingerprint(lastPage), keyHash)) {
+          // THE SERIES PROVABLY DOES NOT HOLD THE KEY: SKIP ITS ROOT AND DATA PAGES ENTIRELY
+          bloomSkippedSeries.increment();
+          --pageNumber;
+          continue;
+        }
+        bloomProbedSeries.increment();
+      }
 
       final PageId pageId = new PageId(database, file.getFileId(), pageNumber);
       final BasePage rootPage = database.getTransaction().getPage(pageId, pageSize);
@@ -718,17 +795,170 @@ public class LSMTreeIndexCompacted extends LSMTreeIndexAbstract {
     return problems;
   }
 
-  void onCursorOpened() {
-    activeCursors.incrementAndGet();
+  /**
+   * A cheap identity for a compacted series, taken from the header of its LAST data page - the page the lookup path
+   * has already read to learn how long the series is, so this costs no extra I/O on either side.
+   * <p>
+   * It exists because a bloom filter entry names its series by POSITION, and a position can be reused: an aborted
+   * compaction round leaves its pages unreachable and a later round writes a different series over them. Page count
+   * alone can coincide; ending with the same number of entries occupying the same bytes as well is not something two
+   * different series do by accident. Defined once here so the compaction and the lookup can never compute it
+   * differently.
+   */
+  int seriesFingerprint(final BasePage lastPageOfSeries) {
+    return getCount(lastPageOfSeries) * 31 + getValuesFreePosition(lastPageOfSeries);
   }
 
-  void onCursorClosed() {
-    activeCursors.decrementAndGet();
+  /** The per-series bloom filters of this file, or null when it has none. */
+  public LSMTreeIndexBloomFilter getBloomFilter() {
+    return bloomFilter;
   }
 
-  /** Live series cursors over this file; the file cannot be physically dropped while > 0. */
-  public int getActiveCursors() {
-    return activeCursors.get();
+  /**
+   * Whether lookups consult the filters. FALSE with {@code arcadedb.indexBloomFilterRate} at 0, in which case the
+   * component may still be attached (so a compaction publishes into the file this index already owns) but is never
+   * read. Captured at load: changing the rate at runtime affects writing immediately and reading at the next open.
+   */
+  public boolean isBloomFilterEnabled() {
+    return bloomFilterEnabled && bloomFilter != null;
+  }
+
+  /** Series a bloom filter spared this file from reading since it was loaded (#5517). */
+  public long getBloomSkippedSeries() {
+    return bloomSkippedSeries.sum();
+  }
+
+  /** Series read despite being probed: they held the key, or the filter returned a false positive. */
+  public long getBloomProbedSeries() {
+    return bloomProbedSeries.sum();
+  }
+
+  @Override
+  public Map<String, Long> getStats() {
+    final Map<String, Long> stats = super.getStats();
+    stats.put("bloomSkippedSeries", bloomSkippedSeries.sum());
+    stats.put("bloomProbedSeries", bloomProbedSeries.sum());
+    return stats;
+  }
+
+  /**
+   * Links the {@code .bfidx} component written for this file, resolved by name after the whole schema is loaded (every
+   * component is registered by then, and the pair is created together so the names cannot drift).
+   */
+  public void attachBloomFilter() {
+    if (bloomFilter != null)
+      return;
+
+    // Adopt the component whatever the configured rate is. The rate decides whether the filters are CONSULTED (see
+    // bloomFilterEnabled below), not whether this index knows about its own file: leaving it unadopted would let a
+    // later compaction - after the rate is raised at runtime - create a SECOND physical file for the same logical
+    // name, orphaning the first and making the name ambiguous at the next open.
+    final Component component = database.getSchema().getEmbedded()
+        .getFileByName(getName() + LSMTreeIndexBloomFilter.NAME_SUFFIX);
+    if (component instanceof LSMTreeIndexBloomFilter filter) {
+      filter.loadDirectory();
+      bloomFilter = filter;
+    }
+
+    // A rate of 0 means "off", and off has to mean the filters on disk are not consulted either - otherwise there is
+    // no way to answer whether a lookup result depends on them. Read once, here: this gates a per-lookup path, and a
+    // configuration lookup per lookup is exactly the kind of cost this feature exists to remove.
+    bloomFilterEnabled = database.getConfiguration().getValueAsFloat(GlobalConfiguration.INDEX_BLOOM_FILTER_RATE) > 0;
+  }
+
+  /**
+   * The filter component to publish into, adopting the one already registered for this index before creating a new
+   * file - a second file for the same logical name would orphan the first and make the name ambiguous at load.
+   */
+  LSMTreeIndexBloomFilter getOrCreateBloomFilter() throws IOException {
+    LSMTreeIndexBloomFilter filter = bloomFilter;
+    if (filter == null) {
+      attachBloomFilter();
+      filter = bloomFilter;
+    }
+    if (filter == null) {
+      filter = LSMTreeIndexBloomFilter.createOrLoad(this);
+      bloomFilter = filter;
+    }
+    return filter;
+  }
+
+  /**
+   * Whether a key can be hashed for the filters at all. A partial key is a RANGE and no hash answers for a range; a
+   * null component is not something the filters were built over. Both fall back to searching every series.
+   */
+  private boolean isBloomHashable(final Object[] convertedKeys) {
+    if (convertedKeys == null || convertedKeys.length != binaryKeyTypes.length)
+      return false;
+
+    for (final Object key : convertedKeys)
+      if (key == null)
+        return false;
+
+    return true;
+  }
+
+  @Override
+  public void drop() throws IOException {
+    final LSMTreeIndexBloomFilter filter = bloomFilter;
+    bloomFilter = null;
+    if (filter != null)
+      filter.dropQuietly();
+    super.drop();
+  }
+
+  /**
+   * Registers a series cursor over this file. The caller passes a token it keeps strongly referenced for as long as it
+   * may still read a page, and hands the returned registration back to {@link #onCursorClosed(WeakReference)}.
+   */
+  WeakReference<Object> onCursorOpened(final Object liveToken) {
+    final WeakReference<Object> registration = new WeakReference<>(liveToken);
+    activeCursors.add(registration);
+    return registration;
+  }
+
+  void onCursorClosed(final WeakReference<Object> registration) {
+    activeCursors.remove(registration);
+  }
+
+  /**
+   * Live series cursors over this file; the file cannot be physically dropped while this is > 0.
+   * <p>
+   * Named {@code count...} rather than {@code get...} because it is NOT a plain accessor (#5662): it walks the
+   * registrations and drops the ones whose cursor has been collected, the same purge-on-read a {@code WeakHashMap}
+   * does. That makes it O(live cursors) and gives it a side effect - it can emit a warning. Both are irrelevant on the
+   * one path that calls it, the retired-file drop, and neither is what a caller would expect from a getter.
+   */
+  public int countActiveCursors() {
+    purgeCollectedCursors();
+    return activeCursors.size();
+  }
+
+  /**
+   * Drops the registrations whose cursor has been collected without being closed, and says so: they are the only way
+   * an entry can be left behind, since {@link #onCursorClosed(WeakReference)} removes its own. Called from
+   * {@link #countActiveCursors()}, which the retired-file drop consults, so an abandoned cursor delays the drop until
+   * the next GC instead of forever.
+   * <p>
+   * Nothing else purges, so on a file that is never retired the cleared references sit here unreclaimed. They are
+   * empty {@link WeakReference} shells bounded by the number of cursors actually leaked over the file's lifetime -
+   * a few dozen bytes each in a case that is already a bug - and they are gone the moment a drop is attempted. Purging
+   * from {@link #onCursorOpened(Object)} instead would put that walk on the scan-open path to reclaim nothing that
+   * matters.
+   */
+  private void purgeCollectedCursors() {
+    int leaked = 0;
+    for (final Iterator<WeakReference<Object>> it = activeCursors.iterator(); it.hasNext(); ) {
+      if (it.next().get() == null) {
+        it.remove();
+        ++leaked;
+      }
+    }
+
+    if (leaked > 0)
+      LogManager.instance().log(this, Level.WARNING,
+          "Reclaimed %d cursor(s) on compacted index '%s' that were garbage collected without being closed: the file "
+              + "could not be dropped until now. Please report this, the scan that opened them is leaking.", leaked, getName());
   }
 
   /**

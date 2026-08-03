@@ -25,6 +25,7 @@ import com.arcadedb.database.Document;
 import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.Record;
 import com.arcadedb.exception.CommandExecutionException;
+import com.arcadedb.exception.CommandParameterMissingException;
 import com.arcadedb.exception.CommandParsingException;
 import com.arcadedb.exception.QueryNotIdempotentException;
 import com.arcadedb.query.OperationType;
@@ -57,9 +58,11 @@ import com.arcadedb.security.SecurityManager;
 import com.arcadedb.function.sql.DefaultSQLFunctionFactory;
 import com.arcadedb.index.Index;
 
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -148,7 +151,7 @@ public class OpenCypherQueryEngine implements QueryEngine {
     try {
       // Check for EXPLAIN or PROFILE prefix
       String actualQuery = query.trim();
-      final String upperQuery = actualQuery.toUpperCase();
+      final String upperQuery = actualQuery.toUpperCase(Locale.ROOT);
       boolean explain = false;
       boolean profile = false;
 
@@ -207,7 +210,7 @@ public class OpenCypherQueryEngine implements QueryEngine {
     try {
       // Check for EXPLAIN or PROFILE prefix
       String actualQuery = query.trim();
-      final String upperQuery = actualQuery.toUpperCase();
+      final String upperQuery = actualQuery.toUpperCase(Locale.ROOT);
       boolean explain = false;
       boolean profile = false;
 
@@ -285,23 +288,24 @@ public class OpenCypherQueryEngine implements QueryEngine {
    *
    * @param referenced the parameter names the query text mentions, collected at parse time
    *
-   * @throws CommandParsingException listing every missing name, in the order the query mentions them
+   * @throws CommandParameterMissingException listing every missing name, in the order the query mentions them
    */
   private static void checkParametersAreBound(final Set<String> referenced, final Map<String, Object> parameters) {
     if (referenced.isEmpty())
       return;
 
-    StringJoiner missing = null;
+    // The common case is that nothing is missing, so the list is allocated only once one is found.
+    List<String> missing = null;
     for (final String name : referenced) {
       if (parameters == null || !parameters.containsKey(name)) {
         if (missing == null)
-          missing = new StringJoiner(", ");
+          missing = new ArrayList<>(referenced.size());
         missing.add(name);
       }
     }
 
     if (missing != null)
-      throw new CommandParsingException("Expected parameter(s): " + missing);
+      throw new CommandParameterMissingException(missing.toArray(new String[0]));
   }
 
   /**
@@ -319,6 +323,7 @@ public class OpenCypherQueryEngine implements QueryEngine {
       final Map<String, Object> parameters, final boolean explain, final boolean profile) {
     // Try to get cached physical plan first (saves optimization time: 200-500ms)
     final CypherExecutionPlan plan;
+    final DatabaseInternal execDb = executionDatabase(statement);
 
     if (!explain && !profile) {
       // Only use plan cache for normal execution (not explain/profile)
@@ -326,10 +331,10 @@ public class OpenCypherQueryEngine implements QueryEngine {
       if (physicalPlan != null) {
         // Reuse cached physical plan (avoids expensive statistics collection and optimization)
         plan = new CypherExecutionPlan(
-            database, statement, parameters, configuration, physicalPlan, EXPRESSION_EVALUATOR);
+            execDb, statement, parameters, configuration, physicalPlan, EXPRESSION_EVALUATOR);
       } else {
         // Create new plan from scratch and cache it
-        final CypherExecutionPlanner planner = new CypherExecutionPlanner(database, statement, parameters,
+        final CypherExecutionPlanner planner = new CypherExecutionPlanner(execDb, statement, parameters,
             EXPRESSION_EVALUATOR);
         plan = planner.createExecutionPlan(configuration);
 
@@ -339,7 +344,7 @@ public class OpenCypherQueryEngine implements QueryEngine {
       }
     } else {
       // explain/profile mode: always create new plan without caching
-      final CypherExecutionPlanner planner = new CypherExecutionPlanner(database, statement, parameters,
+      final CypherExecutionPlanner planner = new CypherExecutionPlanner(execDb, statement, parameters,
           EXPRESSION_EVALUATOR);
       plan = planner.createExecutionPlan(configuration);
     }
@@ -349,6 +354,45 @@ public class OpenCypherQueryEngine implements QueryEngine {
     if (profile)
       return plan.profile();
     return plan.execute();
+  }
+
+  /**
+   * The database a Cypher plan executes against, and therefore the one {@code CommandContext.getDatabase()} returns.
+   * <p>
+   * The write steps auto-commit: {@code SetStep}, {@code DeleteStep}, {@code MergeStep}, {@code RemoveStep},
+   * {@code ForeachStep} and a writing {@code CALL} subquery each call {@code begin()}/{@code commit()} directly on
+   * {@code context.getDatabase()} when no transaction is already open. Handing them the raw instance sends those
+   * commits to {@code LocalDatabase.commit()}, which on an HA leader applies the pages locally and never proposes
+   * them to Raft: followers then trail by exactly those page versions and the next replicated entry touching one of
+   * them fails the version check (#5492, #5655). Off HA the wrapper is the instance itself, so this is a no-op there.
+   * <p>
+   * {@code CreateStep} would be safe either way - it wraps its work in {@code database.transaction(...)}, and
+   * {@code LocalDatabase.transaction()} drives {@code wrappedDatabaseInstance} internally rather than {@code this}.
+   * That is why a bare {@code CREATE} replicated correctly while an equally ordinary {@code SET} did not, and it is
+   * the kind of asymmetry that makes a smoke test look green.
+   * <p>
+   * A read-only statement keeps the raw instance. It cannot commit, so resolving the wrapper would change nothing
+   * about durability, while it would put the nested reads the steps issue on a different footing. Being precise
+   * about which ones: {@code RaftReplicatedDatabase.lookupByRID}/{@code iterateType}/{@code lookupByKey} delegate
+   * straight to the inner instance, so those are indifferent - but its {@code query(language, ...)} overloads open
+   * with {@code waitForReadConsistency()}, and {@code ExistsExpression}, {@code CountExpression} and
+   * {@code CollectExpression} all evaluate their subquery through exactly that call. Routing a read-only statement
+   * through the wrapper would therefore add a read barrier to every {@code EXISTS}/{@code COUNT}/{@code COLLECT}
+   * subquery, follower-local ones included. The switch is on {@code isReadOnly()} rather than on the entry point because
+   * {@link #query} does not imply read-only here: {@code PROFILE} bypasses the idempotency gate and executes, so a
+   * {@code PROFILE MATCH ... SET ...} reaches this method through {@code query()} and does write.
+   *
+   * One consequence worth knowing before you touch this: inside an explicit transaction the two instances are
+   * deliberately mixed. {@code START TRANSACTION} opens on the wrapper, a read-only {@code MATCH} then runs against
+   * the raw instance and a write in the same transaction against the wrapper. That is safe because the transaction
+   * lives in the thread-local {@link DatabaseContext} keyed by database path, which both handles share, and because
+   * a read never commits - so both see one transaction and only one of them can end it.
+   *
+   * @param statement the statement about to be planned, whose {@code isReadOnly()} already accounts for writes
+   *                  nested in a {@code CALL} subquery
+   */
+  private DatabaseInternal executionDatabase(final CypherStatement statement) {
+    return statement.isReadOnly() ? database : database.getWrappedDatabaseInstance();
   }
 
   /**
@@ -462,6 +506,10 @@ public class OpenCypherQueryEngine implements QueryEngine {
       b.withType(Schema.INDEX_TYPE.LSM_TREE);
       b.withUnique(true);
       b.withIgnoreIfExists(ddl.isIfNotExists());
+      // A constraint says what the data must satisfy, so a plain index already on the property is upgraded rather than
+      // reported as being in the way. Neo4j keeps the range index and the constraint as two objects; ArcadeDB has one
+      // index per property set, and a unique one indexes the same keys, so this is the equivalent end state (#5675).
+      b.withReplaceIfIncompatible(true);
       if (anyUndeclared)
         b.withDefaultKeyTypesForUndeclaredProperties(defaultKeyTypes);
       b.create();
@@ -497,6 +545,9 @@ public class OpenCypherQueryEngine implements QueryEngine {
       b.withType(Schema.INDEX_TYPE.LSM_TREE);
       b.withUnique(true);
       b.withIgnoreIfExists(ddl.isIfNotExists());
+      // Same reasoning as the UNIQUE arm above: NODE KEY is a constraint, so it upgrades a plain index on the same
+      // properties instead of colliding with it.
+      b.withReplaceIfIncompatible(true);
       if (anyUndeclared)
         b.withDefaultKeyTypesForUndeclaredProperties(defaultKeyTypes);
       b.create();
@@ -661,8 +712,13 @@ public class OpenCypherQueryEngine implements QueryEngine {
    * balance each START TRANSACTION with its own COMMIT/ROLLBACK.
    */
   private ResultSet executeTransaction(final CypherTransactionStatement txn) {
+    // The transaction this statement drives has to be the replicated one - see executionDatabase(). COMMIT is the
+    // only kind where the two instances differ (begin/rollback delegate to the inner database on the Raft wrapper
+    // too), but all three resolve it so the statement never straddles both.
+    final DatabaseInternal txDatabase = database.getWrappedDatabaseInstance();
+
     final InternalResultSet resultSet = new InternalResultSet();
-    final ResultInternal result = new ResultInternal(database);
+    final ResultInternal result = new ResultInternal(txDatabase);
 
     switch (txn.getKind()) {
     case BEGIN:
@@ -678,20 +734,20 @@ public class OpenCypherQueryEngine implements QueryEngine {
           throw new CommandParsingException(
               "Invalid transaction isolation level '" + isolationLevel + "'. Valid values: " + validLevels);
         }
-        database.begin(level);
+        txDatabase.begin(level);
       } else
-        database.begin();
+        txDatabase.begin();
       result.setProperty("operation", "begin");
       break;
     case COMMIT:
-      if (!database.isTransactionActive())
+      if (!txDatabase.isTransactionActive())
         throw new CommandExecutionException("No active transaction to COMMIT (issue a START TRANSACTION first)");
-      database.commit();
+      txDatabase.commit();
       result.setProperty("operation", "commit");
       break;
     case ROLLBACK:
-      // database.rollback() is idempotent: with no active transaction it is a no-op, so ROLLBACK is lenient.
-      database.rollback();
+      // rollback() is idempotent: with no active transaction it is a no-op, so ROLLBACK is lenient.
+      txDatabase.rollback();
       result.setProperty("operation", "rollback");
       break;
     default:

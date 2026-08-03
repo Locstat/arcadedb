@@ -319,6 +319,14 @@ public class DatabaseAsyncExecutorImpl implements DatabaseAsyncExecutor {
     createThreads(database.getConfiguration().getValueAsInteger(GlobalConfiguration.ASYNC_WORKER_THREADS));
   }
 
+  /**
+   * <b>Must stay lock-free, and must stay callable on a shut-down executor (#5636.)</b> {@code Profiler.toJSON()}
+   * reads this while holding its own monitor, which a closing database can be waiting on, so a lock taken here would
+   * sit on the other side of that wait. The volatile read of {@code executorThreads} plus the queue sizes below is
+   * deliberately all it does - and the null check on that read is what keeps it answering during the window between
+   * a database being torn down and it reaching {@code Profiler.unregisterDatabase}, where a scrape still sees it
+   * registered. Zeros are the right answer there; throwing would take the whole snapshot down.
+   */
   public DBAsyncStats getStats() {
     final DBAsyncStats stats = new DBAsyncStats();
 
@@ -383,8 +391,27 @@ public class DatabaseAsyncExecutorImpl implements DatabaseAsyncExecutor {
   }
 
   public void compact(final IndexInternal index) {
-    if (index.scheduleCompaction())
-      scheduleTask(getBestSlot(), new DatabaseAsyncIndexCompaction(index), false, backPressurePercentage);
+    if (!index.scheduleCompaction())
+      return;
+
+    // scheduleCompaction() has reserved the index (AVAILABLE -> COMPACTION_SCHEDULED) and only the compaction
+    // itself gives that back. So when nothing is going to run it, hand it back here: a full worker queue answers
+    // false without throwing, and a shut-down executor throws out of getBestSlot()/scheduleTask. Leaving it
+    // reserved would be permanent - every later attempt, an explicit COMPACT INDEX included, needs the same
+    // AVAILABLE -> SCHEDULED move - so the index would silently stop compacting until the database is reopened.
+    boolean scheduled = false;
+    try {
+      // No back-pressure (0) on purpose, unlike the user-facing async entry points. Both callers of this method are
+      // index onAfterCommit hooks, so the thread that would be slowed down is a committer whose work is already
+      // durable: sleeping it throttles nothing that is filling the queue, it only adds latency to a commit that is
+      // finished. A full queue instead makes the offer below give up, the finally hands the slot back, and the next
+      // commit past the threshold schedules again - both gates are level-triggered, so no compaction is lost.
+      scheduled = scheduleTask(getBestSlot(), new DatabaseAsyncIndexCompaction(index), false, 0);
+    } finally {
+      if (!scheduled)
+        index.setStatus(new IndexInternal.INDEX_STATUS[] { IndexInternal.INDEX_STATUS.COMPACTION_SCHEDULED },
+            IndexInternal.INDEX_STATUS.AVAILABLE);
+    }
   }
 
   /**

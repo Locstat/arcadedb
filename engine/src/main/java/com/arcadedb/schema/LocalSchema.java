@@ -37,6 +37,7 @@ import com.arcadedb.engine.Dictionary;
 import com.arcadedb.engine.LocalBucket;
 import com.arcadedb.engine.timeseries.TimeSeriesBucket;
 import com.arcadedb.engine.timeseries.TimeSeriesMaintenanceScheduler;
+import com.arcadedb.engine.timeseries.TimeSeriesTagDictionary;
 import com.arcadedb.event.*;
 import com.arcadedb.exception.ConfigurationException;
 import com.arcadedb.exception.DatabaseMetadataException;
@@ -59,6 +60,7 @@ import com.arcadedb.index.lsm.LSMTreeIndex;
 import com.arcadedb.index.sparsevector.LSMSparseVectorIndex;
 import com.arcadedb.index.sparsevector.SparseSegmentComponent;
 import com.arcadedb.index.lsm.LSMTreeIndexAbstract.NULL_STRATEGY;
+import com.arcadedb.index.lsm.LSMTreeIndexBloomFilter;
 import com.arcadedb.index.lsm.LSMTreeIndexCompacted;
 import com.arcadedb.index.lsm.LSMTreeIndexMutable;
 import com.arcadedb.index.vector.LSMVectorIndex;
@@ -124,6 +126,12 @@ public class LocalSchema implements Schema {
   private final       AtomicLong                             versionSerial                 = new AtomicLong();
   private final       Map<String, FunctionLibraryDefinition> functionLibraries             = new ConcurrentHashMap<>();
   private final       Map<Integer, Integer>                  migratedFileIds               = new ConcurrentHashMap<>();
+  /**
+   * Logical index names whose {@link IndexInternal#getUpgradeWarning()} has already been logged. The schema is
+   * re-read on every DDL and on every HA SCHEMA_ENTRY apply, and one logical index is N bucket sub-indexes, so
+   * without this the advice would be repeated N times per reload forever.
+   */
+  private final       Set<String>                            reportedUpgradeWarnings       = ConcurrentHashMap.newKeySet();
   private              MaterializedViewScheduler              materializedViewScheduler;
   private              TimeSeriesMaintenanceScheduler         timeSeriesMaintenanceScheduler;
 
@@ -143,10 +151,14 @@ public class LocalSchema implements Schema {
         new LSMTreeIndex.PaginatedComponentFactoryHandlerUnique());
     componentFactory.registerComponent(LSMTreeIndexCompacted.NOTUNIQUE_INDEX_EXT,
         new LSMTreeIndex.PaginatedComponentFactoryHandlerNotUnique());
+    componentFactory.registerComponent(LSMTreeIndexBloomFilter.FILE_EXT,
+        new LSMTreeIndexBloomFilter.PaginatedComponentFactoryHandler());
     componentFactory.registerComponent(LSMVectorIndex.FILE_EXT, new LSMVectorIndex.PaginatedComponentFactoryHandlerUnique());
     componentFactory.registerComponent(SparseSegmentComponent.FILE_EXT,
         new SparseSegmentComponent.PaginatedComponentFactoryHandler());
     componentFactory.registerComponent(TimeSeriesBucket.BUCKET_EXT, new TimeSeriesBucket.PaginatedComponentFactoryHandler());
+    componentFactory.registerComponent(TimeSeriesTagDictionary.DICT_EXT,
+        new TimeSeriesTagDictionary.PaginatedComponentFactoryHandler());
     componentFactory.registerComponent(HashIndexBucket.UNIQUE_INDEX_EXT,
         new HashIndex.PaginatedComponentFactoryHandlerUnique());
     componentFactory.registerComponent(HashIndexBucket.NOTUNIQUE_INDEX_EXT,
@@ -242,6 +254,9 @@ public class LocalSchema implements Schema {
       if (f != null)
         f.onAfterSchemaLoad();
 
+    // Every component is registered by now, which is what resolving a filter to its compacted index by name needs.
+    attachBloomFilters(snapshot);
+
     if (mode == ComponentFile.MODE.READ_WRITE)
       sweepOrphanCompactedIndexFiles(snapshot);
 
@@ -249,7 +264,19 @@ public class LocalSchema implements Schema {
   }
 
   /**
-   * Drops compacted index files that no mutable index claimed during the load. A crash between a
+   * Links every {@code .bfidx} bloom filter component (#5517) to the compacted index it was written for, matching it
+   * by name. Only a compacted index the load claimed gets one: an orphan is about to be dropped anyway, and an
+   * unattached filter is inert, since nothing but its compacted index ever probes it.
+   */
+  private void attachBloomFilters(final List<Component> snapshot) {
+    for (final Component component : snapshot)
+      if (component instanceof LSMTreeIndexCompacted compacted && compacted.getMainIndex() != null)
+        compacted.attachBloomFilter();
+  }
+
+  /**
+   * Drops compacted index files that no mutable index claimed during the load, together with the bloom filter files
+   * that describe them. A crash between a
    * compaction's publication (schema saved, the mutable header already pointing at its CURRENT compacted
    * file) and the physical drop of a replaced or aborted compacted file leaves the stale file on disk; the
    * directory scan re-registers it at the next open, but nothing references it anymore, leaking its space
@@ -259,6 +286,17 @@ public class LocalSchema implements Schema {
    */
   private void sweepOrphanCompactedIndexFiles(final List<Component> snapshot) {
     for (final Component component : snapshot) {
+      if (component instanceof LSMTreeIndexBloomFilter filter) {
+        // A filter is owned by exactly one compacted index; without it nothing can ever read the file again.
+        final Component owner = filter.getOwnerName() != null ? getFileByName(filter.getOwnerName()) : null;
+        if (!(owner instanceof LSMTreeIndexCompacted compactedOwner) || compactedOwner.getMainIndex() == null) {
+          LogManager.instance().log(this, Level.INFO,
+              "Dropping orphan index bloom filter file '%s' (fileId=%d)", null, filter.getName(), filter.getFileId());
+          filter.dropQuietly();
+        }
+        continue;
+      }
+
       if (!(component instanceof LSMTreeIndexCompacted compacted) || compacted.getMainIndex() != null)
         continue;
 
@@ -394,6 +432,13 @@ public class LocalSchema implements Schema {
     return bucketMap.containsKey(bucketName);
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @throws SchemaException if no bucket is registered under that name. Callers that want to handle the missing case
+   *                         must use {@link #getBucketByNameIfExists(String)}; a {@code null} check after this call is
+   *                         unreachable.
+   */
   @Override
   public Bucket getBucketByName(final String name) {
     final Bucket p = bucketMap.get(name);
@@ -403,8 +448,25 @@ public class LocalSchema implements Schema {
   }
 
   @Override
+  public Bucket getBucketByNameIfExists(final String name) {
+    return bucketMap.get(name);
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @throws SchemaException if the id is out of range or the component it maps to is not a bucket. Callers that want to
+   *                         handle the missing case must use {@link #getBucketByIdIfExists(int)}; a {@code null} check
+   *                         after this call is unreachable.
+   */
+  @Override
   public LocalBucket getBucketById(final int id) {
     return getBucketById(id, true);
+  }
+
+  @Override
+  public LocalBucket getBucketByIdIfExists(final int id) {
+    return getBucketById(id, false);
   }
 
   public LocalBucket getBucketById(final int id, final boolean throwExceptionIfNotFound) {
@@ -495,6 +557,26 @@ public class LocalSchema implements Schema {
     this.encoding = encoding;
   }
 
+  /**
+   * Creates {@code newTypeName} as a copy of {@code typeName}: its properties, its records, and the definitions of the
+   * indexes it declares itself.
+   * <p>
+   * <b>Not atomic, by construction.</b> The records commit first - in batches of {@code transactionBatchSize}, so a
+   * large type does not hold one transaction open - and only then are the indexes built, each in its own transaction.
+   * The index build has to run outside the record-copy transaction to see the records at all (see the comment at that
+   * call site), which is what puts a commit boundary in the middle of the operation. The safety net for a failure on
+   * either side of it is the {@code catch} below: it drops {@code newTypeName}, and with it the buckets and records
+   * already committed, so a failed copy leaves the schema as it found it rather than a half-built type. The SOURCE type
+   * is only ever read, so it is unaffected either way.
+   *
+   * @param typeName             type to copy from, left untouched
+   * @param newTypeName          type to create, which must not exist yet
+   * @param newTypeClass         {@link LocalDocumentType} or {@link LocalVertexType}; edge types are not supported
+   * @param buckets              number of buckets of the new type
+   * @param pageSize             page size of the new type's buckets, not of its indexes - those keep the page size of
+   *                             the index they are copied from
+   * @param transactionBatchSize records to copy per transaction, or 0 to copy them all in one
+   */
   @Override
   public DocumentType copyType(final String typeName, final String newTypeName, final Class<? extends DocumentType> newTypeClass,
       final int buckets, final int pageSize, final int transactionBatchSize) {
@@ -548,11 +630,6 @@ public class LocalSchema implements Schema {
           }
         }
 
-        // COPY INDEXES
-        for (final Index index : oldType.getAllIndexes(false))
-          newType.createTypeIndex(index.getType(), index.isUnique(),
-              index.getPropertyNames().toArray(new String[index.getPropertyNames().size()]));
-
         database.commit();
 
       } finally {
@@ -560,8 +637,18 @@ public class LocalSchema implements Schema {
           database.rollback();
       }
 
+      // COPY INDEXES. Deliberately outside the record-copy transaction: each index build opens its own transaction
+      // (TypeIndexBuilder.create wraps every bucket's build in a database.transaction(..., joinCurrent=false, ...)) and
+      // has to both see the copied records and commit its own entries. Run from inside an enclosing transaction it did
+      // neither, so every index on the copy came out EMPTY - a copy whose indexed queries silently answer nothing.
+      for (final Index index : oldType.getAllIndexes(false))
+        copyIndexDefinition((IndexInternal) index, newTypeName);
+
     } catch (final Exception e) {
-      LogManager.instance().log(this, Level.SEVERE, "Error on renaming type '%s' into '%s'", e, typeName, newTypeName);
+      // "copying", not "renaming": nothing here renames anything, and the source type is still there afterwards. The
+      // old wording is why issue #5723 was filed against a renameType() that does not exist - a rename goes through
+      // LocalDocumentType.rename(), which renames buckets in place and never recreates an index.
+      LogManager.instance().log(this, Level.SEVERE, "Error on copying type '%s' into '%s'", e, typeName, newTypeName);
 
       if (newType != null)
         try {
@@ -576,6 +663,43 @@ public class LocalSchema implements Schema {
     }
 
     return newType;
+  }
+
+  /**
+   * Recreates one index of the source type on the copy, carrying the WHOLE definition over rather than only the index
+   * type, the uniqueness flag and the property list.
+   * <p>
+   * Everything else used to be silently replaced by a default (issue #5723): the page size deliberately tuned at
+   * creation, the null strategy, the collations that make an index case-insensitive, and the type-specific
+   * configuration - a full-text index's analyzers and BM25 parameters, a geospatial index's resolution, a vector
+   * index's dimensions and similarity, without which the copy is not merely differently tuned but unusable.
+   * <p>
+   * The one attribute deliberately NOT carried over is a user-supplied index name: it is unique across the schema, so
+   * reusing it would collide with the index still held by the source type. The copy takes the auto-derived
+   * {@code newTypeName[properties]} form instead.
+   */
+  private void copyIndexDefinition(final IndexInternal index, final String newTypeName) {
+    final List<String> propertyNames = index.getPropertyNames();
+    final String[] properties = propertyNames.toArray(new String[propertyNames.size()]);
+
+    // withType() may swap the builder for a type-specific subclass (TypeFullTextIndexBuilder, TypeLSMVectorIndexBuilder,
+    // ...), so call it first and keep the returned reference instead of chaining off the original.
+    final TypeIndexBuilder builder = buildTypeIndex(newTypeName, properties).withType(index.getType());
+    builder.withUnique(index.isUnique());
+    // getPageSizeForNewFile(), not getPageSize(): the definition goes back through the validating creation path, and a
+    // HASH index predating #5713 can hold a page size that path refuses - which must not make copyType() fail.
+    builder.withPageSize(index.getPageSizeForNewFile());
+    builder.withNullStrategy(index.getNullStrategy());
+
+    final IndexMetadata sourceMetadata = index.getMetadataForNewFile();
+    if (sourceMetadata != null) {
+      // bucketId -1: the per-bucket builder binds each sub-index during create().
+      final IndexMetadata metadata = sourceMetadata.copy(newTypeName, properties, -1);
+      metadata.typeIndexName = null;
+      builder.withMetadata(metadata);
+    }
+
+    builder.create();
   }
 
   @Override
@@ -596,6 +720,31 @@ public class LocalSchema implements Schema {
   public void dropIndex(final String indexName) {
     database.checkPermissionsOnDatabase(SecurityDatabaseUser.DATABASE_ACCESS.UPDATE_SCHEMA);
 
+    checkIndexIsNotBackingAConstraint(indexName);
+
+    dropIndexInternal(indexName);
+  }
+
+  /**
+   * Refuses to drop the index that materialises an edge type's {@code UNIQUE} declaration.
+   * <p>
+   * The type flag is the source of truth for the constraint, so dropping its index directly would leave the schema
+   * advertising a guarantee that nothing enforces. Withdraw the declaration instead - {@code ALTER TYPE <name> WITH
+   * unique = false} - which drops the flag and this index together.
+   */
+  private void checkIndexIsNotBackingAConstraint(final String indexName) {
+    final IndexInternal index = indexMap.get(indexName);
+    if (index == null || index.getTypeName() == null || !existsType(index.getTypeName()))
+      return;
+
+    if (getType(index.getTypeName()) instanceof LocalEdgeType edgeType && edgeType.isUnique()
+        && indexName.equals(LocalEdgeType.uniqueIndexName(edgeType.getName())))
+      throw new SchemaException("Cannot drop index '" + indexName + "' because it enforces the UNIQUE declaration of "
+          + "edge type '" + edgeType.getName() + "'. Use ALTER TYPE " + edgeType.getName()
+          + " WITH unique = false to withdraw the constraint and drop this index");
+  }
+
+  private void dropIndexInternal(final String indexName) {
     recordFileChanges(() -> {
       boolean setMultipleUpdate = !multipleUpdate;
       if (!multipleUpdate)
@@ -1058,7 +1207,10 @@ public class LocalSchema implements Schema {
   @Deprecated
   public Index createManualIndex(final INDEX_TYPE indexType, final boolean unique, final String indexName, final Type[] keyTypes,
       final int pageSize, final NULL_STRATEGY nullStrategy) {
-    return buildManualIndex(indexName, keyTypes).withUnique(unique).withPageSize(pageSize).withNullStrategy(nullStrategy).create();
+    // withType is NOT optional here: the index factory resolves the handler by index type, so dropping the argument
+    // this overload takes made every call through it fail with a NullPointerException (issue #5765).
+    return buildManualIndex(indexName, keyTypes).withType(indexType).withUnique(unique).withPageSize(pageSize)
+        .withNullStrategy(nullStrategy).create();
   }
 
   public void close() {
@@ -1267,7 +1419,7 @@ public class LocalSchema implements Schema {
 
         // DELETE ALL ASSOCIATED INDEXES
         for (final Index m : new ArrayList<>(type.getAllIndexes(true)))
-          dropIndex(m.getName());
+          dropIndexInternal(m.getName());
 
         if (type instanceof LocalVertexType vertexType)
           // DELETE IN/OUT EDGE FILES
@@ -1323,7 +1475,7 @@ public class LocalSchema implements Schema {
         // plain REBUILD/CREATE INDEX. Both directions still need schema.json saved (finally) to be complete.
         for (final Index idx : new ArrayList<>(indexMap.values())) {
           if (idx.getAssociatedBucketId() == bucket.getFileId())
-            dropIndex(idx.getName());
+            dropIndexInternal(idx.getName());
         }
 
         database.getPageManager().deleteFile(database, bucket.getFileId());
@@ -1568,7 +1720,9 @@ public class LocalSchema implements Schema {
         final String kind = (String) schemaType.get("type");
         type = switch (kind) {
           case "v" -> new LocalVertexType(this, typeName);
-          case "e" -> new LocalEdgeType(this, typeName, !schemaType.has("bidirectional") || schemaType.getBoolean("bidirectional"));
+          case "e" -> new LocalEdgeType(this, typeName,
+              !schemaType.has("bidirectional") || schemaType.getBoolean("bidirectional"),
+              schemaType.getBoolean("lightweight", false), schemaType.getBoolean("unique", false));
           case "d" -> new LocalDocumentType(this, typeName);
           case "t" -> {
             final LocalTimeSeriesType tsType = new LocalTimeSeriesType(this, typeName);
@@ -1710,7 +1864,9 @@ public class LocalSchema implements Schema {
                     indexMap.put(indexName, index);
                   } else if (configuredIndexType.equalsIgnoreCase(Schema.INDEX_TYPE.GEOSPATIAL.toString())) {
                     final int precision = indexJSON.getInt("precision", GeoIndexMetadata.DEFAULT_PRECISION);
-                    index = new LSMTreeGeoIndex((LSMTreeIndex) index, precision);
+                    // A definition with no tokenization field predates the FRONTIER layout (#5478), so its entries are
+                    // the full ancestor chain: reading it as anything else would make put/remove miss them.
+                    index = new LSMTreeGeoIndex((LSMTreeIndex) index, precision, GeoIndexMetadata.readTokenization(indexJSON));
                     indexMap.put(indexName, index);
                   } else if (configuredIndexType.equalsIgnoreCase(Schema.INDEX_TYPE.LSM_SPARSE_VECTOR.toString())) {
                     final LSMSparseVectorIndexMetadata sparseMeta = new LSMSparseVectorIndexMetadata(typeName, properties, -1);
@@ -1736,8 +1892,10 @@ public class LocalSchema implements Schema {
                 LogManager.instance()
                     .log(this, Level.WARNING, "Cannot find bucket '%s' defined in index '%s'. Ignoring it", null, bucketName,
                         index.getName());
-              } else
+              } else {
                 type.addIndexInternal(index, bucket.getFileId(), properties, null);
+                reportUpgradeWarning(index, typeName, properties);
+              }
 
             } else {
               orphanIndexes.put(indexName, indexJSON);
@@ -1782,6 +1940,12 @@ public class LocalSchema implements Schema {
                         NULL_STRATEGY.ERROR;
 
                     index.setNullStrategy(nullStrategy);
+                    // Apply the persisted definition, exactly as the by-name path above does. An LSM-tree index
+                    // carries its key types in its own file header and survives without this, but an index whose
+                    // whole definition lives in schema.json - a vector index with its dimensions, similarity and
+                    // quantization - comes up empty when its file is relinked under a new name after a compaction:
+                    // with dimensions still 0 the component skips loading its vectors at the end of this load.
+                    index.setMetadata(entry.getValue());
                     // Carry the manual TypeIndex name (issue #4139) onto the metadata for the
                     // orphan-relinking path too. addIndexInternal reads this when minting the
                     // TypeIndex; without this hop, an index file renamed by compaction loses its
@@ -1838,7 +2002,36 @@ public class LocalSchema implements Schema {
               new Object[0];
 
           final DocumentType type = getType(typeName);
-          type.setBucketSelectionStrategy(bucketSelectionStrategy.getString("name"), properties);
+          try {
+            type.setBucketSelectionStrategy(bucketSelectionStrategy.getString("name"), properties);
+          } catch (final Exception e) {
+            // One type's strategy must not take the rest of the load down with it (issue #5637). This block sits
+            // near the end of readConfiguration, so an exception escaping here aborts every remaining type's
+            // strategy AND everything the loader has not reached yet - triggers, function libraries, extensions,
+            // and the compaction file-migration map WAL recovery redirects through - while the outer catch reports
+            // the whole schema as "reset". The type stays on its default round-robin strategy, which loses the
+            // partition pruning but leaves a database that opens and says why.
+            //
+            // The catch has to be broad to give that guarantee, so the LEVEL carries what the type cannot: a
+            // SchemaException or IllegalArgumentException is the strategy declining to be restored - an
+            // unresolvable implementation class, a configuration the suitability check refuses - which is a
+            // property of this database and worth a WARNING. Anything else reaching here is a fault in the bind
+            // path itself, and would otherwise be indistinguishable from an expected refusal in the log of a
+            // database that opens successfully.
+            // IllegalArgumentException is listed alongside SchemaException for the strategies this engine does not
+            // ship: a custom BucketSelectionStrategy named by class in schema.json runs its own setType() here, and
+            // rejecting the type it is handed is what that exception is for. The engine's own strategies no longer
+            // raise it from the bind path - that is the change this issue made - so on a stock database only the
+            // SchemaException arm fires.
+            final boolean expected = e instanceof SchemaException || e instanceof IllegalArgumentException;
+            LogManager.instance().log(this, expected ? Level.WARNING : Level.SEVERE,
+                "Cannot restore the '%s' bucket selection strategy on type '%s': %s. The type falls back to `%s`",
+                // Falling back to toString() because the failures this catch is broad enough to reach include the
+                // ones that carry no message - an NPE most of all - and "...: null" names neither what went wrong
+                // nor where, on the one line an operator is likely to read.
+                e, bucketSelectionStrategy.getString("name"), typeName,
+                e.getMessage() != null ? e.getMessage() : e.toString(), RoundRobinBucketSelectionStrategy.NAME);
+          }
         }
         // Restore the persisted needsRepartition flag AFTER the strategy is set. We always force
         // the flag to the persisted value (true OR false), because {@link
@@ -2331,10 +2524,10 @@ public class LocalSchema implements Schema {
       return index;
 
     } catch (final NeedRetryException e) {
-      dropIndex(indexName);
+      dropIndexInternal(indexName);
       throw e;
     } catch (final Exception e) {
-      dropIndex(indexName);
+      dropIndexInternal(indexName);
       throw new IndexException("Error on creating index '" + indexName + "'", e);
     }
   }
@@ -2356,6 +2549,36 @@ public class LocalSchema implements Schema {
   protected void updateSecurity() {
     if (security != null)
       security.updateSchema(database);
+  }
+
+  /**
+   * Logs, once per opened database and per LOGICAL index, the reason an index should be rebuilt. An index whose
+   * on-disk layout predates a change the engine cannot apply in place keeps working exactly as it did, so this is
+   * advice and never an error; it is the only moment an operator would otherwise have no way of learning that a
+   * `REBUILD INDEX` is worth running. The same text reaches Studio through {@code schema:indexes}.
+   *
+   * @see IndexInternal#getUpgradeWarning()
+   */
+  private void reportUpgradeWarning(final IndexInternal index, final String typeName, final String[] properties) {
+    final String warning;
+    try {
+      warning = index.getUpgradeWarning();
+    } catch (final Exception e) {
+      // Never let advisory reporting break a schema load
+      return;
+    }
+    if (warning == null)
+      return;
+
+    // Report the LOGICAL index once, not each of its bucket sub-indexes: the name below is the one REBUILD INDEX takes.
+    final TypeIndex typeIndex = index.getTypeIndex();
+    final String logicalName = typeIndex != null ? typeIndex.getName() : typeName + Arrays.toString(properties);
+    if (!reportedUpgradeWarnings.add(logicalName))
+      return;
+
+    LogManager.instance().log(this, Level.WARNING,
+        "Index '%s' of database '%s' should be rebuilt: %s. Run: REBUILD INDEX `%s`", null, logicalName,
+        database.getName(), warning, logicalName);
   }
 
   /**

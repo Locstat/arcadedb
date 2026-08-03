@@ -2,12 +2,18 @@
 
 Guidance for working under `engine/`. This file records things the code does not tell you, or actively misleads you about. It is not a tour of the module - use `Glob` and the package names for that.
 
-## Concurrency: the conflict unit is the PAGE, not the record
+## Concurrency: the conflict unit is the PAGE, and two commit-time merges take it back to the record
 
-`PageManager.checkPageVersion()` compares the transaction's page version against `getMostRecentVersionOfPage()`. Any other committed transaction that touched that page raises `ConcurrentModificationException`, **whether or not the records overlap**. Two consequences that surprise people:
+`PageManager.checkPageVersion()` compares the transaction's page version against `getMostRecentVersionOfPage()`. Any other committed transaction that touched that page raises `ConcurrentModificationException`, **whether or not the records overlap** - `LocalBucket.findAvailableSpace` deliberately packs unrelated records into the same page, and `EdgeLinkedList.add` makes two edges into one supernode touch the same chunk even though appends commute.
 
-- **Concurrent inserts false-conflict.** `LocalBucket.findAvailableSpace` deliberately packs new records into an existing free page, filling the lowest page ID first. N threads inserting at once pick the same page, all bump its version, and only one commit survives. The records were destined for different slots and never really conflicted.
-- **Supernode edge appends genuinely conflict.** `EdgeLinkedList.add` modifies the last segment chunk in place plus the vertex record. Two edges into the same supernode touch the same pages even though appends are logically commutative. Adding buckets cannot help: one vertex is one set of pages.
+Two mechanisms undo that false verdict at commit time, both leader/embedded-only and both running while the file's commit lock is held (see `TransactionContext.commit1stPhase`):
+
+- **`GRAPH_EDGE_APPEND_MERGE`** replays this transaction's in-chunk edge appends on the newer committed edge-list page.
+- **`TX_PAGE_SLOT_MERGE`** (#5381, #5279, #5569) replays this transaction's per-slot record writes on the newer committed bucket page: inserts into free slots, updates that stayed **inside** the page - an overwrite of the same size or smaller, or a growth the page could host by shifting the records that follow (`LocalBucket.growRecordInPage`, shared with the replay so both grow a record identically) - and the delete of a plain in-place record (`rebaseRecordDeleteOnPage`), which only zeroes its own slot-table entry. `LocalBucket` also reserves the insert slot per in-flight transaction, so concurrent inserts into one page get different slots (hence different RIDs) instead of all being handed the same one.
+
+What still raises a `ConcurrentModificationException`: two transactions writing the **same** record (by design - the byte-for-byte pre-image check catches it and the application must reload), a placeholder or multi-page record, a record that had to spill out of its page, and any page its owner poisoned with one of those.
+
+The delete is tracked with a `null` final image in `TransactionContext.SlotRebaseBuffer.finalBody`, which is why `deleteRecordInternal` decides where to poison only **after** reading the record's marker: every non-plain shape (placeholder pointer or content, chunk chain, corrupted slot, and the error fallback) poisons its own page. A slot the transaction both inserted and deleted is skipped at replay - it never existed on the committed page, so checking for a pre-image would invent a conflict.
 
 `ConcurrentModificationException extends NeedRetryException`, so retry is the designed response. **Retry safety is asymmetric:** on retry an INSERT gets a fresh slot and RID from `findAvailableSpace`, so nothing is overwritten and retrying is safe. For UPDATE, blind retry can overwrite a concurrent write - re-read first.
 
@@ -45,9 +51,11 @@ This matters as soon as any index has been compacted: an LSM index with a compac
 
 To disable auto-compaction reliably mid-test: set the config, `database.async().waitCompletion()`, then force `scheduleCompaction()` + `compact()` on each LSM index (this creates a fresh mutable that reads the new value), then `waitCompletion()` again.
 
-## `countEntries()` is not O(1) on vector indexes
+## `countEntries()` is O(1) only on `HASH`
 
-On a dense `LSM_VECTOR`, `countEntries()` streams the entire location map filtering deleted entries, and on the bounded backend does so while holding the `locations` monitor, so concurrent callers serialize. On a sparse `LSM_SPARSE_VECTOR` it returns **postings**, not records: a 2-record fixture with 2 dimensions each reports 4. `TypeIndex.countEntries()` sums over buckets and inherits whichever applies.
+On an LSM index it is a full ascending cursor walk. It counts LIVE entries - the value that survives a `next()`, not the call - so tombstones are excluded whether or not a compaction has purged them (#5601). Getting that wrong is easy in this codebase: `LSMTreeIndexCursor.hasNext()` is optimistic, so `next()` answers `null` at the tail of a scan whose remaining keys are all dead, and any `while (hasNext()) { next(); ++n; }` over-counts.
+
+On a dense `LSM_VECTOR`, `countEntries()` streams the entire location map filtering deleted entries, lock-free over a `ConcurrentHashMap` - the bounded backend that made concurrent callers serialize on the `locations` monitor was removed with the eviction it existed for (#5559), so the count is now unconditionally the live-vector count. On a sparse `LSM_SPARSE_VECTOR` it returns **postings**, not records: a 2-record fixture with 2 dimensions each reports 4. A full-text index counts one entry per analyzed token and a geospatial one per covering cell. `TypeIndex.countEntries()` sums over buckets and inherits whichever applies.
 
 Never call it on a query path. If you need an "is there more?" signal, derive it from the result window or the candidate budget you already have.
 

@@ -44,7 +44,10 @@ public class FileManager {
   // FileManager is unchanged since their last observation - they cache the value here, compare on
   // entry, and only re-walk when it has advanced.
   private final        AtomicLong                                modificationCount = new AtomicLong();
-  private              List<FileChange>                          recordedChanges   = null;
+  // Volatile because startRecordingChanges()/stopRecordingChanges() are the handshake HA uses to decide
+  // whether a schema change still needs replicating; a stale read there loses the change silently (#5728).
+  private volatile     List<FileChange>                          recordedChanges   = null;
+  private volatile     Thread                                    recordingThread   = null;
   private final static PaginatedComponentFile                    RESERVED_SLOT     = new PaginatedComponentFile();
 
   public static class FileChange {
@@ -141,28 +144,48 @@ public class FileManager {
 
   /**
    * Start recording changes in file system. Changes can be returned (before the end of the lock in database) with {@link #getRecordedChanges()}.
+   * <p>
+   * There is a single session per database and it is not re-entrant, so the check and the claim must be
+   * atomic: two callers both told they started would each install their own list, and the loser's recorded
+   * file creations would never be shipped to the followers (#5728).
    *
    * @return true if the recorded started and false if it was already started.
    */
-  public boolean startRecordingChanges() {
+  public synchronized boolean startRecordingChanges() {
     if (recordedChanges != null) {
-      LogManager.instance().log(this, Level.FINE,
-          "startRecordingChanges denied: a session is already active with %d entries",
-          null, recordedChanges.size());
+      // Level-guarded because a contended HA caller polls this method until the session frees up.
+      if (Logger.getLogger(getClass().getName()).isLoggable(Level.FINE))
+        LogManager.instance().log(this, Level.FINE,
+            "startRecordingChanges denied: a session is already active with %d entries",
+            null, recordedChanges.size());
       return false;
     }
 
     recordedChanges = new ArrayList<>();
+    recordingThread = Thread.currentThread();
     LogManager.instance().log(this, Level.FINE,
         "startRecordingChanges: new session begun on thread '%s'", null, Thread.currentThread().getName());
     return true;
+  }
+
+  /**
+   * Tells apart the two reasons {@link #startRecordingChanges()} can refuse. A caller nested inside its own
+   * session may proceed, because the frame that opened the session still owns the recorded changes and will
+   * act on them; a caller facing a session opened by a different thread has no such guarantee and must wait
+   * for its own. Conflating the two let an HA leader apply a schema change locally and replicate nothing
+   * (#5728).
+   *
+   * @return true when the active session was opened by the calling thread
+   */
+  public synchronized boolean isRecordingChangesOnCurrentThread() {
+    return recordedChanges != null && recordingThread == Thread.currentThread();
   }
 
   public List<FileChange> getRecordedChanges() {
     return recordedChanges;
   }
 
-  public void stopRecordingChanges() {
+  public synchronized void stopRecordingChanges() {
     if (recordedChanges != null && Logger.getLogger(getClass().getName()).isLoggable(Level.FINE)) {
       final StringBuilder dump = new StringBuilder();
       for (final FileChange c : recordedChanges) {
@@ -175,6 +198,7 @@ public class FileManager {
           null, Thread.currentThread().getName(), recordedChanges.size(), dump.toString());
     }
     recordedChanges = null;
+    recordingThread = null;
   }
 
   /**
@@ -242,6 +266,17 @@ public class FileManager {
     }
   }
 
+  /**
+   * <b>Must stay lock-free, and must stay callable after {@link #close} (#5636.)</b> {@code Profiler.toJSON()} reads
+   * this while holding its own monitor, which a closing database can be waiting on, so a lock taken here would sit on
+   * the other side of that wait. Note this is deliberately NOT {@code synchronized}, unlike {@link #getFiles()} just
+   * below.
+   * <p>
+   * The close-tolerance half is not theoretical: {@code LocalDatabase.kill()} closes this file manager well before it
+   * reaches {@code Profiler.unregisterDatabase}, so a scrape landing in that window reads a CLOSED manager on a
+   * still-registered database. Returning zeros there is fine - these feed gauges, so the reading dips for one scrape -
+   * but throwing would take the whole snapshot down, and {@code toJSON()} has no try/catch by design.
+   */
   public FileManagerStats getStats() {
     final FileManagerStats stats = new FileManagerStats();
     stats.maxOpenFiles = maxFilesOpened.get();

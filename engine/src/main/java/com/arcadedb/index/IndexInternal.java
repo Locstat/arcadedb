@@ -110,6 +110,38 @@ public interface IndexInternal extends Index {
 
   int getPageSize();
 
+  /**
+   * Page size to use when this index's configuration is carried over into a NEW index file - a rebuild, or a
+   * propagation to a freshly added bucket or sub type. Defaults to the current one, which is what "carry the
+   * configuration over" means, but an index whose CURRENT page size is not one it would accept at creation has to
+   * answer with a legal one instead (issue #5713).
+   * <p>
+   * Distinct from {@link #getPageSize()} because the value goes back through the creation path, which validates.
+   * A rebuild in particular DROPS the index before recreating it ({@code RebuildIndexStatement.buildIndex}), so
+   * handing back a page size creation refuses would delete the index and then fail to build the replacement -
+   * turning the documented repair for a damaged index into the thing that loses it.
+   */
+  default int getPageSizeForNewFile() {
+    return getPageSize();
+  }
+
+  /**
+   * Configuration to replay when this index's definition is carried over into a NEW index file - a rebuild, a truncate,
+   * a propagation to a freshly added bucket or sub type, a {@code copyType()}. The companion of
+   * {@link #getPageSizeForNewFile()} for everything that is not the page size, and the value to feed
+   * {@link IndexMetadata#copy(String, String[], int)} before handing it to a builder.
+   * <p>
+   * Distinct from {@link #getMetadata()} because that one answers whatever the index stores internally, which for the
+   * wrapper index types is the UNDERLYING LSM-Tree's plain {@link IndexMetadata}: a full-text index keeps its analyzers
+   * and BM25 configuration in its own {@code FullTextIndexMetadata}, a geospatial one keeps its resolution and layout
+   * in its own fields, and neither is reachable through the underlying index. A carry-over site reading
+   * {@code getMetadata()} therefore silently recreates the index with the default configuration (issue #5723) - which
+   * for a full-text index means a different analyzer and a different ranking.
+   */
+  default IndexMetadata getMetadataForNewFile() {
+    return getMetadata();
+  }
+
   boolean isCompacting();
 
   boolean isValid();
@@ -166,5 +198,35 @@ public interface IndexInternal extends Index {
    */
   default boolean isTransactionKeyOrderRequired() {
     return true;
+  }
+
+  /**
+   * Returns {@code true} when {@link Index#get} answers with a SUPERSET of the matching records that the caller must
+   * re-check with the real predicate - a spatial grid approximates a shape with cells, so a cell hit is a candidate,
+   * not a match.
+   * <p>
+   * The consequence is that a row {@code limit} cannot be applied to this index's output: truncating candidates
+   * BEFORE the predicate runs drops rows that would have survived it, and does so silently. Both
+   * {@link Index#get(Object[], int)} on such an index and {@link TypeIndex#get(Object[], int)} over it therefore
+   * ignore a positive limit and return every candidate; the caller applies the limit after filtering
+   * ({@code IndexableSQLFunction.shouldExecuteAfterSearch}).
+   */
+  default boolean isResultApproximate() {
+    return false;
+  }
+
+  /**
+   * Returns a human-readable reason why this index should be rebuilt, or {@code null} when there is none.
+   * <p>
+   * An index whose on-disk layout predates a change the engine cannot apply in place keeps working with the old
+   * layout - correctness first - but does not get whatever the new one buys. This is how it says so: the schema
+   * load logs it once per database open, and it is exposed as {@code upgradeWarning} on {@code schema:indexes} and
+   * {@code schema:index:<name>}, which is what Studio renders. The remedy is always
+   * {@code REBUILD INDEX &lt;name&gt;}, so say what is lost and why, not what to type.
+   * <p>
+   * Implementations must keep this cheap and side-effect free: it is called per index on every listing.
+   */
+  default String getUpgradeWarning() {
+    return null;
   }
 }

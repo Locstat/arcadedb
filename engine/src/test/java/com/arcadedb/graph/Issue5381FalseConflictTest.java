@@ -82,7 +82,7 @@ class Issue5381FalseConflictTest extends TestHelper {
     final int updatesPerRecord = 500;
 
     // Fixed-width value so every update is a same-size in-place overwrite (like #5381's RID->RID head-pointer
-    // flip). A growing value would hit the record-growth path, which the merge deliberately does not cover.
+    // flip) - the shape this test is about. Growth is covered by the merge too since #5279 and has its own tests.
     final RID[] rids = new RID[records];
     database.transaction(() -> {
       database.getSchema().createDocumentType("Doc", 1).createProperty("tag", Type.STRING);
@@ -248,13 +248,14 @@ class Issue5381FalseConflictTest extends TestHelper {
   }
 
   /**
-   * A record-GROWTH update (serialized size increases) on a page shared with other records must NOT be merged: it
-   * shifts other slots, so it poisons the page and falls back to a normal retry. Several threads each grow their
-   * OWN co-located record; correctness (each holds exactly its last committed, larger value) proves the growth
-   * path was not rebased onto a stale page.
+   * A record-GROWTH update (serialized size increases) on a page shared with other records. Since #5279 the merge
+   * replays it as long as it stays inside the page, and falls back to a normal retry when the record has to spill
+   * out of it. Several threads each grow their OWN co-located record, up to the point the page can no longer host
+   * them: whichever of the two paths each step takes, every record must hold exactly its last committed value -
+   * neither a merge onto a stale page nor a fallback may tear it.
    */
   @Test
-  void growingUpdatesOnCoLocatedRecordsFallBackAndStayCorrect() throws Exception {
+  void growingUpdatesOnCoLocatedRecordsStayCorrect() throws Exception {
     GlobalConfiguration.TX_PAGE_SLOT_MERGE.setValue(true);
 
     final int records = 6;
@@ -280,7 +281,7 @@ class Issue5381FalseConflictTest extends TestHelper {
         try {
           start.await();
           for (int i = 1; i <= steps; i++) {
-            final String value = "x".repeat(i); // strictly growing -> record-growth path -> poison + retry
+            final String value = "x".repeat(i); // strictly growing -> record-growth path (merged, or spilled+retried)
             database.transaction(() -> rid.asDocument(true).modify().set("tag", value).save(), true, 50);
           }
         } catch (final Throwable e) {
@@ -297,7 +298,7 @@ class Issue5381FalseConflictTest extends TestHelper {
     if (!errors.isEmpty())
       throw new AssertionError(errors.size() + " thread(s) failed, first: " + errors.getFirst(), errors.getFirst());
 
-    // With retries each grow commits; correct final length proves growth fell back cleanly (no torn/merged record).
+    // Correct final length proves every growth landed intact, whether it was merged or retried.
     database.transaction(() -> {
       for (int i = 0; i < records; i++)
         assertThat(rids[i].asDocument(true).getString("tag")).isEqualTo("x".repeat(steps));
@@ -658,10 +659,11 @@ class Issue5381FalseConflictTest extends TestHelper {
   }
 
   /**
-   * A DELETE on a page shared with other records must poison it (a delete frees a slot and can relink placeholder
-   * chains), so it is never merged - it falls back to a normal retry. Threads delete their own co-located victims
-   * while other threads update co-located survivors in place; the survivors keep exact values and every victim is
-   * gone, proving the delete fell back cleanly rather than being rebased.
+   * A DELETE on a page shared with other records, mixed with in-place updates of the co-located survivors. Since
+   * #5569 the delete of a plain in-place record is itself a tracked single-slot write and merges like the others;
+   * before that it poisoned the page and fell back to a retry. Either way the outcome asserted here is the same and
+   * is the point of the test: the survivors keep their exact last committed value and every victim is gone, so
+   * neither the merge nor the fallback ever mixes the two.
    */
   @Test
   void deleteOnSharedPageFallsBackAndStaysCorrect() throws Exception {

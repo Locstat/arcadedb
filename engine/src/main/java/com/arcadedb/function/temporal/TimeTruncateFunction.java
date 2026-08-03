@@ -18,10 +18,9 @@
  */
 package com.arcadedb.function.temporal;
 
-import com.arcadedb.function.cypher.CypherFunctionHelper;
-
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.function.StatelessFunction;
+import com.arcadedb.function.cypher.CypherFunctionHelper;
 import com.arcadedb.query.opencypher.temporal.CypherDateTime;
 import com.arcadedb.query.opencypher.temporal.CypherLocalDateTime;
 import com.arcadedb.query.opencypher.temporal.CypherLocalTime;
@@ -43,11 +42,20 @@ public class TimeTruncateFunction implements StatelessFunction {
     return "time.truncate";
   }
 
+  @Override
+  public int getMinArgs() {
+    return 2;
+  }
+
+  @Override
+  public int getMaxArgs() {
+    return 3;
+  }
+
   @SuppressWarnings("unchecked")
   @Override
   public Object execute(final Object[] args, final CommandContext context) {
-    if (args.length < 2)
-      throw new CommandExecutionException("time.truncate() requires at least 2 arguments");
+    checkArity(args);
     final String unit = args[0].toString();
     final OffsetTime time;
     if (args[1] instanceof CypherTime)
@@ -62,6 +70,11 @@ public class TimeTruncateFunction implements StatelessFunction {
       throw new CommandExecutionException("time.truncate() second argument must be a temporal value with a time");
     LocalTime truncated = TemporalUtil.truncateLocalTime(time.toLocalTime(), unit);
     ZoneOffset offset = time.getOffset();
+    // An explicitly written null adjustment map propagates, like every argument before it; only an omitted one means
+    // "no adjustment" (issue #5629). This sits after the unit and the temporal value have been validated, so a bad unit
+    // is still reported rather than being masked by the null - the same ordering round() uses.
+    if (CypherFunctionHelper.isExplicitNull(args, 2))
+      return null;
     if (args.length >= 3 && args[2] instanceof Map) {
       final Map<String, Object> adjustMap = (Map<String, Object>) args[2];
       truncated = CypherFunctionHelper.applyTimeMap(truncated, adjustMap);

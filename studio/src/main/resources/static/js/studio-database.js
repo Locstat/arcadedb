@@ -909,7 +909,7 @@ function dropProperty(type, property) {
           url: "api/v1/command/" + database,
           data: JSON.stringify({
             language: "sql",
-            command: "drop property `" + type + "`.`" + property + "`",
+            command: "drop property " + quoteSqlName(type) + "." + quoteSqlName(property),
             serializer: "record",
           }),
           beforeSend: function (xhr) {
@@ -946,7 +946,7 @@ function dropIndex(indexName, type) {
           url: "api/v1/command/" + database,
           data: JSON.stringify({
             language: "sql",
-            command: "drop index `" + indexName + "`",
+            command: "drop index " + quoteSqlName(indexName),
             serializer: "record",
           }),
           beforeSend: function (xhr) {
@@ -1002,7 +1002,7 @@ function runRepartition(typeName) {
           url: "api/v1/command/" + database,
           data: JSON.stringify({
             language: "sql",
-            command: "REBUILD TYPE `" + typeName + "` WITH repartition = true",
+            command: "REBUILD TYPE " + quoteSqlName(typeName) + " WITH repartition = true",
             serializer: "record",
           }),
           beforeSend: function (xhr) {
@@ -1059,7 +1059,7 @@ function dropType(typeName) {
               url: "api/v1/command/" + database,
               data: JSON.stringify({
                 language: "sql",
-                command: "drop type `" + typeName + "` unsafe",
+                command: "drop type " + quoteSqlName(typeName) + " unsafe",
                 serializer: "record",
               }),
               beforeSend: function (xhr) {
@@ -1233,7 +1233,7 @@ function createProperty(typeName) {
     let compression = $("#inputCreatePropCompression").val();
     let ifNotExists = $("#inputCreatePropIfNotExists").prop("checked");
 
-    let command = "CREATE PROPERTY `" + typeName + "`.`" + name + "`";
+    let command = "CREATE PROPERTY " + quoteSqlName(typeName) + "." + quoteSqlName(name);
     if (ifNotExists) command += " IF NOT EXISTS";
     command += " " + type;
     if (ofType != "") command += " OF " + ofType;
@@ -1290,6 +1290,74 @@ function createProperty(typeName) {
   }, 100);
 }
 
+/**
+ * Validates the values collected from the "Add Index" dialog before any SQL is assembled.
+ * Kept free of DOM/jQuery access so it can be unit tested (studio/test/create-index-command.test.js).
+ *
+ * @param opts {object} see buildCreateIndexCommand()
+ * @return {string|null} the error to show, or null when the input is usable
+ */
+function validateCreateIndexOptions(opts) {
+  let properties = opts.properties || [];
+
+  // The algorithm-specific arity rules come first, so an LSM_VECTOR or LSM_SPARSE_VECTOR submitted with
+  // no property at all gets the message that names its own rule rather than the generic one.
+  if (opts.algorithm == "LSM_SPARSE_VECTOR" && properties.length != 2)
+    return "LSM_SPARSE_VECTOR requires both an indices property and a weights property";
+
+  if (opts.algorithm == "LSM_VECTOR" && properties.length != 1) return "LSM_VECTOR requires exactly one property";
+
+  if (properties.length == 0) return "At least one property is required";
+
+  if (opts.algorithm == "LSM_VECTOR") {
+    // The engine has no usable default for the vector width: it compares every candidate vector
+    // length against it, so an index created without it never indexes anything (issue #5607).
+    let dimensions = opts.metadata == null ? null : opts.metadata.dimensions;
+    if (!(dimensions > 0)) return "Dimensions is required for LSM_VECTOR: the number of components of each vector";
+  }
+
+  return null;
+}
+
+/**
+ * Assembles the CREATE INDEX statement for the "Add Index" dialog. Pure function: it takes the
+ * already collected dialog values so the emitted SQL can be unit tested without a browser.
+ *
+ * @param opts {object} with:
+ *   typeName {string}     the type the index is created on
+ *   algorithm {string}    LSM_TREE | HASH | FULL_TEXT | LSM_VECTOR | LSM_SPARSE_VECTOR
+ *   properties {string[]} the indexed property names, in order
+ *   unique {boolean}      LSM_TREE / HASH only
+ *   nullStrategy {string} LSM_TREE / HASH only, "" for the server default
+ *   ifNotExists {boolean} emit IF NOT EXISTS
+ *   metadata {object}     METADATA payload, omitted when null or empty
+ * @return {string} the SQL command
+ */
+function buildCreateIndexCommand(opts) {
+  let algorithm = opts.algorithm;
+
+  let indexTypeSql;
+  if (algorithm == "LSM_TREE") indexTypeSql = opts.unique ? "UNIQUE" : "NOTUNIQUE";
+  else if (algorithm == "HASH") indexTypeSql = opts.unique ? "UNIQUE_HASH" : "NOTUNIQUE_HASH";
+  else indexTypeSql = algorithm;
+
+  let command = "CREATE INDEX";
+  if (opts.ifNotExists) command += " IF NOT EXISTS";
+  command += " ON " + quoteSqlName(opts.typeName) + " (";
+  command += opts.properties
+    .map(function (p) {
+      return quoteSqlName(p);
+    })
+    .join(", ");
+  command += ") " + indexTypeSql;
+
+  if ((algorithm == "LSM_TREE" || algorithm == "HASH") && opts.nullStrategy) command += " NULL_STRATEGY " + opts.nullStrategy;
+
+  if (opts.metadata != null && Object.keys(opts.metadata).length > 0) command += " METADATA " + JSON.stringify(opts.metadata);
+
+  return command;
+}
+
 function createIndex(typeName) {
   let database = getCurrentDatabase();
   if (database == "") {
@@ -1338,6 +1406,43 @@ function createIndex(typeName) {
   } else {
     html += "<input class='form-control mt-1 mb-3' id='inputCreateIdxPropsVectorText' placeholder='Property name (ARRAY_OF_FLOATS or ARRAY_OF_DOUBLES)'>";
   }
+  // The engine refuses an LSM_VECTOR index without a METADATA clause carrying 'dimensions', so the
+  // dialog has to collect it. The remaining knobs default server-side; they are pre-filled with the
+  // same defaults and always sent, which keeps the generated DDL self-documenting (issue #5607).
+  html += "<div class='row mb-3'>";
+  html += "<div class='col-6'>";
+  html += "<label for='inputCreateIdxVectorDimensions'>Dimensions <span style='color:#dc3545'>*</span></label>";
+  html += "<input type='number' min='1' class='form-control mt-1' id='inputCreateIdxVectorDimensions' placeholder='e.g. 384'>";
+  html += "<small class='text-muted'>Number of components of each vector.</small>";
+  html += "</div>";
+  html += "<div class='col-6'>";
+  html += "<label for='inputCreateIdxVectorSimilarity'>Similarity</label>";
+  html += "<select class='form-select mt-1' id='inputCreateIdxVectorSimilarity'>";
+  html += "<option value='COSINE' selected>COSINE (default)</option>";
+  html += "<option value='DOT_PRODUCT'>DOT_PRODUCT</option>";
+  html += "<option value='EUCLIDEAN'>EUCLIDEAN</option>";
+  html += "</select>";
+  html += "</div>";
+  html += "</div>";
+  html += "<div class='row mb-3'>";
+  html += "<div class='col-4'>";
+  html += "<label for='inputCreateIdxVectorMaxConnections'>Max connections</label>";
+  html += "<input type='number' min='1' class='form-control mt-1' id='inputCreateIdxVectorMaxConnections' value='32'>";
+  html += "</div>";
+  html += "<div class='col-4'>";
+  html += "<label for='inputCreateIdxVectorBeamWidth'>Beam width</label>";
+  html += "<input type='number' min='1' class='form-control mt-1' id='inputCreateIdxVectorBeamWidth' value='100'>";
+  html += "</div>";
+  html += "<div class='col-4'>";
+  html += "<label for='inputCreateIdxVectorQuantization'>Quantization</label>";
+  html += "<select class='form-select mt-1' id='inputCreateIdxVectorQuantization'>";
+  html += "<option value='' selected>NONE (default)</option>";
+  html += "<option value='INT8'>INT8</option>";
+  html += "<option value='BINARY'>BINARY</option>";
+  html += "<option value='PRODUCT'>PRODUCT</option>";
+  html += "</select>";
+  html += "</div>";
+  html += "</div>";
   html += "</div>";
 
   // Sparse vector properties (LSM_SPARSE_VECTOR - parallel ARRAY_OF_INTEGERS + ARRAY_OF_FLOATS)
@@ -1368,15 +1473,23 @@ function createIndex(typeName) {
   html += "</div>";
   html += "</div>";
   html += "<div class='row mb-3'>";
-  html += "<div class='col-6'>";
+  html += "<div class='col-4'>";
   html += "<label>Dimensions <small class='text-muted'>(optional)</small></label>";
   html += "<input type='number' min='1' class='form-control mt-1' id='inputCreateIdxSparseDimensions' placeholder='e.g. 105000'>";
   html += "</div>";
-  html += "<div class='col-6'>";
+  html += "<div class='col-4'>";
   html += "<label>Modifier <small class='text-muted'>(optional)</small></label>";
   html += "<select class='form-select mt-1' id='inputCreateIdxSparseModifier'>";
   html += "<option value='' selected>NONE (default)</option>";
   html += "<option value='IDF'>IDF - inverse document frequency</option>";
+  html += "</select>";
+  html += "</div>";
+  html += "<div class='col-4'>";
+  html += "<label>Weight quantization <small class='text-muted'>(optional)</small></label>";
+  html += "<select class='form-select mt-1' id='inputCreateIdxSparseWeightQuantization'>";
+  html += "<option value='' selected>INT8 (default)</option>";
+  html += "<option value='FP16'>FP16</option>";
+  html += "<option value='FP32'>FP32 - exact scoring</option>";
   html += "</select>";
   html += "</div>";
   html += "</div>";
@@ -1413,9 +1526,17 @@ function createIndex(typeName) {
   html += "</div>";
 
   globalPrompt("Add Index to " + escapeHtml(typeName), html, "Create", function () {
+    // Reads an integer from an input, returning null when it is empty or not a positive number.
+    function positiveInt(selector) {
+      let raw = $(selector).val();
+      if (raw == null || raw === "") return null;
+      let value = parseInt(raw, 10);
+      return !isNaN(value) && value > 0 ? value : null;
+    }
+
     let algorithm = $("#inputCreateIdxAlgorithm").val();
     let selectedProps = [];
-    let metadataJson = null;
+    let metadata = null;
     if (algorithm == "LSM_VECTOR") {
       let vectorEl = document.getElementById("inputCreateIdxPropsVector");
       if (vectorEl) {
@@ -1425,6 +1546,17 @@ function createIndex(typeName) {
         let text = $("#inputCreateIdxPropsVectorText").val().trim();
         if (text != "") selectedProps = [text];
       }
+
+      metadata = {};
+      let dimensions = positiveInt("#inputCreateIdxVectorDimensions");
+      if (dimensions != null) metadata.dimensions = dimensions;
+      metadata.similarity = $("#inputCreateIdxVectorSimilarity").val();
+      let maxConnections = positiveInt("#inputCreateIdxVectorMaxConnections");
+      if (maxConnections != null) metadata.maxConnections = maxConnections;
+      let beamWidth = positiveInt("#inputCreateIdxVectorBeamWidth");
+      if (beamWidth != null) metadata.beamWidth = beamWidth;
+      let quantization = $("#inputCreateIdxVectorQuantization").val();
+      if (quantization) metadata.quantization = quantization;
     } else if (algorithm == "LSM_SPARSE_VECTOR") {
       let idxEl = document.getElementById("inputCreateIdxPropsSparseIdx");
       let idxName = idxEl ? $("#inputCreateIdxPropsSparseIdx").val() : $("#inputCreateIdxPropsSparseIdxText").val().trim();
@@ -1432,18 +1564,13 @@ function createIndex(typeName) {
       let wName = wEl ? $("#inputCreateIdxPropsSparseWeights").val() : $("#inputCreateIdxPropsSparseWeightsText").val().trim();
       if (idxName && wName) selectedProps = [idxName, wName];
 
-      let metaParts = [];
-      let dimsRaw = $("#inputCreateIdxSparseDimensions").val();
-      if (dimsRaw != null && dimsRaw !== "") {
-        let dims = parseInt(dimsRaw, 10);
-        if (!isNaN(dims) && dims > 0)
-          metaParts.push("\"dimensions\": " + dims);
-      }
+      metadata = {};
+      let dimensions = positiveInt("#inputCreateIdxSparseDimensions");
+      if (dimensions != null) metadata.dimensions = dimensions;
       let modifier = $("#inputCreateIdxSparseModifier").val();
-      if (modifier != null && modifier !== "")
-        metaParts.push("\"modifier\": \"" + modifier + "\"");
-      if (metaParts.length > 0)
-        metadataJson = "{ " + metaParts.join(", ") + " }";
+      if (modifier) metadata.modifier = modifier;
+      let weightQuantization = $("#inputCreateIdxSparseWeightQuantization").val();
+      if (weightQuantization) metadata.weightQuantization = weightQuantization;
     } else {
       let multiEl = document.getElementById("inputCreateIdxProps");
       if (multiEl) {
@@ -1456,33 +1583,23 @@ function createIndex(typeName) {
       }
     }
 
-    if (algorithm == "LSM_SPARSE_VECTOR" && selectedProps.length != 2) {
-      globalNotify("Error", "LSM_SPARSE_VECTOR requires both an indices property and a weights property", "danger");
+    let options = {
+      typeName: typeName,
+      algorithm: algorithm,
+      properties: selectedProps,
+      unique: $("#inputCreateIdxUnique").prop("checked"),
+      nullStrategy: $("#inputCreateIdxNullStrategy").val(),
+      ifNotExists: $("#inputCreateIdxIfNotExists").prop("checked"),
+      metadata: metadata
+    };
+
+    let error = validateCreateIndexOptions(options);
+    if (error != null) {
+      globalNotify("Error", error, "danger");
       return;
     }
-    if (selectedProps.length == 0) {
-      globalNotify("Error", "At least one property is required", "danger");
-      return;
-    }
-    let unique = $("#inputCreateIdxUnique").prop("checked");
-    let nullStrategy = $("#inputCreateIdxNullStrategy").val();
-    let ifNotExists = $("#inputCreateIdxIfNotExists").prop("checked");
 
-    let indexTypeSql;
-    if (algorithm == "LSM_TREE")
-      indexTypeSql = unique ? "UNIQUE" : "NOTUNIQUE";
-    else if (algorithm == "HASH")
-      indexTypeSql = unique ? "UNIQUE_HASH" : "NOTUNIQUE_HASH";
-    else
-      indexTypeSql = algorithm;
-
-    let command = "CREATE INDEX";
-    if (ifNotExists) command += " IF NOT EXISTS";
-    command += " ON `" + typeName + "` (";
-    command += selectedProps.map(function (p) { return "`" + p + "`"; }).join(", ");
-    command += ") " + indexTypeSql;
-    if ((algorithm == "LSM_TREE" || algorithm == "HASH") && nullStrategy != "") command += " NULL_STRATEGY " + nullStrategy;
-    if (metadataJson != null) command += " METADATA " + metadataJson;
+    let command = buildCreateIndexCommand(options);
 
     jQuery.ajax({
       type: "POST",
@@ -1619,7 +1736,7 @@ function createType(category) {
       return;
     }
 
-    let command = "CREATE " + sqlKeyword + " TYPE `" + name + "`";
+    let command = "CREATE " + sqlKeyword + " TYPE " + quoteSqlName(name);
 
     if ($("#inputCreateTypeIfNotExists").prop("checked"))
       command += " IF NOT EXISTS";
@@ -1627,7 +1744,7 @@ function createType(category) {
     // Multiple parents
     let parents = $("#inputCreateTypeParents").val();
     if (parents && parents.length > 0)
-      command += " EXTENDS " + parents.map(function (p) { return "`" + p + "`"; }).join(", ");
+      command += " EXTENDS " + parents.map(function (p) { return quoteSqlName(p); }).join(", ");
 
     let buckets = $("#inputCreateTypeBuckets").val();
     if (buckets && parseInt(buckets) > 0)
@@ -1788,7 +1905,7 @@ function createTimeSeriesType() {
       return;
     }
 
-    let command = "CREATE TIMESERIES TYPE `" + name + "`";
+    let command = "CREATE TIMESERIES TYPE " + quoteSqlName(name);
 
     if ($("#tsCreateIfNotExists").prop("checked"))
       command += " IF NOT EXISTS";
@@ -2916,12 +3033,22 @@ function applyDefaultLabel(value) {
   if (globalCy != null) renderGraph();
 }
 
+/**
+ * Renders the number of returned rows, flagging a response the server cut short at its row limit so a partial
+ * result cannot be read as a complete one (issue #5711).
+ */
+function renderResultCount(data, count) {
+  if (data.truncated === true)
+    $("#result-num").html(count + ' <span class="text-warning" title="More rows matched: raise the limit to see them.">(truncated)</span>');
+  else $("#result-num").html(count);
+}
+
 function browseType(typeName) {
   let database = getCurrentDatabase();
   if (!database) return;
 
   let limit = parseInt($("#inputLimit").val()) || 100;
-  let query = "select from `" + typeName + "`";
+  let query = "select from " + quoteSqlName(typeName);
 
   $("#inputLanguage").val("sql");
   editor.setValue(query);
@@ -2954,7 +3081,7 @@ function browseType(typeName) {
     } else {
       globalResultset = data.result;
       globalCy = null;
-      $("#result-num").html(data.result.records.length);
+      renderResultCount(data, data.result.records.length);
       renderGraph();
     }
 
@@ -2963,6 +3090,21 @@ function browseType(typeName) {
     $("#executeSpinner").hide();
     globalNotifyError(jqXHR.responseText);
   });
+}
+
+// Quick-action helpers for the type and view detail panes. The SQL is built here, where quoteSqlName() applies, instead of
+// being spelled out inside an inline onclick attribute: a name embedded there would have to survive HTML decoding, JS string
+// parsing and SQL quoting at once, and only the first of those was handled.
+function browseRecords(typeName) {
+  executeCommand("sql", "select from " + quoteSqlName(typeName));
+}
+
+function browseRecordsWithConnections(typeName) {
+  executeCommand("sql", "select *, bothE() as `@edges` from " + quoteSqlName(typeName));
+}
+
+function countRecords(typeName) {
+  executeCommand("sql", "select count(*) from " + quoteSqlName(typeName));
 }
 
 function executeCommand(language, query) {
@@ -3100,7 +3242,7 @@ function executeCommandTable() {
       let elapsed = new Date() - beginTime;
       $("#result-elapsed").html(elapsed);
 
-      $("#result-num").html(data.result.records.length);
+      renderResultCount(data, data.result.records.length);
       $("#resultJson").val(JSON.stringify(data, null, 2));
       $("#resultExplain").val(data.explain != null ? data.explain : "No profiler data found");
 
@@ -3155,7 +3297,7 @@ function executeCommandGraph() {
       let elapsed = new Date() - beginTime;
       $("#result-elapsed").html(elapsed);
 
-      $("#result-num").html(data.result.records.length);
+      renderResultCount(data, data.result.records.length);
       $("#resultJson").val(JSON.stringify(data, null, 2));
       $("#resultExplain").val(data.explain != null ? data.explain : "No profiler data found");
 
@@ -3217,6 +3359,107 @@ function fetchSchemaTypes(callback) {
     });
 }
 
+// The single place where a schema object name is spelled into an HTML attribute (issue #5580). An inline
+// onclick nests three contexts - HTML attribute, JS string literal, handler argument - and escapes only the
+// first, so a name holding a double quote decodes back to `"` and breaks out of the JS string. A data-*
+// attribute has one context: the value is HTML-escaped once and read back through dataset, which the browser
+// returns as a plain string with no further interpretation. `parent` carries the owning type for the actions
+// that need two names (drop-property, drop-index).
+//
+// `action` is deliberately not escaped: it is always a string literal chosen from the registries below,
+// never a runtime value. `name` and `parent` are the untrusted halves. The "every emitted data-action is
+// covered by a dispatch registry" test fails at CI if a caller ever passes something else.
+function schemaActionAttrs(action, name, parent) {
+  let attrs = " data-action='" + action + "' data-name='" + escapeHtml(name) + "'";
+  if (parent != null) attrs += " data-parent='" + escapeHtml(parent) + "'";
+  return attrs;
+}
+
+function renderTypeLink(typeName) {
+  return "<a class='link' href='#'" + schemaActionAttrs("show-type-detail", typeName) + ">" + escapeHtml(typeName) + "</a>";
+}
+
+function renderTypeSidebarBadge(row, color, action) {
+  let name = escapeHtml(row.name);
+  let records = (row.records || 0).toLocaleString();
+  return (
+    "<a class='sidebar-badge' href='#' style='background-color: " + color + "'" +
+    schemaActionAttrs(action, row.name) +
+    " title='" + name + " (" + records + " records)'>" +
+    "<span class='sidebar-badge-name'>" + name + "</span>" +
+    "<span class='sidebar-badge-count'>" + records + "</span>" +
+    "</a>"
+  );
+}
+
+function renderTypeQuickActions(row) {
+  let html = "<button class='btn btn-sm db-action-btn'" + schemaActionAttrs("browse-records", row.name) + "><i class='fa fa-table'></i> Browse records</button>";
+  if (row.type == "vertex")
+    html += "<button class='btn btn-sm db-action-btn'" + schemaActionAttrs("browse-records-with-connections", row.name) + "><i class='fa fa-project-diagram'></i> With connections</button>";
+  html += "<button class='btn btn-sm db-action-btn'" + schemaActionAttrs("count-records", row.name) + "><i class='fa fa-calculator'></i> Count records</button>";
+  html += "<button class='btn btn-sm db-action-btn db-action-btn-danger'" + schemaActionAttrs("drop-type", row.name) + "><i class='fa fa-trash'></i> Drop Type</button>";
+  return html;
+}
+
+function renderMaterializedViewQuickActions(view) {
+  return (
+    "<button class='btn btn-sm db-action-btn'" + schemaActionAttrs("refresh-materialized-view", view.name) + "><i class='fa fa-sync'></i> Refresh Now</button>" +
+    "<button class='btn btn-sm db-action-btn'" + schemaActionAttrs("browse-records", view.name) + "><i class='fa fa-table'></i> Browse Records</button>" +
+    "<button class='btn btn-sm db-action-btn'" + schemaActionAttrs("alter-materialized-view", view.name) + "><i class='fa fa-pen'></i> Alter Refresh Mode</button>" +
+    "<button class='btn btn-sm db-action-btn db-action-btn-danger'" + schemaActionAttrs("drop-materialized-view", view.name) + "><i class='fa fa-trash'></i> Drop View</button>"
+  );
+}
+
+// Delegated handlers for the schema actions emitted by schemaActionAttrs(). The registry doubles as the
+// allowlist: an unknown data-action falls through untouched, which is what lets studio-security.js keep its
+// own document-level handlers. Values are read from dataset, never from jQuery's .data(): schema names may
+// look numeric or boolean ("123", "true") and .data() would coerce those away from the string the SQL layer
+// expects.
+//
+// Note for anyone adding a control elsewhere in Studio: because the dispatch is bound to document, the
+// data-action values below form a page-wide namespace. Reusing one of these names for an unrelated control
+// anywhere in the DOM would route its clicks here as well, so pick a distinct value (or a distinct
+// container-scoped handler) rather than a name that already appears in either registry.
+var schemaClickActions = {
+  "show-type-detail": function (d) { showTypeDetail(d.name); },
+  "browse-type": function (d) { browseType(d.name); },
+  "browse-records": function (d) { browseRecords(d.name); },
+  "browse-records-with-connections": function (d) { browseRecordsWithConnections(d.name); },
+  "count-records": function (d) { countRecords(d.name); },
+  "create-property": function (d) { createProperty(d.name); },
+  "create-index": function (d) { createIndex(d.name); },
+  "drop-type": function (d) { dropType(d.name); },
+  "drop-property": function (d) { dropProperty(d.parent, d.name); },
+  "drop-index": function (d) { dropIndex(d.name, d.parent); },
+  "run-repartition": function (d) { runRepartition(d.name); },
+  "show-materialized-view-detail": function (d) { showMaterializedViewDetail(d.name); },
+  "refresh-materialized-view": function (d) { refreshMaterializedView(d.name); },
+  "alter-materialized-view": function (d) { alterMaterializedView(d.name); },
+  "drop-materialized-view": function (d) { dropMaterializedView(d.name); },
+  "show-gav-detail": function (d) { showGavDetail(d.name); },
+  "rebuild-gav": function (d) { rebuildGav(d.name); },
+  "drop-gav": function (d) { dropGav(d.name); }
+};
+
+var schemaChangeActions = {
+  "alter-gav-update-mode": function (d, value) { alterGavUpdateMode(d.name, value); }
+};
+
+$(document).ready(function () {
+  $(document).on("click", "[data-action]", function (e) {
+    let handler = schemaClickActions[this.dataset.action];
+    if (handler == null) return;
+    e.preventDefault();
+    handler(this.dataset);
+  });
+
+  $(document).on("change", "[data-action]", function () {
+    let handler = schemaChangeActions[this.dataset.action];
+    if (handler == null) return;
+    handler(this.dataset, this.value);
+  });
+});
+
 function displaySchema(onReady) {
   fetchSchemaTypes(function (types) {
     // Build sub-types map
@@ -3274,14 +3517,7 @@ function displaySchema(onReady) {
         let row = items[j];
         let color = colors[j % colors.length];
         globalSidebarTypeColors[row.name] = color;
-        let name = escapeHtml(row.name);
-        let records = (row.records || 0).toLocaleString();
-        html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-        html += "onclick='showTypeDetail(\"" + row.name.replace(/"/g, "&quot;") + "\"); return false;' ";
-        html += "title='" + name + " (" + records + " records)'>";
-        html += "<span class='sidebar-badge-name'>" + name + "</span>";
-        html += "<span class='sidebar-badge-count'>" + records + "</span>";
-        html += "</a>";
+        html += renderTypeSidebarBadge(row, color, "show-type-detail");
       }
 
       html += "</div></div>";
@@ -3344,14 +3580,6 @@ function showTypeDetail(typeName) {
   // refreshes the schema view on completion. Records are SAFE while the flag is true (queries
   // fan out and stay correct), but the optimisation is off until the rebuild runs.
   if (row.needsRepartition === true) {
-    let btnId = "btnRepartition_" + row.name.replace(/[^a-zA-Z0-9]/g, "_");
-    // The button is wired programmatically (via addEventListener after the HTML lands in the
-    // DOM) rather than through an inline onclick. Inline handlers embedding row.name into a
-    // JS-string-in-HTML-attribute context are double-escape territory: even with escapeHtml,
-    // a name containing a literal double-quote escapes back to `"` after HTML decoding and
-    // breaks out of the JS string. The data-* attribute carries the untrusted value through
-    // a single HTML-escaping; the click handler reads it via dataset.typeName which the
-    // browser exposes as a plain string with no further interpretation.
     html += "<div class='alert alert-warning d-flex align-items-center justify-content-between' role='alert' style='margin-bottom:14px;'>";
     html += "  <div>";
     html += "    <i class='fa fa-triangle-exclamation me-2'></i>";
@@ -3359,7 +3587,7 @@ function showTypeDetail(typeName) {
     html += "    A bucket was added/dropped or the strategy changed; partition-aware query pruning is suppressed for this type. ";
     html += "    Queries remain correct but lose the optimisation until a repartition rebuild runs.";
     html += "  </div>";
-    html += "  <button id='" + escapeHtml(btnId) + "' class='btn btn-sm btn-warning js-repartition-btn' data-type-name='" + escapeHtml(row.name) + "'>";
+    html += "  <button class='btn btn-sm btn-warning'" + schemaActionAttrs("run-repartition", row.name) + ">";
     html += "    <i class='fa fa-rotate'></i> Run Repartition";
     html += "  </button>";
     html += "</div>";
@@ -3370,7 +3598,7 @@ function showTypeDetail(typeName) {
     html += "<div class='db-type-meta'>Super Types: ";
     for (let ptidx in row.parentTypes) {
       if (ptidx > 0) html += ", ";
-      html += "<a class='link' href='#' onclick='showTypeDetail(\"" + row.parentTypes[ptidx] + "\"); return false;'>" + escapeHtml(row.parentTypes[ptidx]) + "</a>";
+      html += renderTypeLink(row.parentTypes[ptidx]);
     }
     html += "</div>";
   }
@@ -3381,7 +3609,7 @@ function showTypeDetail(typeName) {
     html += "<div class='db-type-meta'>Sub Types: ";
     for (let stidx in typeSubTypes) {
       if (stidx > 0) html += ", ";
-      html += "<a class='link' href='#' onclick='showTypeDetail(\"" + typeSubTypes[stidx] + "\"); return false;'>" + escapeHtml(typeSubTypes[stidx]) + "</a>";
+      html += renderTypeLink(typeSubTypes[stidx]);
     }
     html += "</div>";
   }
@@ -3419,7 +3647,7 @@ function showTypeDetail(typeName) {
     html += "<div class='db-detail-section'>";
     html += "<div class='d-flex align-items-center justify-content-between mb-2'>";
     html += "<h6 class='mb-0'><i class='fa fa-list'></i> Properties</h6>";
-    html += "<button class='btn btn-sm btn-outline-primary' onclick='createProperty(\"" + row.name.replace(/"/g, "&quot;") + "\"); return false;'><i class='fa fa-plus'></i> Add Property</button>";
+    html += "<button class='btn btn-sm btn-outline-primary'" + schemaActionAttrs("create-property", row.name) + "><i class='fa fa-plus'></i> Add Property</button>";
     html += "</div>";
     let propHtml = renderProperties(row, types);
     if (propHtml == "") {
@@ -3438,7 +3666,7 @@ function showTypeDetail(typeName) {
     html += "<div class='db-detail-section'>";
     html += "<div class='d-flex align-items-center justify-content-between mb-2'>";
     html += "<h6 class='mb-0'><i class='fa fa-bolt'></i> Indexes</h6>";
-    html += "<button class='btn btn-sm btn-outline-primary' onclick='createIndex(\"" + row.name.replace(/"/g, "&quot;") + "\"); return false;'><i class='fa fa-plus'></i> Add Index</button>";
+    html += "<button class='btn btn-sm btn-outline-primary'" + schemaActionAttrs("create-index", row.name) + "><i class='fa fa-plus'></i> Add Index</button>";
     html += "</div>";
     let idxHtml = renderIndexes(row, types);
     if (idxHtml != "") {
@@ -3531,24 +3759,11 @@ function showTypeDetail(typeName) {
   html += "<div class='db-detail-section'>";
   html += "<h6><i class='fa fa-play-circle'></i> Quick Actions</h6>";
   html += "<div class='d-flex flex-wrap gap-2'>";
-  html += "<button class='btn btn-sm db-action-btn' onclick='executeCommand(\"sql\", \"select from \\`" + row.name + "\\`\")'><i class='fa fa-table'></i> Browse records</button>";
-  if (row.type == "vertex")
-    html += "<button class='btn btn-sm db-action-btn' onclick='executeCommand(\"sql\", \"select *, bothE() as \\`@edges\\` from \\`" + row.name + "\\`\")'><i class='fa fa-project-diagram'></i> With connections</button>";
-  html += "<button class='btn btn-sm db-action-btn' onclick='executeCommand(\"sql\", \"select count(*) from \\`" + row.name + "\\`\")'><i class='fa fa-calculator'></i> Count records</button>";
-  html += "<button class='btn btn-sm db-action-btn db-action-btn-danger' onclick='dropType(\"" + escapeHtml(row.name) + "\")'><i class='fa fa-trash'></i> Drop Type</button>";
+  html += renderTypeQuickActions(row);
   html += "</div>";
   html += "</div>";
 
   $("#dbTypeDetail").html(html);
-
-  // Wire the repartition button (issue #4087). Done programmatically rather than via inline
-  // onclick so the type name carries through a single HTML-escape (in the data-type-name
-  // attribute) and is read back as a plain string via dataset.typeName, with no JS-string
-  // interpretation. Avoids the double-escape footgun on type names with embedded quotes.
-  $("#dbTypeDetail .js-repartition-btn").on("click", function (e) {
-    e.preventDefault();
-    runRepartition(this.dataset.typeName);
-  });
 }
 
 var sidebarBadgeColors = {
@@ -3601,14 +3816,7 @@ function populateQuerySidebar() {
       let row = items[j];
       let color = palette[j % palette.length];
       globalSidebarTypeColors[row.name] = color;
-      let name = escapeHtml(row.name);
-      let records = (row.records || 0).toLocaleString();
-      html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-      html += "onclick='browseType(\"" + row.name + "\"); return false;' ";
-      html += "title='" + name + " (" + records + " records)'>";
-      html += "<span class='sidebar-badge-name'>" + name + "</span>";
-      html += "<span class='sidebar-badge-count'>" + records + "</span>";
-      html += "</a>";
+      html += renderTypeSidebarBadge(row, color, "browse-type");
     }
 
     html += "</div></div>";
@@ -3687,11 +3895,9 @@ function renderProperties(row, results) {
 
     panelHtml += "<td>" + (totalIndexes > 0 ? totalIndexes : "None") + "</td>";
     panelHtml +=
-      "<td><button class='btn btn-sm db-action-btn db-action-btn-danger' onclick='dropProperty(\"" +
-      row.name +
-      '", "' +
-      property.name +
-      "\")'><i class='fa fa-minus'></i> Drop Property</button></td></tr>";
+      "<td><button class='btn btn-sm db-action-btn db-action-btn-danger'" +
+      schemaActionAttrs("drop-property", property.name, row.name) +
+      "><i class='fa fa-minus'></i> Drop Property</button></td></tr>";
 
     if (property.custom != null && Object.keys(property.custom).length > 0) {
       panelHtml += "<td></td>";
@@ -3723,13 +3929,22 @@ function renderIndexes(row, results, seen) {
     let index = row.indexes[k];
     if (seen[index.name]) continue;
     seen[index.name] = true;
-    panelHtml += "<tr><td>" + index.name + "</td><td>" + index.typeName + "</td>";
+    // An index whose on-disk layout predates a change the engine cannot apply in place keeps working, so this is
+    // advice, not an error: the reason arrives as `upgradeWarning` and the remedy is always REBUILD INDEX.
+    let indexWarning = index.upgradeWarning
+      ? "<i class='fa fa-exclamation-triangle text-warning me-1' title='" +
+        escapeHtml(index.upgradeWarning) +
+        " - run: REBUILD INDEX `" +
+        escapeHtml(index.name) +
+        "`'></i>"
+      : "";
+    panelHtml += "<tr><td>" + indexWarning + index.name + "</td><td>" + index.typeName + "</td>";
     panelHtml += "<td>" + index.properties + "</td>";
     panelHtml += "<td>" + index.type + "</td>";
 
     panelHtml += "<td>" + (index.unique ? true : false) + "</td>";
     panelHtml += "<td>" + (index.automatic ? true : false) + "</td>";
-    panelHtml += "<td><button class='btn btn-sm db-action-btn db-action-btn-danger' onclick='dropIndex(\"" + index.name + "\", \"" + row.name.replace(/"/g, "&quot;") + "\")'><i class='fa fa-minus'></i> Drop Index</button></td></tr>";
+    panelHtml += "<td><button class='btn btn-sm db-action-btn db-action-btn-danger'" + schemaActionAttrs("drop-index", index.name, row.name) + "><i class='fa fa-minus'></i> Drop Index</button></td></tr>";
   }
 
   // Recurse into parent types so inherited indexes appear in the child type detail (issue #4140).
@@ -4217,21 +4432,12 @@ function renderMaterializedViewsSidebarSection(views, isQuerySidebar) {
     let name = escapeHtml(view.name);
     let statusClass = "mv-status-dot-" + (view.status || "valid").toLowerCase();
 
-    if (isQuerySidebar) {
-      html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-      html += "onclick='executeCommand(\"sql\", \"select from \\`" + view.name + "\\`\"); return false;' ";
-      html += "title='" + name + " (Materialized View)'>";
-      html += "<span class='mv-status-dot " + statusClass + "'></span>";
-      html += "<span class='sidebar-badge-name'>" + name + "</span>";
-      html += "</a>";
-    } else {
-      html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-      html += "onclick='showMaterializedViewDetail(\"" + view.name.replace(/"/g, "&quot;") + "\"); return false;' ";
-      html += "title='" + name + " (Materialized View)'>";
-      html += "<span class='mv-status-dot " + statusClass + "'></span>";
-      html += "<span class='sidebar-badge-name'>" + name + "</span>";
-      html += "</a>";
-    }
+    html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "'";
+    html += schemaActionAttrs(isQuerySidebar ? "browse-records" : "show-materialized-view-detail", view.name);
+    html += " title='" + name + " (Materialized View)'>";
+    html += "<span class='mv-status-dot " + statusClass + "'></span>";
+    html += "<span class='sidebar-badge-name'>" + name + "</span>";
+    html += "</a>";
   }
 
   html += "</div></div>";
@@ -4261,21 +4467,12 @@ function renderMaterializedViewsSidebarBadges(views, isQuerySidebar) {
     let name = escapeHtml(view.name);
     let statusClass = "mv-status-dot-" + (view.status || "valid").toLowerCase();
 
-    if (isQuerySidebar) {
-      html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-      html += "onclick='executeCommand(\"sql\", \"select from \\`" + view.name + "\\`\"); return false;' ";
-      html += "title='" + name + " (Materialized View)'>";
-      html += "<span class='mv-status-dot " + statusClass + "'></span>";
-      html += "<span class='sidebar-badge-name'>" + name + "</span>";
-      html += "</a>";
-    } else {
-      html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-      html += "onclick='showMaterializedViewDetail(\"" + view.name.replace(/"/g, "&quot;") + "\"); return false;' ";
-      html += "title='" + name + " (Materialized View)'>";
-      html += "<span class='mv-status-dot " + statusClass + "'></span>";
-      html += "<span class='sidebar-badge-name'>" + name + "</span>";
-      html += "</a>";
-    }
+    html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "'";
+    html += schemaActionAttrs(isQuerySidebar ? "browse-records" : "show-materialized-view-detail", view.name);
+    html += " title='" + name + " (Materialized View)'>";
+    html += "<span class='mv-status-dot " + statusClass + "'></span>";
+    html += "<span class='sidebar-badge-name'>" + name + "</span>";
+    html += "</a>";
   }
 
   html += "</div>";
@@ -4333,10 +4530,10 @@ function renderGavSidebarBadges(gavs, isQuerySidebar) {
     let name = escapeHtml(gav.name);
     let statusClass = mvStatusDotClass(gav.status);
 
-    html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
+    html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "'";
     if (!isQuerySidebar)
-      html += "onclick='showGavDetail(\"" + gav.name.replace(/"/g, "&quot;") + "\"); return false;' ";
-    html += "title='" + name + " (Graph Analytical View)'>";
+      html += schemaActionAttrs("show-gav-detail", gav.name);
+    html += " title='" + name + " (Graph Analytical View)'>";
     html += "<span class='mv-status-dot " + statusClass + "'></span>";
     html += "<span class='sidebar-badge-name'>" + name + "</span>";
     html += "</a>";
@@ -4387,10 +4584,9 @@ function showGavDetail(gavName) {
   if (gav.edgePropertyFilter && gav.edgePropertyFilter.length > 0)
     html += "<div class='mv-info-row'><span class='mv-info-label'>Edge Properties:</span> " + escapeHtml(gav.edgePropertyFilter.join(", ")) + "</div>";
 
-  let safeName = gav.name.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, "&quot;");
   let currentMode = escapeHtml(gav.updateMode || "OFF");
   html += "<div class='mv-info-row'><span class='mv-info-label'>Update Mode:</span> ";
-  html += "<select class='form-select form-select-sm d-inline-block' style='width:auto;' id='gavUpdateModeSelect' onchange='alterGavUpdateMode(\"" + safeName + "\", this.value)'>";
+  html += "<select class='form-select form-select-sm d-inline-block' style='width:auto;' id='gavUpdateModeSelect'" + schemaActionAttrs("alter-gav-update-mode", gav.name) + ">";
   let modes = ["OFF", "SYNCHRONOUS", "ASYNCHRONOUS"];
   for (let m = 0; m < modes.length; m++)
     html += "<option value='" + modes[m] + "'" + (modes[m] === currentMode ? " selected" : "") + ">" + modes[m] + "</option>";
@@ -4410,8 +4606,8 @@ function showGavDetail(gavName) {
 
   // Actions
   html += "<div class='mt-3 d-flex gap-2'>";
-  html += "<button class='btn btn-sm btn-outline-primary' onclick='rebuildGav(\"" + safeName + "\")'><i class='fa fa-sync'></i> Rebuild</button>";
-  html += "<button class='btn btn-sm btn-outline-danger' onclick='dropGav(\"" + safeName + "\")'><i class='fa fa-trash'></i> Drop</button>";
+  html += "<button class='btn btn-sm btn-outline-primary'" + schemaActionAttrs("rebuild-gav", gav.name) + "><i class='fa fa-sync'></i> Rebuild</button>";
+  html += "<button class='btn btn-sm btn-outline-danger'" + schemaActionAttrs("drop-gav", gav.name) + "><i class='fa fa-trash'></i> Drop</button>";
   html += "</div>";
 
   html += "</div>";
@@ -4539,31 +4735,31 @@ function createGraphAnalyticalView() {
     let command = "CREATE GRAPH ANALYTICAL VIEW";
     if ($("#inputGavIfNotExists").prop("checked"))
       command += " IF NOT EXISTS";
-    command += " `" + name + "`";
+    command += " " + quoteSqlName(name);
 
     let vt = $("#inputGavVertexTypes").val();
     // Filter out the "All types" sentinel — no VERTEX TYPES clause means all
     if (vt)
       vt = vt.filter(function (v) { return v !== "__ALL__"; });
     if (vt && vt.length > 0)
-      command += " VERTEX TYPES (" + vt.map(function (v) { return "`" + v + "`"; }).join(", ") + ")";
+      command += " VERTEX TYPES (" + vt.map(function (v) { return quoteSqlName(v); }).join(", ") + ")";
 
     let et = $("#inputGavEdgeTypes").val();
     if (et)
       et = et.filter(function (e) { return e !== "__ALL__"; });
     if (et && et.length > 0)
-      command += " EDGE TYPES (" + et.map(function (e) { return "`" + e + "`"; }).join(", ") + ")";
+      command += " EDGE TYPES (" + et.map(function (e) { return quoteSqlName(e); }).join(", ") + ")";
 
     let props = $("#inputGavProperties").val().trim();
     if (props) {
-      let propList = props.split(",").map(function (p) { return "`" + p.trim() + "`"; }).filter(function (p) { return p !== "``"; });
+      let propList = props.split(",").filter(function (p) { return p.trim() !== ""; }).map(function (p) { return quoteSqlName(p.trim()); });
       if (propList.length > 0)
         command += " PROPERTIES (" + propList.join(", ") + ")";
     }
 
     let edgeProps = $("#inputGavEdgeProperties").val().trim();
     if (edgeProps) {
-      let edgePropList = edgeProps.split(",").map(function (p) { return "`" + p.trim() + "`"; }).filter(function (p) { return p !== "``"; });
+      let edgePropList = edgeProps.split(",").filter(function (p) { return p.trim() !== ""; }).map(function (p) { return quoteSqlName(p.trim()); });
       if (edgePropList.length > 0)
         command += " EDGE PROPERTIES (" + edgePropList.join(", ") + ")";
     }
@@ -4804,7 +5000,7 @@ function dropGav(gavName) {
         url: "api/v1/command/" + database,
         data: JSON.stringify({
           language: "sql",
-          command: "DROP GRAPH ANALYTICAL VIEW `" + gavName + "`"
+          command: "DROP GRAPH ANALYTICAL VIEW " + quoteSqlName(gavName)
         }),
         beforeSend: function (xhr) {
           xhr.setRequestHeader("Authorization", globalCredentials);
@@ -4829,7 +5025,7 @@ function alterGavUpdateMode(gavName, newMode) {
     url: "api/v1/command/" + database,
     data: JSON.stringify({
       language: "sql",
-      command: "ALTER GRAPH ANALYTICAL VIEW `" + gavName + "` UPDATE MODE " + newMode
+      command: "ALTER GRAPH ANALYTICAL VIEW " + quoteSqlName(gavName) + " UPDATE MODE " + newMode
     }),
     beforeSend: function (xhr) {
       xhr.setRequestHeader("Authorization", globalCredentials);
@@ -4851,7 +5047,7 @@ function rebuildGav(gavName) {
     url: "api/v1/command/" + database,
     data: JSON.stringify({
       language: "sql",
-      command: "REBUILD GRAPH ANALYTICAL VIEW `" + gavName + "`"
+      command: "REBUILD GRAPH ANALYTICAL VIEW " + quoteSqlName(gavName)
     }),
     beforeSend: function (xhr) {
       xhr.setRequestHeader("Authorization", globalCredentials);
@@ -4997,8 +5193,7 @@ function showMaterializedViewDetail(viewName) {
     html += "<h6><i class='fa fa-link'></i> Source Types</h6>";
     html += "<div class='d-flex flex-wrap gap-2'>";
     for (let i = 0; i < view.sourceTypes.length; i++) {
-      let st = view.sourceTypes[i];
-      html += "<a class='link' href='#' onclick='showTypeDetail(\"" + escapeHtml(st) + "\"); return false;' style='font-weight:600;'>" + escapeHtml(st) + "</a>";
+      html += "<span style='font-weight:600;'>" + renderTypeLink(view.sourceTypes[i]) + "</span>";
     }
     html += "</div></div>";
   }
@@ -5051,10 +5246,7 @@ function showMaterializedViewDetail(viewName) {
   html += "<div class='db-detail-section'>";
   html += "<h6><i class='fa fa-play-circle'></i> Quick Actions</h6>";
   html += "<div class='d-flex flex-wrap gap-2'>";
-  html += "<button class='btn btn-sm db-action-btn' onclick='refreshMaterializedView(\"" + escapeHtml(view.name) + "\")'><i class='fa fa-sync'></i> Refresh Now</button>";
-  html += "<button class='btn btn-sm db-action-btn' onclick='executeCommand(\"sql\", \"select from \\`" + view.name + "\\`\")'><i class='fa fa-table'></i> Browse Records</button>";
-  html += "<button class='btn btn-sm db-action-btn' onclick='alterMaterializedView(\"" + escapeHtml(view.name) + "\")'><i class='fa fa-pen'></i> Alter Refresh Mode</button>";
-  html += "<button class='btn btn-sm db-action-btn db-action-btn-danger' onclick='dropMaterializedView(\"" + escapeHtml(view.name) + "\")'><i class='fa fa-trash'></i> Drop View</button>";
+  html += renderMaterializedViewQuickActions(view);
   html += "</div></div>";
 
   $("#dbTypeDetail").html(html);
@@ -5139,7 +5331,7 @@ function createMaterializedView() {
       return;
     }
     let mode = $("input[name='mvRefreshMode']:checked").val();
-    let command = "CREATE MATERIALIZED VIEW `" + name + "` AS " + query;
+    let command = "CREATE MATERIALIZED VIEW " + quoteSqlName(name) + " AS " + query;
     if (mode != "MANUAL") {
       command += " REFRESH";
       if (mode == "PERIODIC") {
@@ -5215,7 +5407,7 @@ function refreshMaterializedView(name) {
           url: "api/v1/command/" + database,
           data: JSON.stringify({
             language: "sql",
-            command: "REFRESH MATERIALIZED VIEW `" + name + "`",
+            command: "REFRESH MATERIALIZED VIEW " + quoteSqlName(name),
             serializer: "record",
           }),
           beforeSend: function (xhr) {
@@ -5249,7 +5441,7 @@ function alterMaterializedView(name) {
 
   globalPrompt("Alter Materialized View: " + escapeHtml(name), html, "Alter", function () {
     let mode = $("input[name='mvAlterMode']:checked").val();
-    let command = "ALTER MATERIALIZED VIEW `" + name + "` REFRESH " + mode;
+    let command = "ALTER MATERIALIZED VIEW " + quoteSqlName(name) + " REFRESH " + mode;
     if (mode == "PERIODIC") {
       let interval = parseInt($("#mvAlterInterval").val()) || 5;
       let unit = $("#mvAlterIntervalUnit").val() || "MINUTE";
@@ -5303,7 +5495,7 @@ function dropMaterializedView(name) {
           url: "api/v1/command/" + database,
           data: JSON.stringify({
             language: "sql",
-            command: "DROP MATERIALIZED VIEW `" + name + "`",
+            command: "DROP MATERIALIZED VIEW " + quoteSqlName(name),
             serializer: "record",
           }),
           beforeSend: function (xhr) {
@@ -5650,7 +5842,7 @@ function refreshMvFromMetrics(name) {
   jQuery.ajax({
     type: "POST",
     url: "api/v1/command/" + database,
-    data: JSON.stringify({ language: "sql", command: "REFRESH MATERIALIZED VIEW `" + name + "`" }),
+    data: JSON.stringify({ language: "sql", command: "REFRESH MATERIALIZED VIEW " + quoteSqlName(name) }),
     beforeSend: function (xhr) { xhr.setRequestHeader("Authorization", globalCredentials); },
   }).done(function () {
     globalNotify("Success", "Materialized view '" + escapeHtml(name) + "' refreshed", "success");
@@ -5793,11 +5985,23 @@ function loadStorageIndexes() {
 
 function renderIndexesDataTable(indexes) {
   var tableData = [];
+  // An index whose on-disk layout predates a change the engine cannot apply in place keeps working, so this is
+  // advice, not an error: the server sends the reason as `upgradeWarning` and the remedy is always REBUILD INDEX.
+  var needRebuild = [];
 
   for (var i = 0; i < indexes.length; i++) {
     var idx = indexes[i];
+    var name = escapeHtml(idx.name);
+    if (idx.upgradeWarning) {
+      needRebuild.push(idx);
+      name =
+        "<i class='fa fa-exclamation-triangle text-warning me-1' title='" +
+        escapeHtml(idx.upgradeWarning) +
+        "'></i>" +
+        name;
+    }
     tableData.push([
-      escapeHtml(idx.name),
+      name,
       escapeHtml(idx.indexType || "-"),
       escapeHtml(idx.typeName || "-"),
       idx.fileId != null ? idx.fileId : "-",
@@ -5807,6 +6011,8 @@ function renderIndexesDataTable(indexes) {
       idx.valid != null ? (idx.valid ? "Yes" : "No") : "-"
     ]);
   }
+
+  renderIndexUpgradeWarningBanner(needRebuild);
 
   if ($.fn.dataTable.isDataTable("#dbStorageIndexes"))
     try { $("#dbStorageIndexes").DataTable().destroy(); $("#dbStorageIndexes").empty(); } catch (e) {}
@@ -5854,6 +6060,38 @@ function renderIndexesDataTable(indexes) {
       globalNotifyError(jqXHR.responseText);
     });
   });
+}
+
+// Renders the advisory banner above the index listing. The rows are per-bucket sub-indexes, so they are grouped by
+// the type index name the user actually rebuilds, and identical advice for several indexes is shown once.
+function renderIndexUpgradeWarningBanner(needRebuild) {
+  var banner = $("#dbIndexUpgradeWarning");
+  if (!needRebuild || needRebuild.length == 0) {
+    banner.hide().empty();
+    return;
+  }
+
+  var byMessage = {};
+  for (var i = 0; i < needRebuild.length; i++) {
+    var idx = needRebuild[i];
+    var names = byMessage[idx.upgradeWarning];
+    if (names == null) names = byMessage[idx.upgradeWarning] = [];
+    var name = idx.typeIndexName || idx.name;
+    if (names.indexOf(name) < 0) names.push(name);
+  }
+
+  var html = "<div><i class='fa fa-exclamation-triangle me-1'></i><strong>Some indexes should be rebuilt.</strong> " +
+    "They keep working as they are - rebuilding is optional and can be done at any time.</div>";
+
+  for (var message in byMessage) {
+    var names = byMessage[message].sort();
+    html += "<div class='mt-2'>" + escapeHtml(message) + "</div><ul class='mb-0 mt-1'>";
+    for (var n = 0; n < names.length; n++)
+      html += "<li><code>REBUILD INDEX `" + escapeHtml(names[n]) + "`</code></li>";
+    html += "</ul>";
+  }
+
+  banner.html(html).show();
 }
 
 // ===== Dictionary Tab =====

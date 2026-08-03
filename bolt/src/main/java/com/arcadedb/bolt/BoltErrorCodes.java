@@ -34,6 +34,14 @@ public final class BoltErrorCodes {
   // Statement errors
   public static final String SYNTAX_ERROR   = "Neo.ClientError.Statement.SyntaxError";
   public static final String SEMANTIC_ERROR = "Neo.ClientError.Statement.SemanticError";
+  // A statement that parses and is semantically valid but references a $parameter the client never bound.
+  // Neo4j gives this its own title, and drivers/tools key off it to tell "your query is wrong" apart from
+  // "you forgot to send a value", so it must not collapse into SyntaxError.
+  public static final String PARAMETER_MISSING_ERROR = "Neo.ClientError.Statement.ParameterMissing";
+  // A 64-bit integer overflow or a division by zero. The statement is fine and so is the server; the values the
+  // caller supplied have no representable answer, which Neo4j reports as a client error - not the generic
+  // DatabaseError a driver would surface as "the server broke". See issue #5602.
+  public static final String ARITHMETIC_ERROR      = "Neo.ClientError.Statement.ArithmeticError";
 
   // Transaction errors
   public static final String TRANSACTION_ERROR = "Neo.ClientError.Transaction.TransactionNotFound";

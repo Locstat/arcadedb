@@ -34,17 +34,17 @@ Each has its own local `excludeId` derivation (`leaderId != null ? leaderId : lo
 
 **Any change to what "replica" means must be applied to all three.** Grep `RaftHAServer.java` for `getPeers()` before claiming such a fix is complete. This has already caused one incomplete fix that review caught.
 
-## Known sharp edge: materialized views break page-version replication
+## Anything that commits must hold the WRAPPED database instance, not the inner one
 
-Unresolved as of 2026-07, tracked in #5492 - delete this section when that closes. Established by a controlled A/B run on a 3-node cluster, identical load, only the schema differing:
+`LocalDatabase.commit()` writes pages locally. `RaftReplicatedDatabase.commit()` proposes them to Raft and *then* writes them. Code holding the wrong one of the two commits successfully, applies its pages on the leader, and replicates nothing. Followers trail by exactly those page versions, and the next replicated entry touching one of them fails its version check - `WALVersionGapException`, database marked diverged, snapshot resync, and the entry after it breaks the same way. Nothing throws at the point of the mistake, so the symptom always surfaces somewhere else.
 
-- **With** a `REFRESH INCREMENTAL` materialized view: 2041/3000 writes fail, 12 snapshot-resync cycles in ~9 s, nodes never converge.
-- **Without** it: 3000/3000 writes, zero errors, immediate convergence.
+`getWrappedDatabaseInstance()` returns the Raft wrapper under HA and the instance itself off it, so resolving it is always correct and never costs anything.
 
-The leader ships a `TX_ENTRY` whose page version is ahead of what followers hold, first appearing on the view's own backing bucket. Followers throw `WALVersionGapException`, trigger a full snapshot resync, and the resync does not repair it - the next entry gaps again on a different file. Meanwhile every request to a resyncing follower is deflected with a 503, so writes routed through it are dropped. The end state is lost committed writes, not split-brain.
+This was #5492. `SQLQueryEngine` handed statements the raw instance, so `CommandContext.getDatabase()` was the inner `LocalDatabase`, and every statement that commits mid-execution bypassed replication: `TRUNCATE TYPE`/`BUCKET` batching every `TRUNCATE_BATCH_SIZE` (default **1000**) records, `REBUILD INDEX`, `BatchStep`. `SQLScriptQueryEngine` had always resolved the wrapper before running the *same statement classes*, which is why an identical `TRUNCATE` replicated under `sqlscript` and not under `sql`.
 
-The exact leader-side path is **not** proven. One theory is already ruled out and should not be re-proposed: `LocalSchema.getDatabase()` returns the wrapped instance, so the refresh does go through `RaftReplicatedDatabase`. It does not commit on the inner `LocalDatabase`.
+Two things about how it hid, both worth generalizing:
 
-A second, independent defect sits next to it: `MaterializedViewChangeListener` always schedules `MaterializedViewRefresher.fullRefresh` regardless of `REFRESH INCREMENTAL`, so every committing transaction that touches the source type triggers a `TRUNCATE TYPE ... UNSAFE` plus a full re-run of the defining query. Under single-record transactions that degenerates to a full rebuild per row. The refresh is deduplicated per transaction, not per record, and a refresh arriving while one is already running is **dropped** rather than queued (`tryBeginRefresh`), so a view can also be silently stale under concurrent writers with no HA involved.
+- **A default-sized threshold can look like a heisenbug.** It reproduced only above 1000 records in one statement, so every in-process attempt (180 to 450 records) saw a clean cluster and the failure was written off as needing container-level concurrency. If a replication bug reproduces in containers and not in process, compare the *sizes* before theorizing about timing.
+- **A materialized view was the trigger only because it truncates constantly.** `MaterializedViewRefresher` truncates and rebuilds its backing type on every source commit, so a view over 1000+ rows crossed the boundary on every refresh. The view was the amplifier, not the defect - `TRUNCATE TYPE` over 1000 records through `/api/v1/command` with `language=sql` was enough on its own.
 
-If you are investigating unexplained replication gaps, check whether the failing database has a materialized view before going further.
+When adding any code path that commits, ask which instance it holds. `Issue5492TruncateBatchNotReplicatedIT` guards the statement path; it asserts the WAL gap counter *before* querying the follower, because the resync reinstalls the follower's database and a stale handle then throws `DatabaseIsClosed`, which reads like infrastructure noise rather than divergence.
