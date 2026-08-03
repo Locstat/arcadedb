@@ -28,15 +28,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Regression test for issue #5318: the RID -> vector-id reverse index in {@link VectorLocationIndex} must resolve
  * a RID's vector ids in O(k) and stay perfectly consistent with the primary {@code id -> location} map across
- * inserts, updates (new id + tombstone of the old one), FIFO eviction (bounded mode) and clear().
+ * inserts, updates (new id + tombstone of the old one) and clear().
  *
  * @author Luca Garulli (l.garulli@arcadedata.com)
  */
 class VectorLocationIndexRidReverseTest {
 
   @Test
-  void reverseIndexResolvesRidsInUnlimitedMode() {
-    final VectorLocationIndex index = new VectorLocationIndex(-1);
+  void reverseIndexResolvesRids() {
+    final VectorLocationIndex index = new VectorLocationIndex();
 
     final RID rid0 = new RID(3, 10);
     final RID rid1 = new RID(3, 11);
@@ -48,40 +48,50 @@ class VectorLocationIndexRidReverseTest {
     assertThat(index.getVectorIdsForRid(rid1)).containsExactly(id1);
     assertThat(index.getVectorIdsForRid(new RID(9, 9))).isEmpty();
 
-    // Simulate an embedding update on rid0: a new id is added and the old one is tombstoned (kept resident).
+    // Simulate an embedding update on rid0: a new id is added and the old one is tombstoned. Since issue #5516 the
+    // tombstoned id keeps no location and no reverse-index slot: only the live id is mapped to the RID.
     final int id0b = index.addVector(false, 300, rid0);
     index.markDeleted(id0);
 
-    final int[] rid0Ids = index.getVectorIdsForRid(rid0);
-    assertThat(rid0Ids).hasSize(2);
-    assertThat(Arrays.stream(rid0Ids).boxed()).contains(id0, id0b);
+    assertThat(index.getVectorIdsForRid(rid0)).containsExactly(id0b);
+    assertThat(index.getLocation(id0)).isNull();
+    assertThat(index.isDeleted(id0)).isTrue();
+    assertThat(index.getDeletedCount()).isEqualTo(1);
+    assertThat(index.size()).as("only the live vectors stay resident").isEqualTo(2);
 
-    // The reverse index still mirrors the primary map exactly (deleted entries stay resident until compaction).
+    // The reverse index still mirrors the primary map exactly.
     assertReverseMirrorsPrimary(index);
 
     index.clear();
     assertThat(index.getVectorIdsForRid(rid0)).isEmpty();
     assertThat(index.getVectorIdsForRid(rid1)).isEmpty();
+    assertThat(index.getDeletedCount()).isEqualTo(0);
+    assertThat(index.isDeleted(id0)).isFalse();
   }
 
+  /**
+   * Issue #5559: nothing evicts. The map used to FIFO-drop the oldest entry past a {@code maxSize} handed to the
+   * constructor, which silently unmapped a live vector from its record. The capacity hint that replaced that
+   * parameter must size the map, not bound it, so every entry added past it stays resolvable both ways.
+   */
   @Test
-  void reverseIndexTracksFifoEvictionInBoundedMode() {
-    final int maxSize = 8;
-    final VectorLocationIndex index = new VectorLocationIndex(maxSize, maxSize);
+  void nothingIsEvictedPastTheInitialCapacity() {
+    final int initialCapacity = 8;
+    final VectorLocationIndex index = new VectorLocationIndex(initialCapacity);
 
-    final RID[] rids = new RID[maxSize * 2];
-    final int[] ids = new int[maxSize * 2];
+    final RID[] rids = new RID[initialCapacity * 4];
+    final int[] ids = new int[rids.length];
     for (int i = 0; i < rids.length; i++) {
       rids[i] = new RID(3, i);
       ids[i] = index.addVector(false, i * 10L, rids[i]);
     }
 
-    // Only the newest maxSize entries survive FIFO eviction; the evicted ones must be gone from the reverse index too.
-    assertThat(index.size()).isEqualTo(maxSize);
-    for (int i = 0; i < maxSize; i++)
-      assertThat(index.getVectorIdsForRid(rids[i])).as("evicted rid %d", i).isEmpty();
-    for (int i = maxSize; i < rids.length; i++)
-      assertThat(index.getVectorIdsForRid(rids[i])).as("resident rid %d", i).containsExactly(ids[i]);
+    assertThat(index.size()).as("every location stays resident").isEqualTo(rids.length);
+    for (int i = 0; i < rids.length; i++) {
+      assertThat(index.getVectorIdsForRid(rids[i])).as("rid %d", i).containsExactly(ids[i]);
+      assertThat(index.getLocation(ids[i])).as("location of id %d", ids[i]).isNotNull();
+      assertThat(index.isDeleted(ids[i])).as("id %d must not read as deleted", ids[i]).isFalse();
+    }
 
     assertReverseMirrorsPrimary(index);
   }

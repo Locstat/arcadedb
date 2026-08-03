@@ -20,6 +20,7 @@ package com.arcadedb.function.text;
 
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.function.StatelessFunction;
+import com.arcadedb.function.cypher.CypherFunctionHelper;
 import com.arcadedb.query.sql.executor.CommandContext;
 
 /**
@@ -32,10 +33,21 @@ public class SubstringFunction implements StatelessFunction {
   }
 
   @Override
+  public int getMinArgs() {
+    return 2;
+  }
+
+  @Override
+  public int getMaxArgs() {
+    return 3;
+  }
+
+  @Override
   public Object execute(final Object[] args, final CommandContext context) {
-    if (args.length < 2 || args.length > 3)
-      throw new CommandExecutionException("substring() requires 2 or 3 arguments: substring(string, start[, length])");
-    if (args[0] == null || args[1] == null)
+    checkArity(args);
+    // An explicitly written null length propagates rather than meaning "run to the end of the string", which is what
+    // CypherSubstringFunction - the implementation Cypher actually resolves substring() to - already did (issue #5193).
+    if (args[0] == null || args[1] == null || CypherFunctionHelper.isExplicitNull(args, 2))
       return null;
     final String str = args[0].toString();
     final int start = ((Number) args[1]).intValue();

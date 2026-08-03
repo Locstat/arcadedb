@@ -18,6 +18,8 @@
  */
 package com.arcadedb.bolt;
 
+import com.arcadedb.exception.ArithmeticErrorException;
+import com.arcadedb.exception.CommandParameterMissingException;
 import com.arcadedb.exception.CommandParsingException;
 import com.arcadedb.exception.CommandSemanticException;
 import com.arcadedb.exception.ConcurrentModificationException;
@@ -103,5 +105,49 @@ class BoltErrorClassificationTest {
   void plainParsingExceptionClassifiesAsSyntaxError() {
     assertThat(BoltNetworkExecutor.classifyParsingError(new CommandParsingException("unexpected token")))
         .isEqualTo(BoltErrorCodes.SYNTAX_ERROR);
+  }
+
+  /**
+   * Issue #5561: an unbound {@code $parameter} is not a syntax error and not a generic semantic error - the
+   * query text is valid and the client only failed to send a value. Neo4j gives it its own title, and drivers
+   * key off it, so it must not collapse into either neighbour even though the exception extends
+   * {@link CommandSemanticException}.
+   */
+  @Test
+  void missingParameterClassifiesAsParameterMissing() {
+    assertThat(BoltNetworkExecutor.classifyParsingError(new CommandParameterMissingException("threshold")))
+        .isEqualTo(BoltErrorCodes.PARAMETER_MISSING_ERROR);
+    assertThat(BoltErrorCodes.PARAMETER_MISSING_ERROR).isEqualTo("Neo.ClientError.Statement.ParameterMissing");
+  }
+
+  /**
+   * Issue #5602: a 64-bit overflow or a division by zero is decided by the values the caller supplied, so a driver
+   * must be told it is the client's error and not the generic DatabaseError it reports as "the server broke". Neo4j
+   * calls it ArithmeticError.
+   */
+  @Test
+  void arithmeticErrorClassifiesAsArithmeticError() {
+    assertThat(BoltNetworkExecutor.classifyExecutionError(new ArithmeticErrorException("long overflow"),
+        BoltErrorCodes.DATABASE_ERROR)).isEqualTo(BoltErrorCodes.ARITHMETIC_ERROR);
+    assertThat(BoltErrorCodes.ARITHMETIC_ERROR).isEqualTo("Neo.ClientError.Statement.ArithmeticError");
+  }
+
+  @Test
+  void arithmeticErrorWrappedAsCauseAlsoClassifiesAsArithmeticError() {
+    // It reaches the handler wrapped by the auto-commit transaction wrapper, and carries the JDK ArithmeticException
+    // it came from as its own cause, so the whole chain has to be searched.
+    final Throwable wrapped = new RuntimeException("command failed",
+        new ArithmeticErrorException("long overflow", new ArithmeticException("long overflow")));
+    assertThat(BoltNetworkExecutor.classifyExecutionError(wrapped, BoltErrorCodes.DATABASE_ERROR))
+        .isEqualTo(BoltErrorCodes.ARITHMETIC_ERROR);
+  }
+
+  @Test
+  void aRetryableConflictStillWinsOverAnArithmeticError() {
+    // Ordering matters: a conflict is retryable and an arithmetic error is not, so a chain carrying both must keep
+    // the transient classification the driver acts on.
+    final Throwable wrapped = new ArithmeticErrorException("long overflow", new ConcurrentModificationException("retry"));
+    assertThat(BoltNetworkExecutor.classifyExecutionError(wrapped, BoltErrorCodes.DATABASE_ERROR))
+        .isEqualTo(BoltErrorCodes.TRANSIENT_CONFLICT_ERROR);
   }
 }

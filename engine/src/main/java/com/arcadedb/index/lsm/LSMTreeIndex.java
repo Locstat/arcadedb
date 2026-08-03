@@ -180,7 +180,7 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
    */
   synchronized void dropRetiredCompactedIndexes() {
     for (final LSMTreeIndexCompacted retired : retiredCompactedIndexes) {
-      if (retired.getActiveCursors() != 0)
+      if (retired.countActiveCursors() != 0)
         continue;
 
       final int fileId = retired.getFileId();
@@ -487,9 +487,22 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
   public long countEntries() {
     checkIsValid();
     long total = 0;
-    for (final IndexCursor it = iterator(true); it.hasNext(); ) {
-      it.next();
-      ++total;
+    final IndexCursor it = iterator(true);
+    try {
+      // #5635: hasNext() is exact, so every next() yields a live entry. Before that it was optimistic - it answered on
+      // the number of live underlying cursors, not on whether they still held a surviving RID - and next() returned
+      // null once a trailing run of tombstones left nothing to emit, which this count read as one more entry (#5601:
+      // a fully emptied type still reported 1, and only a full compaction cleared it). Dead keys consumed mid-scan are
+      // skipped by the cursor and accounted separately in the deadEntriesSkipped stat, so what is counted here is
+      // exactly the live entries.
+      while (it.hasNext()) {
+        it.next();
+        ++total;
+      }
+    } finally {
+      // releases the compacted-series retire guards and flushes the scan stats: a full walk of every index is the
+      // last place that should leak either
+      it.close();
     }
     return total;
   }

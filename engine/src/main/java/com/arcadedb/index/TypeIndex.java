@@ -92,10 +92,21 @@ public class TypeIndex implements RangeIndex, IndexInternal {
       throw new UnsupportedOperationException("Index '" + getName() + "' does not support ordered iterations");
 
     final List<IndexCursor> cursors = new ArrayList<>(indexesOnBuckets.size());
-    for (final Index index : indexesOnBuckets)
-      cursors.add(((RangeIndex) index).range(ascending, beginKeys, beginKeysInclusive, endKeys, endKeysInclusive));
+    try {
+      for (final Index index : indexesOnBuckets)
+        cursors.add(((RangeIndex) index).range(ascending, beginKeys, beginKeysInclusive, endKeys, endKeysInclusive));
 
-    return new MultiIndexCursor(cursors, -1, ascending);
+      return new MultiIndexCursor(cursors, -1, ascending);
+    } catch (final RuntimeException e) {
+      // #5662: nothing owns the per-bucket cursors until the MultiIndexCursor is built, so a failure partway through
+      // would abandon the ones already opened. The null guard matters: MultiIndexCursor keeps THIS list rather than
+      // copying it, and a constructor that fails has already closed the children and nulled their slots - without the
+      // guard the cleanup would throw a NullPointerException over the exception that is being propagated.
+      for (final IndexCursor cursor : cursors)
+        if (cursor != null)
+          cursor.close();
+      throw e;
+    }
   }
 
   @Override
@@ -114,11 +125,12 @@ public class TypeIndex implements RangeIndex, IndexInternal {
       final List<IndexCursorEntry> entries = new ArrayList<>();
 
       for (final Index index : getIndexesByKeys(keys)) {
-        final IndexCursor cursor = index.get(keys, -1);
-        while (cursor.hasNext()) {
-          final Identifiable record = cursor.next();
-          final int score = cursor.getScore();
-          entries.add(new IndexCursorEntry(keys, record, score));
+        try (final IndexCursor cursor = index.get(keys, -1)) {
+          while (cursor.hasNext()) {
+            final Identifiable record = cursor.next();
+            final int score = cursor.getScore();
+            entries.add(new IndexCursorEntry(keys, record, score));
+          }
         }
       }
 
@@ -134,16 +146,18 @@ public class TypeIndex implements RangeIndex, IndexInternal {
       for (final Index index : getIndexesByKeys(keys)) {
         final boolean unique = index.isUnique();
 
-        final IndexCursor cursor = index.get(keys, unique ? 1 : -1);
-        while (cursor.hasNext()) {
-          if (unique) {
-            result = Set.of(cursor.next());
-            return new IndexCursorCollection(result);
-          }
+        // #5662: try-with-resources - the unique branch returns from inside the loop, abandoning the cursor partway
+        try (final IndexCursor cursor = index.get(keys, unique ? 1 : -1)) {
+          while (cursor.hasNext()) {
+            if (unique) {
+              result = Set.of(cursor.next());
+              return new IndexCursorCollection(result);
+            }
 
-          if (result == null)
-            result = new HashSet<>();
-          result.add(cursor.next());
+            if (result == null)
+              result = new HashSet<>();
+            result.add(cursor.next());
+          }
         }
       }
       return new IndexCursorCollection(result != null ? result : Collections.emptyList());
@@ -166,14 +180,16 @@ public class TypeIndex implements RangeIndex, IndexInternal {
       final List<IndexCursorEntry> entries = new ArrayList<>();
 
       for (final Index index : getIndexesByKeys(keys)) {
-        final IndexCursor cursor = index.get(keys, limit > -1 ? limit - entries.size() : -1);
-        while (cursor.hasNext()) {
-          final Identifiable record = cursor.next();
-          final int score = cursor.getScore();
-          entries.add(new IndexCursorEntry(keys, record, score));
+        // #5662: try-with-resources - the limit breaks out of the loop, abandoning the cursor partway
+        try (final IndexCursor cursor = index.get(keys, limit > -1 ? limit - entries.size() : -1)) {
+          while (cursor.hasNext()) {
+            final Identifiable record = cursor.next();
+            final int score = cursor.getScore();
+            entries.add(new IndexCursorEntry(keys, record, score));
 
-          if (limit > -1 && entries.size() >= limit)
-            break;
+            if (limit > -1 && entries.size() >= limit)
+              break;
+          }
         }
         if (limit > -1 && entries.size() >= limit)
           break;
@@ -189,19 +205,27 @@ public class TypeIndex implements RangeIndex, IndexInternal {
 
       return new TempIndexCursor(entries);
     } else {
-      // For non-full-text indexes, use the original implementation
+      // For non-full-text indexes, use the original implementation.
+      // An index whose results are APPROXIMATE (a spatial grid: a cell hit is a candidate, not a match) cannot have a
+      // row limit applied to its output - truncating candidates before the caller's predicate re-checks them silently
+      // drops rows that would have survived it. Such an index is asked for, and returns, everything.
+      final int effectiveLimit = isResultApproximate() ? -1 : limit;
+
       Set<Identifiable> result = null;
 
       for (final Index index : getIndexesByKeys(keys)) {
-        final IndexCursor cursor = index.get(keys, limit > -1 ? (result != null ? result.size() : 0) - limit : -1);
-        while (cursor.hasNext()) {
-          if (result == null)
-            result = new HashSet<>(limit);
+        // #5662: try-with-resources - the limit returns from inside the loop, abandoning the cursor partway
+        try (final IndexCursor cursor = index.get(keys,
+            effectiveLimit > -1 ? (result != null ? result.size() : 0) - effectiveLimit : -1)) {
+          while (cursor.hasNext()) {
+            if (result == null)
+              result = effectiveLimit > -1 ? new HashSet<>(effectiveLimit) : new HashSet<>();
 
-          result.add(cursor.next());
+            result.add(cursor.next());
 
-          if (limit > -1 && result.size() >= limit)
-            return new IndexCursorCollection(result);
+            if (effectiveLimit > -1 && result.size() >= effectiveLimit)
+              return new IndexCursorCollection(result);
+          }
         }
       }
       return new IndexCursorCollection(result != null ? result : Collections.emptyList());
@@ -300,6 +324,18 @@ public class TypeIndex implements RangeIndex, IndexInternal {
   }
 
   @Override
+  public String getUpgradeWarning() {
+    // Every bucket sub-index of a type index shares one definition, so the first one answers for all of them.
+    return getFirstUnderlyingIndex().getUpgradeWarning();
+  }
+
+  @Override
+  public boolean isResultApproximate() {
+    // Same definition across every bucket sub-index, so the first one answers for all of them.
+    return !indexesOnBuckets.isEmpty() && indexesOnBuckets.getFirst().isResultApproximate();
+  }
+
+  @Override
   public void drop() {
     if (!valid)
       // Already dropped. The schema's leaf-drop path (LocalSchema#dropIndex) auto-removes a wrapper
@@ -376,6 +412,13 @@ public class TypeIndex implements RangeIndex, IndexInternal {
   public int getPageSize() {
     checkIsValid();
     return getFirstUnderlyingIndex().getPageSize();
+  }
+
+  @Override
+  public int getPageSizeForNewFile() {
+    checkIsValid();
+    // Same definition across every bucket sub-index, so the first one answers for all of them.
+    return getFirstUnderlyingIndex().getPageSizeForNewFile();
   }
 
   @Override
@@ -585,13 +628,17 @@ public class TypeIndex implements RangeIndex, IndexInternal {
       return indexesOnBuckets;
     }
 
-    final int bucketIndex = type.getBucketIndexByKeys(keys,
+    // Pass the properties these keys belong to, NOT just the values: a record is placed by hashing the type's
+    // PARTITION properties, so pruning to the hash of an arbitrary key set lands on an unrelated bucket and the
+    // record is silently missed (issue #5589). The strategy compares the two and returns -1 when they differ,
+    // which falls through to the full fan-out below.
+    final List<String> propNames = getPropertyNames();
+
+    final int bucketIndex = type.getBucketIndexByKeys(propNames, keys,
         DatabaseContext.INSTANCE.getContext(type.getSchema().getEmbedded().getDatabase().getDatabasePath()).asyncMode);
 
     if (bucketIndex > -1) {
       // USE THE SHARDED INDEX
-      final List<String> propNames = getPropertyNames();
-
       List<IndexInternal> polymorphicIndexesOnKeys = type.getPolymorphicBucketIndexByBucketId(
           type.getBuckets(false).get(bucketIndex).getFileId(), propNames);
 
@@ -638,6 +685,18 @@ public class TypeIndex implements RangeIndex, IndexInternal {
       return metadata;
     if (!indexesOnBuckets.isEmpty())
       return getFirstUnderlyingIndex().getMetadata();
+    return null;
+  }
+
+  @Override
+  public IndexMetadata getMetadataForNewFile() {
+    // Same precedence as getMetadata(), but the delegate answers with the type-specific configuration a wrapper index
+    // keeps outside the underlying LSM-Tree. Same definition across every bucket sub-index, so the first one answers
+    // for all of them.
+    if (metadata != null)
+      return metadata;
+    if (!indexesOnBuckets.isEmpty())
+      return getFirstUnderlyingIndex().getMetadataForNewFile();
     return null;
   }
 }

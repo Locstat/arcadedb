@@ -21,11 +21,13 @@ package com.arcadedb.mongo;
 import com.arcadedb.database.Database;
 import com.arcadedb.database.MutableDocument;
 import com.arcadedb.database.ProtocolContext;
+import com.arcadedb.exception.ErrorCategory;
 import com.arcadedb.log.LogManager;
 import com.arcadedb.query.sql.executor.IteratorResultSet;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
+import com.arcadedb.query.sql.parser.Identifier;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.Schema;
 import com.arcadedb.schema.TypeIndexBuilder;
@@ -44,6 +46,7 @@ import de.bwaldvogel.mongo.backend.Utils;
 import de.bwaldvogel.mongo.backend.aggregation.Aggregation;
 import de.bwaldvogel.mongo.bson.Document;
 import de.bwaldvogel.mongo.bson.ObjectId;
+import de.bwaldvogel.mongo.exception.ErrorCode;
 import de.bwaldvogel.mongo.exception.MongoServerError;
 import de.bwaldvogel.mongo.exception.MongoServerException;
 import de.bwaldvogel.mongo.oplog.Oplog;
@@ -130,7 +133,7 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
           "Received unsupported command from MongoDB client '%s', (document=%s)".formatted(command, document));
       }
     } catch (final Exception e) {
-      throw new MongoServerException("Error on executing MongoDB '" + command + "' command", e);
+      throw wireException("Error on executing MongoDB '" + command + "' command", e);
     } finally {
       ProtocolContext.clear();
     }
@@ -202,8 +205,41 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
         return collection.handleQuery(query.getQuery(), numSkip, numReturn);
       }
     } catch (final Exception e) {
-      throw new MongoServerException("Error on executing MongoDB query", e);
+      throw wireException("Error on executing MongoDB query", e);
     }
+  }
+
+  /**
+   * Wraps a failure so the client is told whose fault it was (issue #5628). Every failure used to become a bare
+   * {@link MongoServerException}, and {@link #putLastError} can only emit {@code code}/{@code codeName} for a
+   * {@link MongoServerError} - so a caller who divided by zero or hit a unique index got an uncoded error
+   * indistinguishable from the server having broken.
+   * <p>
+   * The classification itself lives in {@link ErrorCategory} so every wire protocol answers it the same way; only
+   * the translation into MongoDB's error codes is here. The categories MongoDB has no code for keep the uncoded
+   * exception they already had.
+   * <p>
+   * WriteConflict, NamespaceNotFound, Unauthorized and MaxTimeMSExpired are given as literals because the bundled
+   * {@code de.bwaldvogel} {@link ErrorCode} enum does not define them; the rest come from the enum.
+   */
+  static MongoServerException wireException(final String message, final Exception e) {
+    // The bundled backend assigns its own codes - an aggregation stage rejecting a pipeline, for instance. Those
+    // are already more precise than anything classification could infer, and re-wrapping them dropped the code
+    // entirely, so the client saw an uncoded error. Keep what the backend decided.
+    if (e instanceof MongoServerError alreadyCoded)
+      return alreadyCoded;
+
+    return switch (ErrorCategory.of(e)) {
+      case RETRY -> new MongoServerError(112, "WriteConflict", message, e);
+      case ARITHMETIC, VALIDATION -> new MongoServerError(ErrorCode.BadValue.getValue(), ErrorCode.BadValue.getName(), message, e);
+      case DUPLICATED_KEY ->
+          new MongoServerError(ErrorCode.DuplicateKey.getValue(), ErrorCode.DuplicateKey.getName(), message, e);
+      case SCHEMA -> new MongoServerError(26, "NamespaceNotFound", message, e);
+      case SECURITY -> new MongoServerError(13, "Unauthorized", message, e);
+      case PARSING -> new MongoServerError(ErrorCode.FailedToParse.getValue(), ErrorCode.FailedToParse.getName(), message, e);
+      case TIMEOUT -> new MongoServerError(50, "MaxTimeMSExpired", message, e);
+      case NOT_FOUND, SERVER -> new MongoServerException(message, e);
+    };
   }
 
   private Document aggregateCollection(final String command, final Document document, final Oplog oplog)
@@ -479,12 +515,13 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
           final Number limit = (Number) del.get("limit");
           final boolean single = limit != null && limit.intValue() == 1;
 
-          final StringBuilder sql = new StringBuilder("DELETE FROM `").append(collectionName).append('`');
-          appendWhere(sql, q);
+          final Map<String, Object> params = new HashMap<>();
+          final StringBuilder sql = new StringBuilder("DELETE FROM ").append(Identifier.quote(collectionName));
+          appendWhere(sql, params, q);
           if (single)
             sql.append(" LIMIT 1");
 
-          n += executeCount(sql.toString());
+          n += executeCount(sql.toString(), params);
         }
         database.commit();
       } catch (final RuntimeException e) {
@@ -556,13 +593,14 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
     if (!database.getSchema().existsType(collectionName) || u == null)
       return 0;
 
-    final StringBuilder sql = new StringBuilder("UPDATE `").append(collectionName).append('`');
-    appendUpdateOperations(sql, u);
-    appendWhere(sql, q);
+    final Map<String, Object> params = new HashMap<>();
+    final StringBuilder sql = new StringBuilder("UPDATE ").append(Identifier.quote(collectionName));
+    appendUpdateOperations(sql, params, u);
+    appendWhere(sql, params, q);
     if (!multi)
       sql.append(" LIMIT 1");
 
-    return executeCount(sql.toString());
+    return executeCount(sql.toString(), params);
   }
 
   private ObjectId executeUpsert(final String collectionName, final Document q, final Document u) {
@@ -620,9 +658,21 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
     }
   }
 
-  private void appendUpdateOperations(final StringBuilder sql, final Document u) {
+  /**
+   * Appends the update clauses for a BSON update document, binding every value it carries into {@code params} rather than
+   * spelling it into {@code sql}. Field names are the exception: SQL cannot bind a property name, so {@code $unset} and
+   * {@code $inc} quote theirs as identifiers.
+   * <p>
+   * {@code params} must be empty on entry and hold only generated placeholders afterwards: names are derived from the map's
+   * current size, so a pre-seeded map would silently reuse one. A caller that also appends a WHERE clause must share this
+   * same map, which continues the numbering instead of colliding with it.
+   */
+  static void appendUpdateOperations(final StringBuilder sql, final Map<String, Object> params, final Document u) {
+    assert params.isEmpty();
+
     if (isReplacement(u)) {
-      sql.append(" CONTENT ").append(documentToJson(u));
+      sql.append(" CONTENT ");
+      MongoDBToSqlTranslator.buildValue(sql, params, documentToMap(u));
       return;
     }
 
@@ -630,19 +680,24 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
       final String op = entry.getKey();
       final Document operand = (Document) entry.getValue();
       switch (op) {
-      case "$set" -> sql.append(" MERGE ").append(documentToJson(operand));
+      case "$set" -> {
+        sql.append(" MERGE ");
+        MongoDBToSqlTranslator.buildValue(sql, params, documentToMap(operand));
+      }
       case "$unset" -> {
         sql.append(" REMOVE ");
         int i = 0;
         for (final String field : operand.keySet()) {
           if (i++ > 0)
             sql.append(", ");
-          sql.append('`').append(field).append('`');
+          sql.append(MongoDBToSqlTranslator.quoteFieldPath(field));
         }
       }
       case "$inc" -> {
-        for (final Map.Entry<String, Object> f : operand.entrySet())
-          sql.append(" SET `").append(f.getKey()).append("` += ").append((Number) f.getValue());
+        for (final Map.Entry<String, Object> f : operand.entrySet()) {
+          sql.append(" SET ").append(MongoDBToSqlTranslator.quoteFieldPath(f.getKey())).append(" += ");
+          MongoDBToSqlTranslator.buildValue(sql, params, (Number) f.getValue());
+        }
       }
       default -> throw new UnsupportedOperationException("Unsupported update operator '" + op + "'");
       }
@@ -656,15 +711,15 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
     return true;
   }
 
-  private void appendWhere(final StringBuilder sql, final Document q) {
+  private void appendWhere(final StringBuilder sql, final Map<String, Object> params, final Document q) {
     if (q != null && !q.isEmpty()) {
       sql.append(" WHERE ");
-      MongoDBToSqlTranslator.buildExpression(sql, q);
+      MongoDBToSqlTranslator.buildExpression(sql, params, q);
     }
   }
 
-  private int executeCount(final String sql) {
-    try (final ResultSet rs = database.command("sql", sql)) {
+  private int executeCount(final String sql, final Map<String, Object> params) {
+    try (final ResultSet rs = database.command("sql", sql, params)) {
       if (rs.hasNext()) {
         final Number count = rs.next().getProperty("count");
         if (count != null)
@@ -674,21 +729,25 @@ public class MongoDBDatabaseWrapper implements MongoDatabase {
     return 0;
   }
 
-  private static JSONObject documentToJson(final Document doc) {
-    final JSONObject json = new JSONObject();
+  /**
+   * Converts a BSON document into the map bound as the payload of {@code UPDATE ... MERGE} / {@code ... CONTENT}. Insertion
+   * order is preserved so a replacement document reaches the record in wire order.
+   */
+  private static Map<String, Object> documentToMap(final Document doc) {
+    final Map<String, Object> map = LinkedHashMap.newLinkedHashMap(doc.size());
     for (final Map.Entry<String, Object> entry : doc.entrySet())
-      json.put(entry.getKey(), toJsonValue(entry.getValue()));
-    return json;
+      map.put(entry.getKey(), toMapValue(entry.getValue()));
+    return map;
   }
 
-  private static Object toJsonValue(final Object value) {
+  private static Object toMapValue(final Object value) {
     if (value instanceof Document document)
-      return documentToJson(document);
+      return documentToMap(document);
     else if (value instanceof List<?> list) {
-      final JSONArray array = new JSONArray();
+      final List<Object> converted = new ArrayList<>(list.size());
       for (final Object item : list)
-        array.put(toJsonValue(item));
-      return array;
+        converted.add(toMapValue(item));
+      return converted;
     } else if (value instanceof ObjectId id)
       return toHexString(id);
     return value;

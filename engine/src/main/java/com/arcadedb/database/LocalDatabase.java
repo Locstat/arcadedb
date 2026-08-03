@@ -37,6 +37,7 @@ import com.arcadedb.engine.WALFile;
 import com.arcadedb.engine.WALFileFactory;
 import com.arcadedb.engine.WALFileFactoryEmbedded;
 import com.arcadedb.engine.timeseries.TimeSeriesBucket;
+import com.arcadedb.engine.timeseries.TimeSeriesTagDictionary;
 import com.arcadedb.exception.ArcadeDBException;
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.exception.ConcurrentModificationException;
@@ -67,6 +68,7 @@ import com.arcadedb.index.IndexCursor;
 import com.arcadedb.index.IndexInternal;
 import com.arcadedb.index.TypeIndex;
 import com.arcadedb.index.hash.HashIndexBucket;
+import com.arcadedb.index.lsm.LSMTreeIndexBloomFilter;
 import com.arcadedb.index.lsm.LSMTreeIndexCompacted;
 import com.arcadedb.index.lsm.LSMTreeIndexMutable;
 import com.arcadedb.index.sparsevector.SparseSegmentComponent;
@@ -141,6 +143,8 @@ import java.util.stream.Stream;
 public class LocalDatabase extends RWLockContext implements DatabaseInternal {
   public static final int EDGE_LIST_INITIAL_CHUNK_SIZE         = 64;
   public static final int MAX_RECOMMENDED_EDGE_LIST_CHUNK_SIZE = 8192;
+  /** Header ({@code MutableEdgeSegment.CONTENT_START_POSITION}) plus room for a couple of maximum-width entries. */
+  public static final int MIN_EDGE_LIST_CHUNK_SIZE             = 32;
 
   private static final Set<String> SUPPORTED_FILE_EXT = Set.of(
       Dictionary.DICT_EXT,
@@ -149,10 +153,12 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
       LSMTreeIndexMutable.UNIQUE_INDEX_EXT,
       LSMTreeIndexCompacted.NOTUNIQUE_INDEX_EXT,
       LSMTreeIndexCompacted.UNIQUE_INDEX_EXT,
+      LSMTreeIndexBloomFilter.FILE_EXT,
       LSMVectorIndex.FILE_EXT,
       LSMVectorIndexGraphFile.FILE_EXT,
       SparseSegmentComponent.FILE_EXT,
       TimeSeriesBucket.BUCKET_EXT,
+      TimeSeriesTagDictionary.DICT_EXT,
       HashIndexBucket.UNIQUE_INDEX_EXT,
       HashIndexBucket.NOTUNIQUE_INDEX_EXT);
 
@@ -242,7 +248,10 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
 
   public static int getNewEdgeListSize(final int previousSize) {
     if (previousSize == 0)
-      return EDGE_LIST_INITIAL_CHUNK_SIZE;
+      // Floored: the chunk buffer is not auto-resizable, so a configured value that cannot hold the header plus one
+      // entry fails at the first append with "Cannot resize the buffer" rather than at configuration time.
+      return Math.max(MIN_EDGE_LIST_CHUNK_SIZE,
+          GlobalConfiguration.GRAPH_EDGE_LIST_INITIAL_CHUNK_SIZE.getValueAsInteger());
 
     int newSize = previousSize * 2;
     if (newSize > MAX_RECOMMENDED_EDGE_LIST_CHUNK_SIZE)
@@ -424,6 +433,12 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
     return async;
   }
 
+  /**
+   * <b>Must stay lock-free, and must stay callable on a closed database (#5636.)</b> {@code Profiler} reads this
+   * while holding its own monitor - both on a metrics scrape and from {@code unregisterDatabase} on the close path -
+   * so acquiring a database lock here would put a database lock on the other side of a wait for that monitor, which
+   * is a deadlock. It reads plain atomics today; keep it that way.
+   */
   @Override
   public Map<String, Object> getStats() {
     final Map<String, Object> map = stats.toMap();
@@ -1202,7 +1217,25 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
   }
 
   @Override
+  public void deleteEdgeSkippingEndpoint(final Edge edge, final RID skipEndpoint) {
+    executeInReadLock(() -> {
+      deleteRecordNoLock(edge, skipEndpoint);
+      return null;
+    });
+  }
+
+  @Override
   public void deleteRecordNoLock(final Record record) {
+    deleteRecordNoLock(record, null);
+  }
+
+  /**
+   * @param skipEdgeEndpoint when {@code record} is an edge, the endpoint vertex whose edge list must NOT be
+   *                         touched by the disconnection (#5760, see
+   *                         {@link #deleteEdgeSkippingEndpoint(Edge, RID)}). Ignored for any other record type,
+   *                         and always {@code null} on the ordinary delete path.
+   */
+  private void deleteRecordNoLock(final Record record, final RID skipEdgeEndpoint) {
     if (record.getIdentity() == null)
       throw new IllegalArgumentException("Cannot delete a non persistent record");
 
@@ -1262,7 +1295,7 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
       }
 
       if (record instanceof Edge edge) {
-        graphEngine.deleteEdge(edge);
+        graphEngine.deleteEdge(edge, skipEdgeEndpoint);
       } else if (record instanceof Vertex) {
         try {
           graphEngine.deleteVertex((VertexInternal) record, forceBrokenChainDelete);
@@ -1295,7 +1328,11 @@ public class LocalDatabase extends RWLockContext implements DatabaseInternal {
         ((RecordEventsRegistry) document.getType().getEvents()).onAfterDelete(record);
 
       final TransactionContext transaction = getTransaction();
-      transaction.updateBucketRecordDelta(bucket.getFileId(), -1);
+      if (record.getIdentity().getPosition() >= 0)
+        // A record-less RID (a lightweight edge) never allocated a record in the bucket, so there is nothing to
+        // subtract. Folding a -1 anyway drifts the cached counter behind count(*), and the drift is persisted in
+        // statistics.json, so it survives a reopen.
+        transaction.updateBucketRecordDelta(bucket.getFileId(), -1);
 
     } finally {
       if (implicitTransaction) {

@@ -20,15 +20,19 @@
 /* JavaCCOptions:MULTI=true,NODE_USES_PARSER=false,VISITOR=true,TRACK_TOKENS=true,NODE_PREFIX=O,NODE_EXTENDS=,NODE_FACTORY=,SUPPORT_USERTYPE_VISIBILITY_PUBLIC=true */
 package com.arcadedb.query.sql.parser;
 
+import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.Identifiable;
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.exception.CommandSQLParsingException;
+import com.arcadedb.exception.SchemaException;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.InternalResultSet;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
 import com.arcadedb.schema.DocumentType;
+import com.arcadedb.schema.LocalEdgeType;
+import com.arcadedb.schema.LocalSchema;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -175,8 +179,28 @@ public class AlterTypeStatement extends DDLStatement {
           // Permission failures (UPDATE_SCHEMA) must surface as-is so the HTTP layer maps them to 403,
           // not get masked as a parsing error.
           throw e;
-        } catch (final Exception e) {
-          throw new CommandSQLParsingException("Bucket selection strategy implementation '" + implName + "' was not found", e);
+        } catch (final IllegalArgumentException | SchemaException e) {
+          // Report why the strategy was refused rather than claiming it does not exist. Every failure used to be
+          // rewritten as "was not found", so `partitioned('x')` with no unique index on x - or, since issue #5603,
+          // with a partition key whose stored form cannot be hashed consistently - sent the user hunting for a typo
+          // in a name that was perfectly valid. The genuinely unknown implementation still says so: that case
+          // arrives with its own "Cannot find bucket selection strategy class" message, which this keeps.
+          // <p>
+          // The exception TYPE stays a CommandParsingException subtype, and only the message changes. Refusing a
+          // strategy is a client-side DDL mistake, and CommandParsingException is what the HTTP layer maps to 400
+          // (AbstractServerHttpHandler, both the plain and the transaction-wrapped arm); a CommandExecutionException
+          // would be answered 500, telling clients and load balancers to retry a request that can only ever fail the
+          // same way. Statement-level validation refusals elsewhere in this package (see RebuildTypeStatement's
+          // repartition gate) classify the same way.
+          // <p>
+          // Only the two types a REFUSAL can arrive as are caught: IllegalArgumentException from the strategy's own
+          // unique-index check, and SchemaException from the suitability check and from an unresolvable
+          // implementation name. Catching Exception would hand the same "your DDL is wrong" 400 to a failure that is
+          // nothing of the sort - an NPE, a persistence error - and the sharper message this now carries would make
+          // that misclassification read as authoritative. Anything else propagates and is classified on its merits.
+          throw new CommandSQLParsingException(
+              "Cannot set bucket selection strategy '" + implName + "' on type '" + type.getName() + "': "
+                  + e.getMessage(), e);
         }
         break;
       }
@@ -195,21 +219,55 @@ public class AlterTypeStatement extends DDLStatement {
       result.setProperty("custom", customKey.getStringValue() + "=" + value);
     }
 
-    // Trailing settings clause. Today we recognise `WITH repartition = true` (issue #4087): the
-    // partition mapping is now stale (bucket add/drop or strategy change), so chain a rebuild
-    // before returning. The DDL surfaces the moved-record count alongside the ALTER result so
-    // operators see the rebuild happened. Unknown settings throw - the supported list grows with
+    // Trailing settings clause. `WITH repartition = true` (issue #4087) means the partition mapping is now
+    // stale (bucket add/drop or strategy change), so chain a rebuild before returning; the DDL surfaces the
+    // moved-record count alongside the ALTER result so operators see the rebuild happened. `lightweight` and
+    // `unique` are the edge-type declarations. Unknown settings throw - the supported list grows with
     // explicit additions in this method.
     boolean repartitionRequested = false;
+    Boolean lightweightRequested = null;
+    Boolean uniqueRequested = null;
     for (final Map.Entry<Identifier, Expression> e : settings.entrySet()) {
       final String key = e.getKey().getStringValue();
       if ("repartition".equalsIgnoreCase(key)) {
         final Object raw = e.getValue().execute((Result) null, context);
         repartitionRequested = parseBooleanSetting("ALTER TYPE", "repartition", raw);
-      } else
-        throw new CommandSQLParsingException(
-            "Unrecognized setting '" + key + "' in ALTER TYPE statement (supported: repartition)");
+      } else if ("lightweight".equalsIgnoreCase(key))
+        lightweightRequested = parseBooleanSetting("ALTER TYPE", key, e.getValue().execute((Result) null, context));
+      else if ("unique".equalsIgnoreCase(key))
+        uniqueRequested = parseBooleanSetting("ALTER TYPE", key, e.getValue().execute((Result) null, context));
+      else
+        throw new CommandSQLParsingException("Unrecognized setting '" + key
+            + "' in ALTER TYPE statement (supported: repartition, lightweight, unique)");
     }
+
+    if (lightweightRequested != null || uniqueRequested != null) {
+      if (!(type instanceof LocalEdgeType edgeType))
+        throw new CommandExecutionException(
+            "Settings 'lightweight' and 'unique' apply to edge types only, and '" + type.getName()
+                + "' is not one");
+
+      // Order matters when both arrive in one statement: the storage shape decides how UNIQUE is enforced, so it
+      // has to be settled before the constraint is materialised.
+      if (lightweightRequested != null) {
+        edgeType.setLightweight(lightweightRequested);
+        result.setProperty("lightweight", lightweightRequested);
+      }
+      if (uniqueRequested != null) {
+        // Withdraw first so the drop passes the guard that protects a live constraint's index.
+        edgeType.setUnique(uniqueRequested);
+        result.setProperty("unique", uniqueRequested);
+      }
+
+      final LocalSchema schema = ((DatabaseInternal) context.getDatabase()).getSchema().getEmbedded();
+      if (edgeType.isUnique())
+        LocalEdgeType.applyUniqueConstraint(schema, edgeType);
+      else
+        LocalEdgeType.removeUniqueConstraint(schema, edgeType);
+
+      schema.saveConfiguration();
+    }
+
     if (repartitionRequested) {
       // Construct a RebuildTypeStatement and invoke its rebuild loop directly. This avoids
       // serialising the type name back into a SQL string (which would otherwise need a

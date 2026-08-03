@@ -30,6 +30,7 @@ import com.arcadedb.exception.TimeoutException;
 import com.arcadedb.graph.Edge;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.index.Index;
+import com.arcadedb.index.IndexInternal;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.LocalDocumentType;
 import com.arcadedb.schema.LocalTimeSeriesType;
@@ -114,7 +115,10 @@ public class FetchFromSchemaTypesStep extends AbstractExecutionStep {
             for (final Bucket b : type.getBuckets(false)) {
               final Integer extId = ldt.getExternalBucketIdFor(b.getFileId());
               if (extId != null) {
-                final Bucket extBucket = context.getDatabase().getSchema().getBucketById(extId);
+                // #5636: null-tolerant on purpose. An external bucket tiered to a secondary path can be referenced
+                // by the schema without being loaded; the throwing getBucketById(int) made the guard below dead and
+                // turned a whole `SELECT FROM schema:types` into a SchemaException over one unreadable mapping.
+                final Bucket extBucket = context.getDatabase().getSchema().getBucketByIdIfExists(extId);
                 if (extBucket != null)
                   extMap.put(b.getName(), extBucket.getName());
               }
@@ -177,6 +181,11 @@ public class FetchFromSchemaTypesStep extends AbstractExecutionStep {
                 propRes.setProperty("unique", typeIndex.isUnique());
                 propRes.setProperty("properties", typeIndex.getPropertyNames());
                 propRes.setProperty("automatic", typeIndex.isAutomatic());
+                // Advisory only, and absent on a healthy index: the reason this one should be rebuilt (see
+                // IndexInternal#getUpgradeWarning). Studio flags the row on it.
+                final String upgradeWarning = ((IndexInternal) typeIndex).getUpgradeWarning();
+                if (upgradeWarning != null)
+                  propRes.setProperty("upgradeWarning", upgradeWarning);
                 return propRes;
               }).collect(Collectors.toList());
           r.setProperty("indexes", indexes);

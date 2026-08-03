@@ -24,19 +24,24 @@ import com.arcadedb.database.Database;
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.exception.CommandSQLParsingException;
 import com.arcadedb.index.Index;
+import com.arcadedb.index.IndexException;
 import com.arcadedb.index.TypeIndex;
 import com.arcadedb.index.lsm.LSMTreeIndexAbstract;
 import com.arcadedb.index.vector.LSMVectorIndex;
+import com.arcadedb.log.LogManager;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.InternalResultSet;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
+import com.arcadedb.schema.IndexBuilder;
 import com.arcadedb.schema.Schema;
 import com.arcadedb.schema.TypeFullTextIndexBuilder;
+import com.arcadedb.schema.TypeGeoIndexBuilder;
 import com.arcadedb.schema.TypeIndexBuilder;
 import com.arcadedb.schema.TypeLSMSparseVectorIndexBuilder;
 import com.arcadedb.schema.TypeLSMVectorIndexBuilder;
+import com.arcadedb.serializer.json.JSONException;
 import com.arcadedb.serializer.json.JSONObject;
 
 import java.util.ArrayList;
@@ -44,10 +49,35 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
 import java.util.stream.Collectors;
 
 public class CreateIndexStatement extends DDLStatement {
+
+  /**
+   * Reported for every LSM_VECTOR statement whose METADATA does not carry a usable {@code dimensions}.
+   * Only that one setting is mandatory: it is compared against the length of every candidate vector, so
+   * an index built without it indexes nothing. The others all have defaults, which the previous wording
+   * ("requires METADATA with dimensions, similarity, maxConnections, and beamWidth") did not say (#5607).
+   */
+  private static final String LSM_VECTOR_METADATA_HINT =
+      "LSM_VECTOR index requires a METADATA clause with a positive 'dimensions', e.g. METADATA {\"dimensions\": 384}. "
+          + "Optional: similarity (default COSINE), maxConnections (default 32), beamWidth (default 100), "
+          + "quantization (default NONE)";
+
+  /**
+   * Keys of a {@code METADATA} clause that direct THIS statement rather than configuring the index, so no index ever
+   * stores them.
+   * <p>
+   * They have to be stripped before the clause reaches anything that reads it as configuration: an index type's
+   * {@code fromUserMetadata} refuses a key it does not know, and {@code IF NOT EXISTS} would otherwise compare a
+   * directive against an existing index that cannot have one - both turning a well-formed statement into a 400. Kept
+   * as one named set so a future "do X now" key on another index type has an obvious place to be declared instead of
+   * being stripped at whichever site happens to notice (issue #5765 review).
+   */
+  private static final Set<String> DIRECTIVE_METADATA_KEYS = Set.of("buildGraphNow");
 
   public Identifier                         name;
   public Identifier                         typeName;
@@ -88,6 +118,24 @@ public class CreateIndexStatement extends DDLStatement {
     }
     default -> throw new CommandSQLParsingException("Index type '" + typeAsString + "' is not supported");
     }
+  }
+
+  /**
+   * Reads the {@code METADATA} clause as written and without the statement directives, or null when the statement
+   * carried none. See {@link #DIRECTIVE_METADATA_KEYS} for why the directives cannot travel with it.
+   */
+  private JSONObject readUserMetadata(final CommandContext context) {
+    if (metadata == null)
+      return null;
+
+    return stripDirectives(new JSONObject(metadata.toMap((Result) null, context)));
+  }
+
+  /** Removes the statement directives from a METADATA clause in place, and hands it back for chaining. */
+  private static JSONObject stripDirectives(final JSONObject json) {
+    for (final String directive : DIRECTIVE_METADATA_KEYS)
+      json.remove(directive);
+    return json;
   }
 
   @Override
@@ -152,6 +200,43 @@ public class CreateIndexStatement extends DDLStatement {
 
     if (database.getSchema().existsIndex(name.getValue())) {
       if (ifNotExists) {
+        // The name this matched on is derived from the indexed property set alone, so it says nothing about what the
+        // index actually does. Answering "already exists" on the name only meant a NOTUNIQUE index reported success to
+        // a request for a UNIQUE one, and the migration that asked for the constraint carried on without it (#5675).
+        final Index existing = database.getSchema().getIndexByName(name.getValue());
+        final List<String> requestedProperties = List.of(fields);
+
+        // Reachable only through a manual index name: the auto-derived form above is built from the type name and the
+        // property list, so a name match implies both already match. Index names are global, so a manual one can name
+        // an index on ANOTHER type, or on other properties of this one - either way it is a different index, and
+        // answering "already exists" would leave the requested one uncreated with nothing said about why.
+        if (!existing.getTypeName().equals(typeName.getStringValue())
+            || !existing.getPropertyNames().equals(requestedProperties))
+          throw new IllegalArgumentException(
+              "Cannot create the index '" + name.getValue() + "' on type '" + typeName.getStringValue() + "' properties "
+                  + requestedProperties + " because an index with that name already exists on type '" + existing.getTypeName()
+                  + "' properties " + existing.getPropertyNames() + ". Drop it first or choose a different index name");
+
+        if (!IndexBuilder.satisfiesRequest(existing, indexType, unique))
+          throw IndexBuilder.conflictWithExistingIndex(existing, indexType, unique, typeName.getStringValue(),
+              requestedProperties);
+
+        // The existing index is of the right kind; now the settings this statement SPELLED OUT (issue #5765). Only
+        // the keys written are compared, so a statement with no METADATA names nothing and stays the no-op it has
+        // always been. This shortcut answers before any builder exists, so it has to ask the same question
+        // TypeIndexBuilder.create() asks - hence the shared helper rather than a second copy of the rule.
+        final List<String> settingMismatches;
+        try {
+          settingMismatches = IndexBuilder.findUnsatisfiedSettings(existing, readUserMetadata(context), indexType);
+        } catch (final IndexException | IllegalArgumentException | JSONException e) {
+          // Same treatment the creation branches below give the clause: every value in it comes from the statement,
+          // so one the index type cannot read is a client mistake and must answer 400, not 500.
+          throw new CommandSQLParsingException("Invalid METADATA for " + indexType + " index: " + e.getMessage(), e);
+        }
+        if (!settingMismatches.isEmpty())
+          throw IndexBuilder.conflictWithExistingIndex(existing, indexType, unique, typeName.getStringValue(),
+              requestedProperties, settingMismatches);
+
         final InternalResultSet rs = new InternalResultSet();
         final ResultInternal result = new ResultInternal(context.getDatabase());
         result.setProperty("operation", "create index");
@@ -180,7 +265,8 @@ public class CreateIndexStatement extends DDLStatement {
 
     builder.withIgnoreIfExists(ifNotExists);
     builder.withUnique(unique);
-    builder.withPageSize(LSMTreeIndexAbstract.DEF_PAGE_SIZE);
+    // No withPageSize(): SQL has no PAGESIZE clause, so leaving it unset lets each index implementation pick its own
+    // default. Pinning it to the LSM default here forced that value on HASH too, which cannot address a 256KB page (#5713).
     builder.withNullStrategy(nullStrategy);
 
     // Pass collation settings (e.g., CI for case-insensitive)
@@ -190,28 +276,53 @@ public class CreateIndexStatement extends DDLStatement {
     builder.withCollations(collations);
     builder.withCallback((document, totalIndexed) -> {
       total.incrementAndGet();
-      if (totalIndexed % 100000 == 0) {
-        System.out.print(".");
-        System.out.flush();
-      }
+      // Progress goes to the log, not to stdout: this runs inside the server process, where a dot written to
+      // System.out reaches nobody while still costing a flush on the build path (issue #5765).
+      if (totalIndexed % 100000 == 0)
+        LogManager.instance()
+            .log(this, Level.INFO, "Building index on type '%s': %d records indexed so far", typeName.getStringValue(),
+                totalIndexed);
     });
 
     // Handle vector-specific metadata
     if (indexType == Schema.INDEX_TYPE.LSM_VECTOR) {
       if (metadata == null)
-        throw new CommandSQLParsingException(
-            "LSM_VECTOR index requires METADATA with dimensions, similarity, maxConnections, and beamWidth");
+        // Only "dimensions" is mandatory; the rest of the knobs have defaults. The message used to list
+        // all four as required, which sent users looking for values they did not have to supply (#5607).
+        throw new CommandSQLParsingException(LSM_VECTOR_METADATA_HINT);
 
       final Map<String, Object> metadataMap = metadata.toMap((Result) null, context);
       final JSONObject jsonMetadata = new JSONObject(metadataMap);
 
-      // Extract buildGraphNow directive (default true) before passing metadata to builder
-      final boolean buildGraphNow = jsonMetadata.getBoolean("buildGraphNow", true);
-      jsonMetadata.remove("buildGraphNow");
-
       // Builder is now an LSMVectorIndexBuilder after withType(LSM_VECTOR)
       final TypeLSMVectorIndexBuilder vectorBuilder = builder.withLSMVectorType();
-      vectorBuilder.withMetadata(jsonMetadata);
+
+      final boolean buildGraphNow;
+      try {
+        // An empty or dimension-less METADATA satisfied the null check above and then built an index with
+        // dimensions=0, which accepts writes and indexes nothing. The builder refuses it too, but raising a
+        // parsing exception here keeps a malformed statement a client error (HTTP 400) instead of a 500.
+        if (jsonMetadata.getInt("dimensions", 0) < 1)
+          throw new CommandSQLParsingException(LSM_VECTOR_METADATA_HINT);
+
+        // Read the buildGraphNow directive (default true), then strip every directive before the clause reaches the
+        // builder - which reads what is left as configuration and refuses anything it does not recognise.
+        buildGraphNow = jsonMetadata.getBoolean("buildGraphNow", true);
+        stripDirectives(jsonMetadata);
+
+        vectorBuilder.withMetadata(jsonMetadata);
+        // The clause as written, so IF NOT EXISTS can compare an existing index on the settings this statement
+        // actually named rather than answering for any vector index on the same property (issue #5765).
+        vectorBuilder.withUserMetadata(jsonMetadata);
+      } catch (final IndexException | IllegalArgumentException | JSONException e) {
+        // Every value in this clause comes from the statement, so a value the builder cannot read is a
+        // client mistake, not a server fault: an unparsable number ({"dimensions": "abc"} used to escape
+        // as a raw NumberFormatException), an unknown similarity or quantization name, an out-of-range PQ
+        // setting. Reporting them as parsing errors keeps the HTTP answer a 400, the same treatment the
+        // GEOSPATIAL branch below gives its metadata.
+        throw new CommandSQLParsingException("Invalid METADATA for LSM_VECTOR index: " + e.getMessage(), e);
+      }
+
       final TypeIndex typeIndex = vectorBuilder.create();
 
       // Build the HNSW graph immediately unless explicitly disabled
@@ -226,7 +337,14 @@ public class CreateIndexStatement extends DDLStatement {
       final JSONObject jsonMetadata = new JSONObject(metadataMap);
 
       final TypeFullTextIndexBuilder ftBuilder = builder.withFullTextType();
-      ftBuilder.withMetadata(jsonMetadata);
+      try {
+        ftBuilder.withMetadata(jsonMetadata);
+        ftBuilder.withUserMetadata(jsonMetadata);
+      } catch (final IndexException | IllegalArgumentException | JSONException e) {
+        // Same treatment as the LSM_VECTOR and GEOSPATIAL branches: every value in the clause comes from the
+        // statement, so an unknown key or an out-of-range BM25 parameter is a client mistake and must answer 400.
+        throw new CommandSQLParsingException("Invalid METADATA for FULL_TEXT index: " + e.getMessage(), e);
+      }
       ftBuilder.create();
 
     } else if (indexType == Schema.INDEX_TYPE.LSM_SPARSE_VECTOR) {
@@ -235,11 +353,40 @@ public class CreateIndexStatement extends DDLStatement {
       if (metadata != null) {
         final Map<String, Object> metadataMap = metadata.toMap((Result) null, context);
         final JSONObject jsonMetadata = new JSONObject(metadataMap);
-        sparseBuilder.withMetadata(jsonMetadata);
+        try {
+          sparseBuilder.withMetadata(jsonMetadata);
+          sparseBuilder.withUserMetadata(jsonMetadata);
+        } catch (final IndexException | IllegalArgumentException | JSONException e) {
+          throw new CommandSQLParsingException("Invalid METADATA for LSM_SPARSE_VECTOR index: " + e.getMessage(), e);
+        }
       }
       sparseBuilder.create();
 
+    } else if (indexType == Schema.INDEX_TYPE.GEOSPATIAL) {
+      // Builder is already a TypeGeoIndexBuilder after withType(GEOSPATIAL)
+      final TypeGeoIndexBuilder geoBuilder = builder.withGeoType();
+      if (metadata != null) {
+        final Map<String, Object> metadataMap = metadata.toMap((Result) null, context);
+        final JSONObject jsonMetadata = new JSONObject(metadataMap);
+        try {
+          geoBuilder.withMetadata(jsonMetadata);
+          geoBuilder.withUserMetadata(jsonMetadata);
+        } catch (final IndexException | IllegalArgumentException | JSONException e) {
+          // The same three exceptions the other branches catch. Every geospatial setter happens to throw
+          // IllegalArgumentException today, so catching only that one made the HTTP 400 incidental rather than
+          // guaranteed: a future validation raising IndexException, or a JSON getter raising JSONException, would
+          // escape as a 500.
+          throw new CommandSQLParsingException(e.getMessage(), e);
+        }
+      }
+      geoBuilder.create();
+
     } else {
+      // Every index type whose settings live in METADATA is handled above. Reaching here with a METADATA clause means
+      // the user configured something this index type cannot use: saying so beats dropping it on the floor (#5600).
+      if (metadata != null && !metadata.toMap((Result) null, context).isEmpty())
+        throw new CommandSQLParsingException(
+            "METADATA is not supported by index type '" + typeAsString + "'");
       builder.create();
     }
     typeName = prevName;

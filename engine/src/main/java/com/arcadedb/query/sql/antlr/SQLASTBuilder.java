@@ -3854,12 +3854,7 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
     if (ctx.IDENTIFIER() != null) {
       return new Identifier(ctx.IDENTIFIER().getText());
     } else if (ctx.QUOTED_IDENTIFIER() != null) {
-      final String quoted = ctx.QUOTED_IDENTIFIER().getText();
-      // Remove backticks
-      final String unquoted = quoted.substring(1, quoted.length() - 1);
-      final Identifier id = new Identifier(unquoted);
-      id.setQuotedStringValue(quoted);
-      return id;
+      return Identifier.quoted(ctx.QUOTED_IDENTIFIER().getText());
     } else {
       // Handle keywords used as identifiers (NAME, VALUE, TYPE, etc.)
       // Note: Record attributes (@rid, @type, @in, @out) are handled in visitIdentifierChain
@@ -5080,6 +5075,10 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
     // UNIDIRECTIONAL flag
     stmt.unidirectional = bodyCtx.UNIDIRECTIONAL() != null;
 
+    // LIGHTWEIGHT / UNIQUE modifiers, accepted in either order
+    stmt.lightweight = !bodyCtx.LIGHTWEIGHT().isEmpty();
+    stmt.unique = !bodyCtx.UNIQUE().isEmpty();
+
     // BUCKET clause (list of bucket identifiers)
     if (bodyCtx.BUCKET() != null && !bodyCtx.bucketIdentifier().isEmpty()) {
       stmt.buckets = new ArrayList<>();
@@ -5556,11 +5555,7 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
 
     if (bodyCtx.QUOTED_IDENTIFIER() != null) {
       // Legacy syntax: CREATE INDEX `name` [IF NOT EXISTS] indexType [ENGINE engine] [METADATA json]
-      final String quoted = bodyCtx.QUOTED_IDENTIFIER().getText();
-      final String unquoted = quoted.substring(1, quoted.length() - 1);
-      final Identifier nameId = new Identifier(unquoted);
-      nameId.setQuotedStringValue(quoted);
-      stmt.name = nameId;
+      stmt.name = Identifier.quoted(bodyCtx.QUOTED_IDENTIFIER().getText());
       // No typeName — legacy indexes are not bound to a type via ON clause
 
       if (bodyCtx.indexType() != null) {
@@ -5938,7 +5933,10 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
     final List<SQLParser.AlterTypeSettingContext> settingCtxs = bodyCtx.alterTypeSetting();
     if (settingCtxs != null) {
       for (final SQLParser.AlterTypeSettingContext settingCtx : settingCtxs) {
-        final Identifier key = (Identifier) visit(settingCtx.identifier());
+        // UNIQUE arrives as its own token rather than reducing to identifier - see the grammar rule.
+        final Identifier key = settingCtx.identifier() != null ?
+            (Identifier) visit(settingCtx.identifier()) :
+            new Identifier(settingCtx.UNIQUE().getText());
         final Expression value = (Expression) visit(settingCtx.expression());
         stmt.settings.put(key, value);
       }
@@ -7053,7 +7051,8 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
 
   /**
    * Visit CHECK DATABASE statement.
-   * Grammar: CHECK DATABASE (TYPE ident (COMMA ident)*)? (BUCKET (ident|int) (COMMA (ident|int))*)? (FIX)? (COMPRESS)?
+   * Grammar: CHECK DATABASE (TYPE ident (COMMA ident)*)? (BUCKET (ident|int) (COMMA (ident|int))*)?
+   * (RECORD rid (COMMA rid)*)? (FIX)? (COMPRESS)?
    */
   @Override
   public CheckDatabaseStatement visitCheckDatabaseStmt(final SQLParser.CheckDatabaseStmtContext ctx) {
@@ -7093,6 +7092,13 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
           bucketId.bucketName = (Identifier) visit(allIdents.get(i));
           stmt.buckets.add(bucketId);
         }
+      }
+    }
+
+    // Parse RECORD clause - list of RIDs (#5680): scopes the check to those records only
+    if (checkCtx.RECORD() != null) {
+      for (final SQLParser.RidContext ridCtx : checkCtx.rid()) {
+        stmt.records.add(visitRid(ridCtx));
       }
     }
 

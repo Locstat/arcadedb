@@ -78,17 +78,22 @@
         <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
 
         <testcontainers.version>2.0.5</testcontainers.version>
-        <logback-classic.version>1.6.0</logback-classic.version>
+        <logback-classic.version>1.6.1</logback-classic.version>
         <micrometer.version>1.17.0</micrometer.version>
         <micrometer-tracing.version>1.7.0</micrometer-tracing.version>
         <opentelemetry.version>1.64.0</opentelemetry.version>
         <postgres.version>42.7.13</postgres.version>
+        <jackson.version>2.22.1</jackson.version>
 
         <assertj-core.version>3.27.7</assertj-core.version>
         <junit.jupiter.version>6.1.2</junit.jupiter.version>
         <awaitility.version>4.3.0</awaitility.version>
         <json-path.version>3.0.0</json-path.version>
         <slf4j.version>2.0.18</slf4j.version>
+        <!-- PostBatchHandler depends on two behaviours of this version that are not part of any published contract:
+             UndertowInputStream.close() reads the request body to the end, and available() reports a finished body
+             as -1 rather than 0. Both are covered by Issue5470BatchErrorDeliveryIT, so a bump that changes either
+             shows up as a test failure there rather than as a silently worse diagnosis (issue #5470). -->
         <undertow-core.version>2.4.2.Final</undertow-core.version>
         <jboss-threads.version>3.9.2</jboss-threads.version>
         <mockito-core.version>5.23.0</mockito-core.version>
@@ -132,6 +137,7 @@
         <module>network</module>
         <module>grpc</module>
         <module>server</module>
+        <module>mcp</module>
         <module>ha-raft</module>
         <module>metrics</module>
         <module>tracing</module>
@@ -513,6 +519,17 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <!-- Pin the whole Jackson family through the BOM. Transitive deps (swagger-core in the
+                 server module, gremlin in the graph modules) drag in split Jackson versions, which
+                 both reopens fixed deserialization CVEs and risks mixing databind against an older
+                 jackson-core than it was compiled for. One managed version keeps the family aligned. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <!-- OpenTelemetry + Micrometer Tracing BOMs: consumed only by the optional `tracing`
                  module so the OTel SDK stays off the core/server compile classpath. -->
             <dependency>
@@ -752,6 +769,12 @@
             <properties>
                 <exclude.tests>**/gremlin/**/*.java</exclude.tests>
             </properties>
+        </profile>
+        <profile>
+            <id>native</id>
+            <modules>
+                <module>native</module>
+            </modules>
         </profile>
 
     </profiles>

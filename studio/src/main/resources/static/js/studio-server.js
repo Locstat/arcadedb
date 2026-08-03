@@ -233,8 +233,13 @@ function displayMetrics() {
   var m = serverData.metrics.meters || {};
 
   // Database Operations table (metrics with rate tracking)
-  var rateTrackedMetrics = ["writeTx", "readTx", "txRollbacks", "queries", "concurrentModificationExceptions"];
-  var rateTrackedLabels = { writeTx: "Write Tx", readTx: "Read Tx", txRollbacks: "Tx Rollbacks", queries: "Queries", concurrentModificationExceptions: "MVCC Contention" };
+  // The three page-merge counters (#5608) sit under MVCC Contention on purpose: a merge is contention the engine
+  // absorbed instead of turning into a retry, and a decline is contention it refused to absorb.
+  var rateTrackedMetrics = ["writeTx", "readTx", "txRollbacks", "queries", "concurrentModificationExceptions",
+    "edgeAppendMerges", "txPageSlotMerges", "mergesDeclinedByCoverage"];
+  var rateTrackedLabels = { writeTx: "Write Tx", readTx: "Read Tx", txRollbacks: "Tx Rollbacks", queries: "Queries",
+    concurrentModificationExceptions: "MVCC Contention", edgeAppendMerges: "Edge-Append Page Merges",
+    txPageSlotMerges: "Slot Page Merges", mergesDeclinedByCoverage: "Page Merges Declined" };
   var dbOpsHtml = "";
   for (var i = 0; i < rateTrackedMetrics.length; i++) {
     var name = rateTrackedMetrics[i];
@@ -253,7 +258,8 @@ function displayMetrics() {
   // Profiler details table (remaining metrics without rate tracking)
   var skipProfiler = { cpuLoad: 1, ramHeapUsed: 1, ramHeapMax: 1, ramOsUsed: 1, ramOsTotal: 1,
     diskFreeSpace: 1, diskTotalSpace: 1, readCacheUsed: 1, cacheMax: 1, configuration: 1,
-    writeTx: 1, readTx: 1, txRollbacks: 1, queries: 1, concurrentModificationExceptions: 1 };
+    writeTx: 1, readTx: 1, txRollbacks: 1, queries: 1, concurrentModificationExceptions: 1,
+    edgeAppendMerges: 1, txPageSlotMerges: 1, mergesDeclinedByCoverage: 1 };
   var profilerHtml = "";
   var profilerNames = Object.keys(p).sort();
   for (var i = 0; i < profilerNames.length; i++) {
@@ -262,8 +268,11 @@ function displayMetrics() {
     var entry = p[name];
     var val = "";
     if (entry.perc != null) val = globalFormatDouble(entry.perc, 2) + "%";
-    else if (entry.count != null && entry.count != 0) val = globalFormatDouble(entry.count, 0);
-    else if (entry.space != null && entry.space != 0) val = globalFormatSpace(entry.space);
+    // #5636: no `&& entry.count != 0` here. A counter sitting at zero is DATA; skipping the whole row left the
+    // operator unable to tell "this is zero" from "this is not reported", which is backwards for a health signal
+    // whose good state IS zero. Only a stat reporting none of perc/count/space/value is genuinely absent.
+    else if (entry.count != null) val = globalFormatDouble(entry.count, 0);
+    else if (entry.space != null) val = globalFormatSpace(entry.space);
     else if (entry.value != null) val = entry.value;
     else continue;
     profilerHtml += "<tr><td>" + escapeHtml(name) + "</td><td class='text-end'>" + escapeHtml(String(val)) + "</td></tr>";
@@ -285,12 +294,22 @@ function displayMetrics() {
   }
   $("#srvMetricMetersTable").html(metersHtml || "<tr><td colspan='3' class='text-muted text-center'>No HTTP meters available.</td></tr>");
 
+  // Renders a gauge the pool may not publish at all: absent means "not applicable to this pool",
+  // which is different from zero and must not be shown as one.
+  function gaugeOrDash(pool, key) {
+    return pool[key] === undefined || pool[key] === null ? "<span class='text-muted'>-</span>"
+        : Math.round(pool[key]).toLocaleString();
+  }
+
   // Executor Pools table - rendered from metrics.executors. Server-side keys are populated by
-  // PoolMetrics; expected pool names are "query" (QueryEngineManager) and "sparse_vector"
-  // (SparseVectorScoringPool). Each pool's gauges are: pool.size, pool.active, queue.depth,
-  // queue.capacity_remaining, tasks.completed, tasks.caller_run_fallbacks.
+  // PoolMetrics; expected pool names are "query" (QueryEngineManager), "sparse_vector"
+  // (SparseVectorScoringPool) and "parallel_scan" (ParallelScanProducerPool). Each pool's gauges
+  // are: pool.size, pool.active, queue.depth, queue.capacity_remaining, tasks.completed,
+  // tasks.caller_run_fallbacks. The sparse-vector pool adds pool.reserved, queries.in_flight and
+  // queries.split, which explain its per-query decision to parallelise or not (#4085).
   var ex = serverData.metrics.executors || {};
-  var executorRowLabels = { "query": "Query Parallelism", "sparse_vector": "Sparse Vector Scoring" };
+  var executorRowLabels = { "query": "Query Parallelism", "sparse_vector": "Sparse Vector Scoring",
+      "parallel_scan": "Parallel Scan Producers" };
   var executorPoolNames = Object.keys(ex).sort();
   var executorsHtml = "";
   for (var i = 0; i < executorPoolNames.length; i++) {
@@ -310,9 +329,17 @@ function displayMetrics() {
     executorsHtml += "<td class='text-end'>" + Math.round(pool["queue.capacity_remaining"] || 0).toLocaleString() + "</td>";
     executorsHtml += "<td class='text-end'>" + Math.round(pool["tasks.completed"] || 0).toLocaleString() + "</td>";
     executorsHtml += "<td class='" + fallbackCellClass + "'>" + fallbacks.toLocaleString() + "</td>";
+    // Split-decision columns (#4085). Only the sparse-vector pool decides per query whether to
+    // parallelise, so a pool that does not report them shows "-" rather than a zero that would read
+    // as "nothing is splitting" when the concept simply does not apply. "Queries Split" is the
+    // decision, not the outcome: under caller-runs a submitted range executes inline on the caller,
+    // so it pairs with the Caller-Run Fallbacks column to the left.
+    executorsHtml += "<td class='text-end'>" + gaugeOrDash(pool, "pool.reserved") + "</td>";
+    executorsHtml += "<td class='text-end'>" + gaugeOrDash(pool, "queries.in_flight") + "</td>";
+    executorsHtml += "<td class='text-end'>" + gaugeOrDash(pool, "queries.split") + "</td>";
     executorsHtml += "</tr>";
   }
-  $("#srvMetricExecutorsTable").html(executorsHtml || "<tr><td colspan='6' class='text-muted text-center'>No executor pool metrics available.</td></tr>");
+  $("#srvMetricExecutorsTable").html(executorsHtml || "<tr><td colspan='9' class='text-muted text-center'>No executor pool metrics available.</td></tr>");
 
   // Sparse Vector Indexes table - rendered from metrics.sparseVectorIndexes. Shape:
   //   { dbName: { typeIndexName: { memtablePostings, segmentCount, totalPostings } } }
@@ -840,6 +867,20 @@ function saveBackupConfig() {
 var mcpConfigData = null;
 var mcpConfigLoaded = false;
 
+// A 404 on the MCP routes means this distribution was built without the MCP module, which is a build-time
+// choice rather than a failure. Every other status is a genuine error and must still surface.
+function isMCPModuleAbsent(jqXHR) {
+  return !!jqXHR && jqXHR.status === 404;
+}
+
+function showMCPModuleAbsent() {
+  $("#mcpConfigForm").html(
+    '<div class="alert alert-secondary" style="font-size: 0.85rem;">' +
+      "The MCP module is not installed in this distribution. Rebuild with the <code>mcp</code> module to enable it." +
+      "</div>"
+  );
+}
+
 function loadMCPConfig() {
   jQuery
     .ajax({
@@ -855,8 +896,12 @@ function loadMCPConfig() {
       populateMCPConfigForm(data);
     })
     .fail(function (jqXHR, textStatus, errorThrown) {
-      globalNotifyError(jqXHR.responseText);
       mcpConfigLoaded = false;
+      if (isMCPModuleAbsent(jqXHR)) {
+        showMCPModuleAbsent();
+        return;
+      }
+      globalNotifyError(jqXHR.responseText);
     });
 }
 
@@ -946,6 +991,10 @@ function saveMCPConfig() {
       globalNotify("MCP Configuration", "Configuration saved successfully", "success");
     })
     .fail(function (jqXHR, textStatus, errorThrown) {
+      if (isMCPModuleAbsent(jqXHR)) {
+        showMCPModuleAbsent();
+        return;
+      }
       globalNotifyError(jqXHR.responseText);
     });
 }

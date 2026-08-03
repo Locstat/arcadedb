@@ -1445,6 +1445,7 @@ public class SelectExecutionPlanner {
         bucket.setValue(orid.getBucketId());
         final PInteger position = new PInteger(-1);
         position.setValue(orid.getPosition());
+        rid.setLegacy(true);
         rid.setBucket(bucket);
         rid.setPosition(position);
         if (filterClusters == null || isFromClusters(rid, filterClusters, context.getDatabase())) {
@@ -2093,7 +2094,8 @@ public class SelectExecutionPlanner {
       if (boundCount != partitionProps.size())
         return filterClusters;  // Block left a partition coordinate open; cannot prune.
 
-      final int bucketIndex = partitioned.getBucketIdByKeys(keyValues, false);
+      // keyValues was filled in partitionProps order right above, so the strategy's own check is satisfied.
+      final int bucketIndex = partitioned.getBucketIdByKeys(partitionProps, keyValues, false);
       if (bucketIndex < 0 || bucketIndex >= typeBuckets.size())
         return filterClusters;  // Strategy returned an out-of-range index; abort defensively.
       derivedBuckets.add(typeBuckets.get(bucketIndex).getName());
@@ -2139,7 +2141,7 @@ public class SelectExecutionPlanner {
     if (!result.isEmpty()) {
       final IntHashSet bucketFileIds = new IntHashSet(result.size());
       for (final String bucketName : result) {
-        final com.arcadedb.engine.Bucket bucket = context.getDatabase().getSchema().getBucketByName(bucketName);
+        final com.arcadedb.engine.Bucket bucket = context.getDatabase().getSchema().getBucketByNameIfExists(bucketName);
         if (bucket != null)
           bucketFileIds.add(bucket.getFileId());
       }
@@ -3836,11 +3838,18 @@ public class SelectExecutionPlanner {
     for (final Bucket parserBucket : buckets) {
       String name = resolveBucketName(parserBucket, context);
       Integer bucketId = parserBucket.getBucketNumber();
-      if (name == null && bucketId != null)
-        name = db.getSchema().getBucketById(bucketId).getName();
+      // #5636: null-tolerant, matching the name arm below. This method is an index-optimisation PROBE: every other
+      // way of failing to resolve a bucket here sets tryByIndex = false and falls through to the ordinary fetch,
+      // which reports "Bucket 'x' does not exist" properly. Only the id arm threw, so `SELECT FROM bucket:9999`
+      // escaped as a raw SchemaException while `SELECT FROM bucket:unknown` got the real message.
+      if (name == null && bucketId != null) {
+        final com.arcadedb.engine.Bucket byId = db.getSchema().getBucketByIdIfExists(bucketId);
+        if (byId != null)
+          name = byId.getName();
+      }
 
       if (bucketId == null && name != null) {
-        final com.arcadedb.engine.Bucket bucket = db.getSchema().getBucketByName(name);
+        final com.arcadedb.engine.Bucket bucket = db.getSchema().getBucketByNameIfExists(name);
         if (bucket != null)
           bucketId = bucket.getFileId();
       }
@@ -3894,7 +3903,7 @@ public class SelectExecutionPlanner {
       if (bucketId == null) {
         final String resolvedName = resolveBucketName(parserBucket, context);
         if (resolvedName != null) {
-          final com.arcadedb.engine.Bucket bucket = db.getSchema().getBucketByName(resolvedName);
+          final com.arcadedb.engine.Bucket bucket = db.getSchema().getBucketByNameIfExists(resolvedName);
           if (bucket != null)
             bucketId = bucket.getFileId();
         }
@@ -3918,7 +3927,7 @@ public class SelectExecutionPlanner {
         if (bucketId == null) {
           final String resolvedName = resolveBucketName(parserBucket, context);
           if (resolvedName != null) {
-            final com.arcadedb.engine.Bucket bucket = db.getSchema().getBucketByName(resolvedName);
+            final com.arcadedb.engine.Bucket bucket = db.getSchema().getBucketByNameIfExists(resolvedName);
             if (bucket != null)
               bucketId = bucket.getFileId();
           }
@@ -4095,7 +4104,12 @@ public class SelectExecutionPlanner {
         if (bucket == null)
           // Computed/parameterized RID (e.g. rid: :param): the bucket is only known at runtime, defer resolution
           return null;
-        buckets.add(db.getSchema().getBucketById(bucket.getValue().intValue()).getName());
+        // #5636: an id this schema does not know is another "cannot determine statically" - the same answer this
+        // method already gives for a parameterized bucket - not a reason to abort planning with a SchemaException.
+        final com.arcadedb.engine.Bucket byId = db.getSchema().getBucketByIdIfExists(bucket.getValue().intValue());
+        if (byId == null)
+          return null;
+        buckets.add(byId.getName());
       }
       return buckets;
     } else if (item.getInputParams() != null && item.getInputParams().size() > 0) {
@@ -4107,7 +4121,12 @@ public class SelectExecutionPlanner {
       }
       String name = item.getBucket().getBucketName();
       if (name == null && item.getBucket().getBucketNumber() != null) {
-        name = db.getSchema().getBucketById(item.getBucket().getBucketNumber()).getName();
+        // #5636: the `else return null` below already means "cannot determine statically"; leaving the lookup
+        // throwing made SELECT FROM bucket:<unknown-id> abort here with a raw SchemaException instead, while the
+        // by-name form reached the planner's own "Bucket 'x' does not exist".
+        final com.arcadedb.engine.Bucket byId = db.getSchema().getBucketByIdIfExists(item.getBucket().getBucketNumber());
+        if (byId != null)
+          name = byId.getName();
       }
       if (name != null) {
         buckets.add(name);
@@ -4119,7 +4138,11 @@ public class SelectExecutionPlanner {
       for (final Bucket bucket : item.getBucketList().toListOfClusters()) {
         String name = bucket.getBucketName();
         if (name == null) {
-          name = db.getSchema().getBucketById(bucket.getBucketNumber()).getName();
+          // #5636: same probe contract as the two arms above - the `if (name != null)` guard below is what this
+          // was written to reach.
+          final com.arcadedb.engine.Bucket byId = db.getSchema().getBucketByIdIfExists(bucket.getBucketNumber());
+          if (byId != null)
+            name = byId.getName();
         }
         if (name != null) {
           buckets.add(name);
