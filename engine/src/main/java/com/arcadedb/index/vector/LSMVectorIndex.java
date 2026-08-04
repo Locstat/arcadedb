@@ -149,6 +149,16 @@ public class LSMVectorIndex implements Index, IndexInternal {
   // enough to never matter and large enough that a small index is fully resident from the first query.
   private static final int MIN_SEARCH_CACHE_SIZE = 8_192;
 
+  // DOT_PRODUCT is the fast path for cosine on already-normalized data, and JVector documents unit length as its
+  // precondition. How many ordinals a rebuild samples to notice that the precondition is not met, and how far a
+  // magnitude may drift from 1 before it counts as violated (float accumulation over a few thousand dimensions
+  // moves the last digits, so an exact comparison would flag correctly normalized data).
+  private static final int    UNIT_VECTOR_SAMPLE_SIZE  = 1_000;
+  private static final double UNIT_MAGNITUDE_TOLERANCE = 0.01;
+  // Squared bounds, so the sample costs one multiply-add per component and no square root at all.
+  private static final double MIN_UNIT_MAGNITUDE_SQUARED = (1.0 - UNIT_MAGNITUDE_TOLERANCE) * (1.0 - UNIT_MAGNITUDE_TOLERANCE);
+  private static final double MAX_UNIT_MAGNITUDE_SQUARED = (1.0 + UNIT_MAGNITUDE_TOLERANCE) * (1.0 + UNIT_MAGNITUDE_TOLERANCE);
+
   // Not final: a compaction swaps in a new data file, and this index is named after its component - see
   // getMostRecentFileName(). Every node names the index after the file it holds, so the leader has to
   // follow its own rename or its schema stops matching the followers that rebuilt it from that file.
@@ -184,6 +194,11 @@ public class LSMVectorIndex implements Index, IndexInternal {
   // Set once the ignored location-cache limit has been reported, so a rebuild does not repeat the warning.
   // compareAndSet, not a plain flag: two threads racing the first call would otherwise both log it.
   private final    AtomicBoolean                 locationCacheCapReported = new AtomicBoolean();
+  // Same idea for the DOT_PRODUCT unit-length warning: an ingest crosses the rebuild threshold every time the
+  // pending set grows by a fraction of the graph, so a million-row load rebuilds a hundred-odd times and would
+  // otherwise repeat the same warning on each of them. Set only when the warning is actually emitted, so an index
+  // that starts out normalized and later is not still gets told once.
+  private final    AtomicBoolean                 nonUnitVectorsReported   = new AtomicBoolean();
 
   // Graph file for persistent storage of graph topology
   // Allows lazy-loading graph from disk and avoiding expensive rebuilds
@@ -1711,25 +1726,28 @@ public class LSMVectorIndex implements Index, IndexInternal {
     lock.writeLock().lock();
     final int[] vectorIds;
     try {
-      // CRITICAL: If we couldn't read any entries from pages (e.g., during database close),
-      // DON'T replace vectorIndex - use what's already in memory!
+      // CRITICAL: If we couldn't read any live entry from pages, DON'T replace vectorIndex - use what's already
+      // in memory! Publishing an empty location index here would drop entries that only exist in RAM.
       if (!ridToLatestVector.isEmpty()) {
         // Update vectorIndex to match what we found on pages (sync it with disk state).
         if (!locationIndexAlreadyPublished)
           publishLocationIndex(ridToLatestVector.values());
         vectorIds = finalActiveVectorIdsFromPages; // Use vector IDs from pages (may include doc-scan fallback)
       } else {
-        LogManager.instance().log(this, Level.SEVERE,
-            "FALLBACK: Could not read vectors from pages (database closing), using existing vectorIndex with %d entries",
-            vectorIndex.size());
         // Build vector IDs from existing vectorIndex
         vectorIds = vectorIndex.getAllVectorIds().filter(id -> {
           final VectorLocationIndex.VectorLocation loc = vectorIndex.getLocation(id);
           return loc != null && !loc.deleted;
         }).sorted().toArray();
-        LogManager.instance()
-            .log(this, Level.SEVERE, "FALLBACK: Built %d active vector IDs from in-memory vectorIndex",
-                vectorIds.length);
+
+        // Pages holding no live vector is the ordinary state of a brand new index, and of one whose records have
+        // all been deleted: there the tombstones cancel every entry out. Neither says the database is going away,
+        // and neither is worth a level operators alert on. Only a disagreement between the two sources is: memory
+        // still knows about live vectors the pages did not yield, which is what an interrupted rebuild or an
+        // unreadable data file looks like. Report what was observed, never a cause that was not checked.
+        LogManager.instance().log(this, vectorIds.length > 0 ? Level.WARNING : Level.FINE,
+            "No live vector read from the pages of index %s (%d entries parsed): building the graph from the in-memory index instead (%d live of %d entries)",
+            indexName, totalEntriesRead[0], vectorIds.length, vectorIndex.size());
       }
     } finally {
       lock.writeLock().unlock();
@@ -1928,6 +1946,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
       preloadedVectors.clear(); // Free memory
 
       vectors = pageVectors;
+
+      reportNonUnitVectorsOnDotProduct(pageVectors, finalActiveVectorIds.length);
 
       // Publish the ordinal mapping and the build state under the write lock so searches never observe an
       // ordinal map that disagrees with the vectors snapshot they captured (issue #4581).
@@ -2269,6 +2289,60 @@ public class LSMVectorIndex implements Index, IndexInternal {
       LogManager.instance().log(this, Level.SEVERE, "Error building graph from scratch", e);
       throw new IndexException("Error building graph from scratch", e);
     }
+  }
+
+  /**
+   * Warns once when a {@code DOT_PRODUCT} index is being built over vectors that are not unit length.
+   * <p>
+   * {@code VectorSimilarityFunction.DOT_PRODUCT} scores {@code (1 + dot(a, b)) / 2} and documents unit length as its
+   * precondition: it exists as the cheap path for cosine on data that is already normalized. Honour it and the raw dot
+   * product stays in {@code [-1, 1]}, so the score stays in {@code [0, 1]} and zero is a genuine floor, which is what
+   * {@link #UNREADABLE_NODE_SCORE} relies on to keep an unreadable node from outranking a real one. Break it and the
+   * dot product is unbounded below, real vectors can score under zero, and a tombstone at exactly zero wastes beam
+   * budget. It cannot enter a result - {@code LiveVectorBitsFilter} decides membership, not the score - so the cost is
+   * recall and work, not a wrong answer. Silently worse rankings than COSINE would have given is the opposite of the
+   * reason to pick this metric, hence the warning.
+   * <p>
+   * The rebuild has already read and validated every vector, so sampling costs no I/O beyond what the cache already
+   * holds, and it is bounded at {@link #UNIT_VECTOR_SAMPLE_SIZE} ordinals regardless of index size. Unreadable
+   * ordinals are skipped: the placeholder {@code ArcadePageVectorValues} hands back is all ones, whose magnitude is
+   * {@code sqrt(dimensions)}, and counting it would report a normalization problem the data does not have.
+   *
+   * @param vectors     the vector view the graph is about to be built on
+   * @param totalActive number of active ordinals in that view
+   */
+  private void reportNonUnitVectorsOnDotProduct(final ArcadePageVectorValues vectors, final int totalActive) {
+    if (metadata.similarityFunction != VectorSimilarityFunction.DOT_PRODUCT || nonUnitVectorsReported.get())
+      return;
+
+    final int sampleSize = Math.min(totalActive, UNIT_VECTOR_SAMPLE_SIZE);
+    int sampled = 0;
+    int nonUnit = 0;
+
+    for (int ordinal = 0; ordinal < sampleSize; ordinal++) {
+      final VectorFloat<?> vector = vectors.getVector(ordinal);
+      if (vector == null || vectors.isDeletedSentinel(vector))
+        continue;
+
+      double magnitudeSquared = 0.0;
+      for (int i = 0; i < vector.length(); i++) {
+        final float component = vector.get(i);
+        magnitudeSquared += (double) component * component;
+      }
+
+      ++sampled;
+      if (magnitudeSquared < MIN_UNIT_MAGNITUDE_SQUARED || magnitudeSquared > MAX_UNIT_MAGNITUDE_SQUARED)
+        ++nonUnit;
+    }
+
+    if (nonUnit == 0 || !nonUnitVectorsReported.compareAndSet(false, true))
+      return;
+
+    LogManager.instance().log(this, Level.WARNING,
+        "Vector index '%s' uses DOT_PRODUCT but %d of the %d sampled vectors (%d%%) are not unit length. DOT_PRODUCT is "
+            + "defined only for normalized vectors, so search quality is degraded: normalize the vectors on ingest or "
+            + "recreate the index with COSINE. This is reported once per index",
+        indexName, nonUnit, sampled, nonUnit * 100 / sampled);
   }
 
   private long getTxChunkSize() {
@@ -3461,26 +3535,20 @@ public class LSMVectorIndex implements Index, IndexInternal {
     // mapping (issue #4581).
     final ArcadePageVectorValues pageValues = vectors instanceof final ArcadePageVectorValues p ? p : null;
     boolean added = false;
-    for (int ordinal = 0; ordinal < ordinalMap.length; ordinal++) {
-      final int vectorId = ordinalMap[ordinal];
-      final VectorLocationIndex.VectorLocation loc = vectorIndex.getLocation(vectorId);
-      if (loc == null || loc.deleted)
-        continue;
-      if (seenRIDs.contains(loc.rid))
-        continue;
-      if (allowedRIDs != null && !allowedRIDs.isEmpty() && !allowedRIDs.contains(loc.rid))
-        continue;
 
-      // The location says the vector is live, but the read can still fail - a document whose vector property was
-      // removed or has the wrong type comes back as the placeholder, not as a vector. Scoring it would pair a real
-      // RID with a meaningless distance, and under COSINE with a distance of minus infinity, i.e. first place.
-      final VectorFloat<?> vec = vectors.getVector(ordinal);
-      if (vec == null || (pageValues != null && pageValues.isDeletedSentinel(vec)))
-        continue;
-
-      final float score = metadata.similarityFunction.compare(queryVectorFloat, vec);
-      results.add(new Pair<>(bindRid(loc.rid), scoreToDistance(metadata.similarityFunction, score)));
-      added = true;
+    if (allowedRIDs != null && !allowedRIDs.isEmpty() && allowedRIDs.size() < ordinalMap.length) {
+      // Walk the allow-list instead of every ordinal (issue #5748). An allow-list narrower than k never meets the
+      // caller's expected-result threshold, so the fallback fires on every query and the full ordinal walk costs
+      // O(index) each time. Resolving each allowed RID to its ordinals costs O(allow-list * log index) and reads
+      // only the vectors that can actually make the result set, which is where the time goes.
+      // The guard on size() is the crossover: an allow-list wider than the index would pay more reverse lookups
+      // than the plain scan pays ordinal steps, for the same answer.
+      final int[] candidates = collectAllowedOrdinals(allowedRIDs, ordinalMap);
+      for (final int ordinal : candidates)
+        added |= scoreOrdinal(ordinal, queryVectorFloat, allowedRIDs, results, vectors, ordinalMap, seenRIDs, pageValues);
+    } else {
+      for (int ordinal = 0; ordinal < ordinalMap.length; ordinal++)
+        added |= scoreOrdinal(ordinal, queryVectorFloat, allowedRIDs, results, vectors, ordinalMap, seenRIDs, pageValues);
     }
 
     if (added) {
@@ -3488,6 +3556,71 @@ public class LSMVectorIndex implements Index, IndexInternal {
       if (results.size() > k)
         results.subList(k, results.size()).clear();
     }
+  }
+
+  /**
+   * Resolve an allow-list to the ordinals it occupies in {@code ordinalMap}, ascending.
+   * <p>
+   * {@code ordinalMap} is always sorted ascending - every producer of {@code ordinalToVectorId} builds it with
+   * {@code sorted()} because the ordinal order has to match the order the graph was persisted in - so the reverse
+   * lookup is a binary search and needs no per-query map. A RID with no live vector id, or one whose vector was
+   * ingested after the last rebuild and is therefore only in the delta buffer, simply contributes no ordinal.
+   * <p>
+   * The result is sorted so the caller scores in ordinal order, exactly the order the full scan uses. Distance ties
+   * would otherwise be broken by the allow-list's iteration order and the two paths could truncate to different
+   * RIDs at k.
+   */
+  private int[] collectAllowedOrdinals(final Set<RID> allowedRIDs, final int[] ordinalMap) {
+    // Start small and grow: the allow-list can be much larger than the number of RIDs actually resident in this
+    // index, and sizing the array for it up front would allocate for entries that never materialize.
+    int[] ordinals = new int[Math.min(allowedRIDs.size(), 256)];
+    int count = 0;
+    for (final RID rid : allowedRIDs) {
+      for (final int vectorId : vectorIndex.getVectorIdsForRid(rid)) {
+        final int ordinal = Arrays.binarySearch(ordinalMap, vectorId);
+        if (ordinal < 0)
+          continue;
+        if (count == ordinals.length)
+          ordinals = Arrays.copyOf(ordinals, count * 2);
+        ordinals[count++] = ordinal;
+      }
+    }
+    if (count < ordinals.length)
+      ordinals = Arrays.copyOf(ordinals, count);
+    Arrays.sort(ordinals);
+    return ordinals;
+  }
+
+  /**
+   * Score one ordinal into {@code results}, returning whether it was added. Both brute-force paths funnel through
+   * here so the allow-list walk and the full scan cannot drift apart on the deleted, duplicate and unreadable-vector
+   * guards.
+   */
+  private boolean scoreOrdinal(final int ordinal, final VectorFloat<?> queryVectorFloat, final Set<RID> allowedRIDs,
+      final List<Pair<RID, Float>> results, final RandomAccessVectorValues vectors, final int[] ordinalMap,
+      final RidHashSet seenRIDs, final ArcadePageVectorValues pageValues) {
+    final int vectorId = ordinalMap[ordinal];
+    final VectorLocationIndex.VectorLocation loc = vectorIndex.getLocation(vectorId);
+    if (loc == null || loc.deleted)
+      return false;
+    if (seenRIDs.contains(loc.rid))
+      return false;
+    // Redundant on the allow-list walk, which only ever resolves allowed RIDs, but it is what keeps the full scan
+    // filtered when the crossover guard sends a wide allow-list here, and it is the single place the membership rule
+    // lives for both paths.
+    if (allowedRIDs != null && !allowedRIDs.isEmpty() && !allowedRIDs.contains(loc.rid))
+      return false;
+
+    // The location says the vector is live, but the read can still fail - a document whose vector property was
+    // removed or has the wrong type comes back as the placeholder, not as a vector. Scoring it would pair a real
+    // RID with a meaningless distance, and under COSINE with a distance of minus infinity, i.e. first place.
+    final VectorFloat<?> vec = vectors.getVector(ordinal);
+    if (vec == null || (pageValues != null && pageValues.isDeletedSentinel(vec)))
+      return false;
+
+    final float score = metadata.similarityFunction.compare(queryVectorFloat, vec);
+    results.add(new Pair<>(bindRid(loc.rid), scoreToDistance(metadata.similarityFunction, score)));
+    return true;
   }
 
   /**
