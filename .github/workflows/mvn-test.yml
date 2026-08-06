@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Ensure SHA pinned actions
-        uses: zgosalvez/github-actions-ensure-sha-pinned-actions@3db98c0363e2fa5df3e1c4c471777a7c10b24cc9 # v5.0.5
+        uses: zgosalvez/github-actions-ensure-sha-pinned-actions@46cfe808a5f1588656ef299eedd0ce2fd7ec0dcc # v5.0.6
       - name: Check test database paths
         run: ./.github/scripts/check-test-database-paths.sh
       - name: Run pre-commit
@@ -32,14 +32,16 @@ jobs:
         with:
           python-version: "3.13.0"
           cache: "pip"
-      # Both steps below need PyYAML, so it gets its own step rather than hiding inside the first
-      # one that happens to run - reordering those would otherwise break the second confusingly.
+      # Every step below needs PyYAML, so it gets its own step rather than hiding inside the first
+      # one that happens to run - reordering those would otherwise break the rest confusingly.
       # Pinned for the same reason the actions here are pinned to a SHA: this job gates every other
       # one, so what it installs should not change under it between runs.
       - name: Install workflow linting dependencies
         run: python3 -m pip install --quiet pyyaml==6.0.3
       - name: Check workflow artifact dependencies
         run: ./.github/scripts/check-workflow-artifact-deps.py
+      - name: Check test reporter guards
+        run: ./.github/scripts/check-test-reporter-guards.py
       - name: Check CI scripts
         run: ./.github/scripts/tests/test-ci-scripts.sh
       - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
@@ -51,7 +53,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -123,7 +125,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -210,7 +212,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -270,7 +272,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -332,7 +334,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -389,7 +391,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -425,7 +427,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: "temurin"
           java-version: 21
@@ -457,9 +459,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCADEDB_DOCKER_IMAGE: ${{ needs.build-and-package.outputs.image-tag }}
 
+      # continue-on-error: same reasoning as the unit-tests job, with a different verdict step. The
+      # e2e suites do not run with --fail-never, so the test step above already fails the job on a
+      # failing test and no check-test-results.py is needed. The reporter only publishes annotations,
+      # so letting it fail removes the false red without ever hiding a real failure.
       - name: E2E Tests Reporter
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         if: success() || failure()
+        continue-on-error: true
         with:
           name: Java E2E Tests Report
           path: "e2e/target/failsafe-reports/TEST*.xml"
@@ -503,9 +510,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCADEDB_DOCKER_IMAGE: ${{ needs.build-and-package.outputs.image-tag }}
 
+      # See the java-e2e-tests job: the test step is the verdict, the reporter is decorative.
       - name: JS E2E Tests Reporter
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         if: success() || failure()
+        continue-on-error: true
         with:
           name: JS E2E Tests Report
           path: "e2e-js/reports/jest-junit.xml"
@@ -560,9 +569,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCADEDB_DOCKER_IMAGE: ${{ needs.build-and-package.outputs.image-tag }}
 
+      # See the java-e2e-tests job: the test step is the verdict, the reporter is decorative.
       - name: Studio E2E Tests Reporter
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         if: success() || failure()
+        continue-on-error: true
         with:
           name: Studio E2E Tests Report
           path: "e2e-studio/reports/playwright-junit.xml"
@@ -621,9 +632,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCADEDB_DOCKER_IMAGE: ${{ needs.build-and-package.outputs.image-tag }}
 
+      # See the java-e2e-tests job: the test step is the verdict, the reporter is decorative.
       - name: Python E2E Tests Reporter
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         if: success() || failure()
+        continue-on-error: true
         with:
           name: Python E2E Tests Report
           path: "e2e-python/reports/python-junit.xml"
@@ -676,9 +689,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCADEDB_DOCKER_IMAGE: ${{ needs.build-and-package.outputs.image-tag }}
 
+      # See the java-e2e-tests job: the test step is the verdict, the reporter is decorative.
       - name: C# E2E Tests Reporter
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         if: success() || failure()
+        continue-on-error: true
         with:
           name: C# E2E Tests Report
           path: "e2e-csharp/ArcadeDB.E2ETests/reports/csharp-junit.xml"
@@ -742,9 +757,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCADEDB_DOCKER_IMAGE: ${{ needs.build-and-package.outputs.image-tag }}
 
+      # See the java-e2e-tests job: the test step is the verdict, the reporter is decorative.
       - name: Go E2E Tests Reporter
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         if: success() || failure()
+        continue-on-error: true
         with:
           name: Go E2E Tests Report
           path: "e2e-go/reports/go-junit.xml"
